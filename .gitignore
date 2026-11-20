@@ -1,0 +1,19 @@
+# Fetched by scripts/fetch-all.sh (directories, or links to them).
+/dl
+/toolkits
+/driver
+/nvidia-docs
+/src
+/demos
+
+# The test settings of a site (tests/site.env.example)
+/tests/site.env
+
+# Build outputs
+/target/
+/dist/
+__pycache__/
+*.o
+*.so
+*.so.*
+/cuda-12.9.2/

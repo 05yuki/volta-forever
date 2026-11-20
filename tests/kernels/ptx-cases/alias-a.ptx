@@ -1,0 +1,25 @@
+.version 8.8
+.target sm_75
+.address_size 64
+.visible .entry k(.param .u64 output) {
+.reg .u64 %out, %offset;
+.reg .u32 %lane;
+.reg .b32 %d<4>, %a<2>, %b;
+ld.param.u64 %out, [output];
+mov.u32 %lane, %laneid;
+mul.wide.u32 %offset, %lane, 16;
+add.u64 %out, %out, %offset;
+mov.b32 %a0, 0x3c003c00;
+mov.b32 %a1, 0x3c003c00;
+mov.b32 %b, 0x3c003c00;
+mov.b32 %d0, 0;
+mov.b32 %d1, 0;
+mov.b32 %d2, 0;
+mov.b32 %d3, 0;
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a1}, {%b}, {%d0,%d1,%d2,%d3};
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%d0,%a1}, {%b}, {%d0,%d1,%d2,%d3};
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a1}, {%b}, {%d0,%d1,%d2,%d3};
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a1}, {%b}, {%d0,%d1,%d2,%d3};
+st.global.v4.b32 [%out], {%d0,%d1,%d2,%d3};
+ret;
+}

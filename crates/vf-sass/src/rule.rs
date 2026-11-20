@@ -1,0 +1,118 @@
+//! Rule application: transforms sm_75 instruction words to sm_70 using pre-computed rules.
+//!
+//! Each rule maps an sm_75 class to an sm_70 class. It carries a set of field-to-field moves
+//! (some with register/predicate conversion), a fixed base word for the sm_70 side, and
+//! constraints on which values are valid. This is a port of `remap.py`'s `Rule.apply`.
+
+use crate::field;
+use crate::generated::rules::*;
+use crate::generated::special::SCHEDULING;
+
+/// Find a pre-computed rule by sm_75 class name, sm_70 class name, and drop key.
+pub fn find_rule(sm75_name: &str, sm70_name: &str, drop_key: &str) -> Option<usize> {
+    RULES
+        .iter()
+        .position(|r| r.0 == sm75_name && r.1 == sm70_name && r.10 == drop_key)
+}
+
+/// Find the rule_of target for an sm_75 class (by class ID).
+pub fn rule_of_target(sm75_class_id: u16) -> Option<&'static str> {
+    RULE_OF
+        .iter()
+        .find(|&&(id, _)| id == sm75_class_id)
+        .map(|&(_, target)| target)
+}
+
+/// What applying a rule to an instruction word gave.
+pub enum Applied {
+    /// The sm_70 word.
+    Word(u128),
+    /// A field holds a value that sm_70 does not have.
+    NotAllowed,
+    /// A uniform register that no ordinary register stands for.
+    NoRegister(u32),
+    /// A uniform predicate that no ordinary predicate stands for.
+    NoPredicate(u32),
+}
+
+/// Apply rule at index `rule_idx` to an sm_75 instruction word.
+/// `register`: the ordinary register that stands for a uniform register, if one does.
+/// `predicate`: the same for a uniform predicate.
+pub fn apply(
+    rule_idx: usize,
+    word: u128,
+    register: &dyn Fn(u32) -> Option<u32>,
+    predicate: &dyn Fn(u32) -> Option<u32>,
+) -> Applied {
+    let r = &RULES[rule_idx];
+    let fixed = (r.3 as u128) << 64 | r.2 as u128;
+
+    // Check allowed values
+    let allowed = &RULE_ALLOWED[r.6 as usize..(r.6 + r.7) as usize];
+    for &(fid, values_offset) in allowed {
+        let val = field::get(fid, word) as u32;
+        // Walk the values list until sentinel (0xFFFFFFFF)
+        let mut found = false;
+        let mut idx = values_offset as usize;
+        while RULE_ALLOWED_VALUES[idx] != 0xFFFFFFFF {
+            if RULE_ALLOWED_VALUES[idx] == val {
+                found = true;
+                break;
+            }
+            idx += 1;
+        }
+        if !found {
+            return Applied::NotAllowed;
+        }
+    }
+
+    // Start with fixed bits and scheduling from the original
+    let mut out = fixed | (word & SCHEDULING);
+
+    // Apply moves
+    let moves = &RULE_MOVES[r.4 as usize..(r.4 + r.5) as usize];
+    for &(src_fid, dst_fid, conv) in moves {
+        let raw = field::get(src_fid, word);
+        let v: u64 = match conv {
+            1 => {
+                // Register: uniform -> ordinary
+                if raw == 63 {
+                    255
+                } else {
+                    match register(raw as u32) {
+                        Some(r) => r as u64,
+                        None => return Applied::NoRegister(raw as u32),
+                    }
+                }
+            }
+            2 => {
+                // Predicate: uniform -> ordinary
+                if raw == 7 {
+                    7
+                } else {
+                    match predicate(raw as u32) {
+                        Some(p) => p as u64,
+                        None => return Applied::NoPredicate(raw as u32),
+                    }
+                }
+            }
+            // A signed number into a wider field: the same number.
+            3 => field::signed(src_fid, word) as u64,
+            _ => raw,
+        };
+        out = field::put(dst_fid, out, v);
+    }
+
+    Applied::Word(out)
+}
+
+/// Get the dropped fields of a rule (for uniform_address checks).
+pub fn dropped_fields(rule_idx: usize) -> &'static [(&'static str, u16)] {
+    let r = &RULES[rule_idx];
+    &RULE_DROPPED[r.8 as usize..(r.8 + r.9) as usize]
+}
+
+/// Get the sm_70 class name of a rule.
+pub fn rule_sm70_name(rule_idx: usize) -> &'static str {
+    RULES[rule_idx].1
+}

@@ -1,0 +1,2206 @@
+#!/usr/bin/env python3
+"""controls.py [-u] [-c CONTROL]... CUBIN...: translations that are wrong on purpose, which
+validate.py must object to.
+
+validate.py says "0 problems" of the translation of all of PyTorch. That is worth what the check
+can see: each control here takes one thing away from the prototype (translate.py), translates the
+sm_75 cubins named with it, and counts what validate.py finds. A control that passes unnoticed
+(0 problems in every cubin) is a hole in the check; so is a problem in the translation as it is.
+
+    as it is    nothing taken away: no problem expected
+    unsaved     a predicate that stands for a uniform one while it holds something of the program
+                is not saved before nor given back after
+    blind       the stand-ins of uniform predicates are chosen as if no ordinary predicate held
+                anything
+    cut         the lives of a uniform predicate are cut at every instruction: what one
+                instruction writes, the next reads in what may be another predicate
+    masks       the P2R and R2P of the program are taken to read and write no predicate (the
+                predicates are a mask, a number: the tables do not say which)
+    nowait      the instruction after one that reads late a register of the translation does not
+                wait for it
+    close       a wait comes one cycle after the instruction that names its scoreboard
+    returns     a number that makes a return address is off by one instruction
+    waitless    what an instruction waited for, the first instruction of what it became does not
+                wait for (ULDC lost its wait that way until a review found it)
+    unlisted    the translation as it is, and a map that leaves out one instruction of each
+                function (what the map does not have, the check did not look at)
+    batched     an instruction with marks of register reuse that gets a stall which does not end
+                its group keeps the marks, which then name a batch (as until 2026-11-17)
+    unmoved     the relocations on code stay at the offsets they had, where other instructions
+                are now (as until 2026-11-17; cuFFT has such kernels)
+    named       the first relocation on code is made to name the function it is on, and the
+                function is translated all the same: the place it names would have moved
+    swapped     two instructions of the result that follow each other are exchanged, and the map
+                says so: each is what the map says, in another order
+    unguarded   the loads that stand for a matrix load under a guard have no guard
+    lanes       in the sequence that stands for a matrix load or product, a value is taken from
+                another lane, or another part of the lane's number
+    unwaited    in such a sequence, what reads the result of shuffles does not wait for them
+    soon        the selections after the last step of a product come two cycles after it, with a
+                wait for its scoreboard, and not eight (on a V100 they then read registers that
+                are not written yet)
+    unheld      a uniform predicate held in a register is not read back before the instructions
+                that read it: they go by whatever their predicate held
+    unwritten   it is not written down in the register after the instructions that write it
+    partial     R2P is taken to read its register only, not the predicates: two predicates given
+                back one after the other are one cycle apart (as until 2026-11-18: the second R2P
+                writes the first's predicate back as it was before), and a predicate that an
+                instruction just wrote is not waited for
+    boardless   a predicate saved, or all of them for R2P, is read without waiting for the
+                scoreboard that the instruction that wrote it announces it on
+    unmasked    an R2P of the program is taken to write what its operands say, no predicate (as
+                until 2026-11-18): a predicate that the translation saves right after it is
+                saved as it was before
+    early       a predicate saved in a register is given back as soon as the instruction before
+                allows, and not nine cycles after the last one that read what stood in it (on a
+                V100 that reader then goes by the value given back: PyTorch's f32 attention
+                faulted, 2026-11-18)
+    stale       every product after the first that gathers takes the elements of B where that
+                one left them, whatever happened since: the register of B written, a way in
+                from elsewhere, a call, another register of B gathered
+    unkept      of what a function with a product keeps of the lane, the lane that holds what
+                a thread gathers for the columns 4 to 7 is 8 further and not 16
+
+With pairs of products on whole rows (the translation as it is has them, unless VF_PAIRS=0:
+these change nothing then):
+
+    rowlane     one of the values kept of the lane for the rows is computed with another shift
+    otherrow    a whole-row load takes its second half of k where the first is
+    rowwait     the loads of rows do not wait for the shuffles that bring their addresses
+    rowread     the loads of rows do not say when they have read their address
+    halfswap    a half of a pair writes the accumulators of its two products the other way round
+    halfk       the first product of a pair is done on the second half of k and the second on the first
+    inplace     the first product of a pair adds to the destinations, whatever the two products
+                of the program add to (changes something only where a product does not add in place)
+    stepfast    the steps of a half of a pair are one cycle apart
+    unsettled   the conversions of accumulators start two cycles after the instruction that waits, not fifteen
+    unsynced    the instruction before conversions waits for the products' scoreboard only (as until
+                2026-11-18: a register that a load of the program was still filling was converted)
+    unpermuted  the conversions use the permutation of the other way
+    unconverted the conversions of the first place that has some are left out: every sequence is
+                as the design has it, and the plan is wrong (the checker of plans, qcheck.py,
+                must object: nothing else looks at the states of the accumulators)
+    notalso     a load whose result in Turing's layout something else reads does not give it
+                (the same: only the checker of plans knows who reads what)
+
+With a predicate that the program writes late (a comparison of doubles, an instruction of a late
+kind: docs/translator.md, "Predicates written late"; the translator takes such a predicate only
+behind a wait):
+
+    slowno      the instructions that do nothing, before what writes or saves a slow predicate,
+                are left out
+    slowshort   they last 3 cycles where 13 are needed and 15 where 26 are
+    slownowait  the first of them does not wait for the six scoreboards
+    slownever   slow predicates are taken like the others, with no wait: among them one that is
+                written late under no scoreboard, which may never stand for a uniform predicate
+    slowfree    no wait before the instructions that write a uniform predicate whose stand-in, in
+                a life where it is free, is slow
+    slowsaved   no wait before the first instruction of a life whose stand-in is slow and saved
+    alive_scratch
+                the predicate that a minimum or maximum computes into is one that holds something
+                of the program there
+
+With registers of the program borrowed (docs/translator.md, "Registers"). Few functions borrow
+at the default; with VF_BORROW=1 every function does:
+
+    alive_pair  the pair of registers given at an instruction is the lowest one of which a
+                register holds something there
+    alive_home  the home of each uniform register is the register after the one chosen
+    no_borrow_wait
+                where the first instruction of what an instruction became waits for the six
+                scoreboards, it waits for what the original waited for only
+    no_late_borrow
+                an instruction of the program that reads a borrowed register late does not say
+                when it has read
+    written_pair
+                the pair given at an instruction is one that the original instruction writes
+    shared_home what the homes take is forgotten once they are chosen: a register given at an
+                instruction may be the home of a uniform register that is alive there
+    overlap_pool
+                the same for the pairs only
+    short_home  the declarations say less than the life of a uniform register in its home: an
+                instruction of the life that neither reads nor writes it is left out (the
+                translation is as it was: what the validator is told is wrong)
+    pool_in_home_unsaid
+                as overlap_pool, and no line of the declarations says that the pair is taken
+                where it is the home of a uniform register that is alive
+
+With a frame in the thread's local memory (levels 2 and 3; VF_BORROW=8 puts every function at
+level 3):
+
+    no_lane_l3  the S2R that reads the lane before a matrix sequence is replaced by a NOP
+    odd_pair_l3 two uniform registers that make a pair are loaded from the frame into registers
+                that begin on an odd one
+    no_r1_lower the instruction that lowers the stack pointer by the frame is replaced by a NOP
+    wrong_r1_lower
+                it lowers the stack pointer by twice the frame
+    wrong_slot_load
+                the first load from the frame takes the word after its own
+    no_store_l3 nothing is stored to the frame
+    held_busy_l3
+                the register that holds a uniform predicate between the instructions that name
+                it is one where the program holds something at one of them
+    unkept_holder_l3
+                that register is not kept from the sequences: one of them may compute into it
+                while it holds the predicate
+    shared_holder_l3
+                the uniform predicates held in registers are all held in the first one's,
+                whether or not they are held at the same instructions
+    home_unsaid the declarations leave out the home of one of two uniform registers that have
+                one register for home at different instructions (the translation is as it was:
+                the register then stands for that uniform register in the whole function, for
+                all the validator is told)
+    guarded_store_l3
+                the stores to the frame after an instruction under a guard are under that guard
+    no_old_load_l3
+                what an instruction under a guard writes is not loaded from the frame before it
+    no_load_wait
+                what follows the last load from the frame does not wait for it
+    store_no_read_sb
+                the stores to the frame do not say when they have read
+    wrong_base_const
+                the base of the frame is taken from another constant
+    base_after_use_l3
+                the top of the frame is loaded after the first load or store that takes its
+                address from it, with the waits that this order asks for: that access is
+                addressed from what the register held before
+    missing_pool_line
+                the last register that the translator says it took at an instruction is not said
+    no_attr_raise
+                the attributes of the function are the original's, not raised by the frame
+    no_borrow_wait_l3
+                no instruction of a sequence that reads or writes the frame waits for the six
+                scoreboards
+    no_c3_wait  where the translation takes a register that the program writes late, the first
+                instruction of the sequence does not wait for the six scoreboards
+    store_before_l3
+                the stores to the frame come before what the instruction became, with the waits
+                that this order asks for: they store what was there, or what the register held
+    store_other_l3
+                where an instruction only writes a uniform register of the frame, the register
+                next to the one it computed into is stored
+    stray_store_l3
+                after an instruction that writes a uniform register of the frame, the same
+                value is stored to another uniform register too, which the instruction does
+                not write
+    standin_home_l3
+                a uniform register of the frame is loaded into the home of another uniform
+                register that the instruction reads or writes, and read from there
+    standin_operand_l3
+                a uniform register of the frame is loaded into an ordinary register that the
+                instruction itself reads, and read from there
+    standin_shared_l3
+                two uniform registers of the frame that an instruction reads are loaded into
+                one register
+
+With room made at an instruction (VF_BORROW=5 makes it where a kernel would otherwise need more
+registers than it has):
+
+    room_reads_orig
+                the first register put away is one that the original instruction reads
+    room_home_alive
+                the first register put away is also declared the home of a uniform register
+    room_no_back
+                the first load that brings a register back is replaced by a NOP
+    room_back_wrong_word
+                it brings the register back from the word after its own
+    room_away_after_write
+                the first store that puts a register away comes after the first instruction of
+                the sequence
+    room_same_word
+                two registers are put away in one word
+    room_at_branch
+                R2 is declared put away at the first branch or exit of the function, where
+                nothing puts it away
+    room_depth_wrong
+                the first store that puts a register away is where it would be if the program
+                had not moved the stack pointer
+    room_frame_short
+                the frame is declared with the size of the uniform values only
+    room_missing_lives
+                the registers put away are not declared
+    room_no_back_wait
+                what follows the last load that brings a register back does not wait for it
+    room_scratch_busy
+                at an instruction with room, the scratch register of a matrix load is R14, which
+                the program uses and which is not put away
+    room_back_first
+                the registers put away are brought back right after they were put away, before
+                the sequence that uses them, with the waits that this order asks for
+    room_back_before_store
+                a register put away that stands for a uniform register of the frame which the
+                instruction writes is brought back before that register is stored
+    room_away_after_load
+                a register put away that a load from the frame writes is put away after the
+                load: what is put away, and brought back, is the uniform register
+    copy_after_write
+                in the ORIGINAL, the copy of a return address and the write that follows it are
+                exchanged, and that program is translated as it is: the validator can no longer
+                work out what the call reads and writes, and must not take registers for free
+                where the translator did (no objection where the translator did not)
+
+With tensor-core products that take everything at the instruction (level 3):
+
+    product_odd_before_l3
+                `odd` is computed before the gathering, which still reads `half` in that register
+    product_busy_take_l3
+                the register of the A operand is declared taken at the product, where it holds
+                the operand
+    product_odd_pair_l3
+                the first pair taken for a product begins on an odd register
+    product_no_s2r_wait_l3
+                the first instruction that reads the lane does not wait for the S2R that reads it
+    product_soon_l3
+                the selections come two cycles after the last step of a product, not eight
+                (thirteen for halves)
+    load_ur_wrong_slot_l3
+                the first load of a uniform register before a matrix sequence takes the word
+                after its own
+    load_ur_no_wait_l3
+                the last such load names no scoreboard, and what follows does not wait for it
+
+Printed for each control and cubin: the number of problems, or `=` when the control changed
+nothing in that cubin's translation (it has nothing of what the control takes away, and says
+nothing). The exit status is 0 when the translation as it is has no problem and every control is
+objected to in one cubin at least. Which cubins: ones that have what the controls take away
+(predicates saved, a P2R of the program next to a uniform predicate, a call that is told where
+to return). With -c, only the controls named (and the translation as it is). With -u, the
+translation as it is is made and not validated: for a run of many processes, one of which
+validates it (`-c 'as it is'`).
+
+A control needs a translation that has what it takes away, and so the setting of the translator
+that makes it (above). tests/sass/controls.sh runs every control in a process of its own, with
+each setting, on the test kernels and on cubins of PyTorch that have what the controls need, and
+says which are objected to; docs/validation.md, section 3, has what comes of it. (Until
+2026-11-20 a control of borrowed registers left its change behind for the controls run after it
+in the same process.)
+
+A control may change a translation and find no objection: `blind` takes the lowest predicate the
+instructions of a life do not touch, and where the translator's own lives of predicates are more
+careful than nvdisasm's (they are, across calls within a function) that predicate may hold
+nothing after all. Such a 0 is worth a look, and is not a hole by itself.
+"""
+import collections, os, re, struct, subprocess, sys, tempfile
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import elf, machine, translate
+from machine import READ_BARRIER, WRITE_BARRIER, WAIT, stall_of, with_stall
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+Function = translate.Function
+
+
+def patched(control):
+    """{method name: replacement} for `control`."""
+    stand_ins, liveness, late, schedule, return_addresses = (
+        Function.stand_ins, Function.liveness, Function.late, Function.schedule, Function.return_addresses)
+    matrix_load, matrix_product, kept = Function.matrix_load, Function.matrix_product, Function.kept
+    kept_for_rows, whole_rows, half_of_pair, converted = Function.kept_for_rows, Function.whole_rows, Function.half_of_pair, Function.converted
+    given_back = Function.given_back
+
+    def alive_scratch_pred(self):
+        """For each minimum (scratch_at): replace its predicate with the HIGHEST one that
+        the instruction reads or writes (one that is alive there). The validator's check
+        for 'a predicate of the function, taken as dead, for a minimum or maximum' must
+        catch it."""
+        stand_ins(self)
+        for i in list(self.scratch_at):
+            d = self.src[i]
+            # Pick a predicate that IS alive: one the instruction reads or writes.
+            busy = (self.live_in[i] | self.live_out[i]) & 0x7f
+            if not busy:
+                continue
+            # Pick the highest busy predicate (most likely to be alive and not in scratch_at already).
+            for p in range(6, -1, -1):
+                if busy >> p & 1:
+                    self.scratch_at[i] = (p, self.scratch_at[i][1])
+                    break
+
+    def slowfree(self):
+        """Drop the delay at instructions that write the uniform predicate of a FREE life
+        whose stand-in is slow. The delay was set by delay(i, p) in stand_ins for each
+        instruction of a free life that writes the uniform predicate."""
+        stand_ins(self)
+        # Find free lives: (q, part, p, saved=False) in self.lives.
+        free_writes = set()   # {instruction index}
+        for q, p, saved, part in self.lives:
+            if saved or isinstance(saved, str):
+                continue
+            for i in part:
+                if self.defs[i] >> (7 + q) & 1 and self.slow_predicates >> p & 1:
+                    free_writes.add(i)
+        for i in list(self.delayed):
+            if i in free_writes:
+                del self.delayed[i]
+
+    def unsaved(self):
+        stand_ins(self)
+        self.saves.clear()
+        self.restores.clear()
+        self.scratch_at = {i: (p, None) for i, (p, k) in self.scratch_at.items()}
+
+    def blind(self):
+        liveness(self)
+        self.live_in = [x & ~0x7f for x in self.live_in]
+        self.live_out = [x & ~0x7f for x in self.live_out]
+
+    def cut(self):
+        liveness(self)
+        self.live_out = [x & 0x7f for x in self.live_out]
+
+    def masks(self):
+        kept = []
+        for d in self.src:
+            if d.c.name in ('p2r__RsIR_RIR', 'r2p__RIR'):
+                kept.append((d, d.ops['Sb']))
+                d.ops['Sb'] = 0
+        try:
+            liveness(self)
+        finally:
+            for d, value in kept:
+                d.ops['Sb'] = value
+
+    def nowait(self, c, word, i, what):
+        item = late(self, c, word, i, what)
+        item.late = False
+        return item
+
+    def close(self):
+        schedule(self)
+        items = self.items
+        for k in range(1, len(items)):
+            mask = (items[k].word >> WAIT) & 63
+            before = items[k - 1]
+            named = {(before.word >> WRITE_BARRIER) & 7, (before.word >> READ_BARRIER) & 7} - {7}
+            if (before.changed or items[k].changed) and any(mask >> s & 1 for s in named) and before.d.kind != 'BRU':
+                before.word = with_stall(before.word, 1)
+
+    def returns(self):
+        return_addresses(self)
+        for item in self.items:
+            if item.fix is not None and item.fix + 16 <= 16 * len(self.src):
+                item.fix += 16
+                break
+
+    def waitless(self):
+        for item in self.items:
+            if item.first and item.changed:
+                item.word &= ~(self.src[item.origin].word & (63 << WAIT))
+        schedule(self)
+
+    def other_lane(self, *args):
+        new = (matrix_load if len(args) == 4 else matrix_product)(self, *args)
+        by_name = self.mc.md70.by_name
+        for item in new:
+            if item.what == 'neighbour':
+                item.word = self.put(by_name['shfl__RII'], item.word, 'Sb', 2)
+                break
+            if item.what == 'row':
+                c = by_name['iadd3_imm__RsIR_RIR']
+                item.word = self.put(c, item.word, 'Sb', self.mc.d70.operands(c, item.word)['Sb'] ^ 2)
+                break
+        else:
+            for item in new:
+                if item.what == 'thread':
+                    c = by_name['lop3_lut__RuIR_RIR']
+                    item.word = self.put(c, item.word, 'Sb', 1)
+                    break
+        return new
+
+    def unguarded(self, *args):
+        new = matrix_load(self, *args)
+        c = self.mc.md70.by_name['lds__sImmOffset']
+        for item in new:
+            if item.what in ('half of the matrix', 'word of the matrix'):
+                item.word = self.put(c, item.word, 'Pg', 7)
+                for kind, fields, data in self.mc.d70.plan(c):
+                    if kind == 'attribute' and data == ('Pg', 'not'):
+                        item.word = fields[0].put(item.word, 0)
+        return new
+
+    def unwaited(self, *args):
+        new = (matrix_load if len(args) == 4 else matrix_product)(self, *args)
+        for item in new:
+            if item.what not in ('product',):
+                item.word &= ~(1 << (WAIT + translate.SEQUENCE))
+        return new
+
+    def soon(self, *args):
+        new = matrix_product(self, *args)
+        last = [item for item in new if item.what == 'product'][-1]
+        last.word = with_stall(last.word, 2)
+        return new
+
+    def early(self, k, p, i):
+        item = given_back(self, k, p, i)
+        item.more_writes = []
+        return item
+
+    def partial(self, item):
+        return []
+
+    def boardless(self, item, board):
+        pass
+
+    def unmasked(self, item):
+        return []
+
+    def unheld(self):
+        stand_ins(self)
+        for i in self.held:
+            self.held[i] = [(q, p, False, writes) for q, p, reads, writes in self.held[i]]
+
+    def unwritten(self):
+        stand_ins(self)
+        for i in self.held:
+            self.held[i] = [(q, p, reads, False) for q, p, reads, writes in self.held[i]]
+
+    def stale(self, i, rb):
+        return self.holds is not None
+
+    def unkept(self):
+        new = kept(self)
+        c = self.mc.md70.by_name['lop3_lut__RuIR_RIR']
+        new[3].word = self.put(c, new[3].word, 'Sb', 8)
+        return new
+
+    def rowlane(self):
+        # (The first instruction is the first shift of the row of A: by 2, here by 3.)
+        new = kept_for_rows(self)
+        if new:
+            new[0].word = self.put(self.mc.md70.by_name['shf__RuIR_RIR'], new[0].word, 'Sb', 3)
+        return new
+
+    def otherrow(self, *args):
+        new = whole_rows(self, *args)
+        c = self.mc.md70.by_name['lds__sImmOffset']
+        loads = [item for item in new if item.what == 'whole row']
+        first = self.mc.decode(70, loads[0].word).ops['Ra_offset']
+        loads[1].word = self.put(c, loads[1].word, 'Ra_offset', first)
+        return new
+
+    def rowwait(self, *args):
+        new = whole_rows(self, *args)
+        for item in new:
+            if item.what.startswith('whole row'):
+                item.word &= ~((1 << (WAIT + translate.SEQUENCE)) | (1 << (WAIT + translate.ARRIVES)))
+        return new
+
+    def rowread(self, *args):
+        new = whole_rows(self, *args)
+        for item in new:
+            if item.what == 'whole row':
+                item.word |= 7 << READ_BARRIER
+                item.late = False
+        return new
+
+    def halfswap(self, i, *args):
+        site = self.q.sites[i]
+        site['x'], site['y'] = site['y'], site['x']
+        try:
+            return half_of_pair(self, i, *args)
+        finally:
+            site['x'], site['y'] = site['y'], site['x']
+
+    def halfk(self, i, *args):
+        site = self.q.sites[i]
+        site['half'] ^= 1
+        try:
+            return half_of_pair(self, i, *args)
+        finally:
+            site['half'] ^= 1
+
+    def inplace(self, i, *args):
+        site = self.q.sites[i]
+        kept = site['cx'], site['cy']
+        site['cx'], site['cy'] = site['x'], site['y']
+        try:
+            return half_of_pair(self, i, *args)
+        finally:
+            site['cx'], site['cy'] = kept
+
+    def stepfast(self, *args):
+        new = half_of_pair(self, *args)
+        for item in new[:3]:
+            item.word = with_stall(item.word, 1)
+        return new
+
+    def unsettled(self, *args):
+        new = converted(self, *args)
+        if new:
+            new[0].word = with_stall(new[0].word, 2)
+        return new
+
+    def unsynced(self, *args):
+        new = converted(self, *args)
+        if new:
+            new[0].word = (new[0].word & ~(63 << WAIT)) | (1 << (WAIT + translate.SEQUENCE))
+        return new
+
+    def unconverted(self, i, plan):
+        if plan and i == min(plan):
+            return []
+        return converted(self, i, plan)
+
+    def notalso(self, i, *args):
+        load = self.q.loads[i]
+        was, load['also'] = load['also'], False
+        try:
+            return whole_rows(self, i, *args)
+        finally:
+            load['also'] = was
+
+    def unpermuted(self, i, plan):
+        if not {'pi', 'inv'} <= set(self.kept_rows):
+            return converted(self, i, plan)
+        other = {i: [(r, translate.pairing.T if to == translate.pairing.Q else translate.pairing.Q) for r, to in plan.get(i, [])]}
+        new = converted(self, i, other)
+        for item in new:
+            item.what = {'to pairs': 'from pairs', 'from pairs': 'to pairs'}.get(item.what, item.what)
+        return new
+
+    all_controls = {
+        'as it is': {},
+        'unsaved': {'stand_ins': unsaved},
+        'blind': {'liveness': blind},
+        'cut': {'liveness': cut},
+        'masks': {'liveness': masks},
+        'nowait': {'late': nowait},
+        'close': {'schedule': close},
+        'returns': {'return_addresses': returns},
+        'waitless': {'schedule': waitless},
+        'unlisted': {},
+        'swapped': {},
+        'batched': {},
+        'unmoved': {},
+        'named': {},
+        'unguarded': {'matrix_load': unguarded},
+        'lanes': {'matrix_load': other_lane, 'matrix_product': other_lane},
+        'unwaited': {'matrix_load': unwaited, 'matrix_product': unwaited},
+        'soon': {'matrix_product': soon},
+        'partial': {'all_predicates': partial},
+        'boardless': {'waits_for': boardless},
+        'unmasked': {'masked': unmasked},
+        'early': {'given_back': early},
+        'unheld': {'stand_ins': unheld},
+        'unwritten': {'stand_ins': unwritten},
+        'stale': {'kept_gathering': stale},
+        'unkept': {'kept': unkept},
+        'rowlane': {'kept_for_rows': rowlane},
+        'otherrow': {'whole_rows': otherrow},
+        'rowwait': {'whole_rows': rowwait},
+        'rowread': {'whole_rows': rowread},
+        'halfswap': {'half_of_pair': halfswap},
+        'halfk': {'half_of_pair': halfk},
+        'inplace': {'half_of_pair': inplace},
+        'stepfast': {'half_of_pair': stepfast},
+        'unsettled': {'converted': unsettled},
+        'unsynced': {'converted': unsynced},
+        'unpermuted': {'converted': unpermuted},
+        'unconverted': {'converted': unconverted},
+        'notalso': {'whole_rows': notalso},
+        'slowno': {},
+        'slowshort': {},
+        'slownowait': {},
+        'slownever': {},
+        'slowfree': {'stand_ins': slowfree},
+        'slowsaved': {},
+        'alive_scratch': {'stand_ins': alive_scratch_pred},
+        'alive_pair': {},
+        'alive_home': {},
+        'no_borrow_wait': {},
+        'no_late_borrow': {},
+        'written_pair': {},
+        'shared_home': {},
+        'overlap_pool': {},
+        'short_home': {},
+        'pool_in_home_unsaid': {},
+    }
+    # ---- level 3 controls (the frame) ----
+    from_memory, to_memory = Function.from_memory, Function.to_memory
+    frame_top_orig = Function.frame_top
+
+    def from_memory_no_lane(self, i, d):
+        """Unused: the lane is not created by from_memory."""
+        return from_memory(self, i, d)
+
+    def from_memory_odd_pair(self, i, d):
+        """A pair loaded into two single registers (odd first register)."""
+        items = from_memory(self, i, d)
+        if self.borrow and self.borrow.slots:
+            _, _, together = self.in_frame(d)
+            for u in together:
+                if u in self._mem_regs and u + 1 in self._mem_regs:
+                    r = self._mem_regs[u]
+                    if r % 2 == 0:
+                        # Shift to odd: use r+1 and r+2 instead of r and r+1
+                        old_r, old_r1 = self._mem_regs[u], self._mem_regs[u + 1]
+                        new_r = r + 1
+                        self._mem_regs[u] = new_r
+                        self._mem_regs[u + 1] = new_r + 1
+                        for item in items:
+                            # Replace register references in the LDL items
+                            mc = self.mc
+                            d70 = mc.decode(70, item.word)
+                            if d70 and d70.mnemonic == 'LDL':
+                                if d70.ops.get('Rd') == old_r:
+                                    item.word = mc.assemble('ldl__sImmOffset', Rd=new_r, Ra=d70.ops['Ra'], Ra_offset=d70.ops.get('Ra_offset', 0), dst_wr_sb=d70.ops.get('dst_wr_sb', 7))
+                                elif d70.ops.get('Rd') == old_r1:
+                                    item.word = mc.assemble('ldl__sImmOffset', Rd=new_r + 1, Ra=d70.ops['Ra'], Ra_offset=d70.ops.get('Ra_offset', 0), dst_wr_sb=d70.ops.get('dst_wr_sb', 7))
+                        break
+        return items
+
+    def from_memory_wrong_slot(self, i, d):
+        """A load from the wrong slot (offset +4)."""
+        items = from_memory(self, i, d)
+        mc = self.mc
+        for item in items:
+            d70 = mc.decode(70, item.word)
+            if d70 and d70.mnemonic == 'LDL':
+                offset = d70.ops.get('Ra_offset', 0)
+                # Shift offset by 4 (wrong slot)
+                item.word = mc.assemble('ldl__sImmOffset', Rd=d70.ops['Rd'], Ra=d70.ops['Ra'],
+                                        Ra_offset=(offset + 4) & 0xFFFFFF, dst_wr_sb=d70.ops.get('dst_wr_sb', 7))
+                break
+        return items
+
+    def from_memory_no_wait(self, i, d):
+        """No wait after the last load: clear the 'then' attribute on the last load."""
+        items = from_memory(self, i, d)
+        # Clear the wait-for on loads.
+        for item in reversed(items):
+            if item.what.startswith('mem: load'):
+                item.then = None
+                break
+        return items
+
+    def to_memory_none(self, i, d):
+        """A store left out (no stores at all)."""
+        return []
+
+    def to_memory_guarded(self, i, d):
+        """The stores under the instruction's guard: they go by what the predicate holds after
+        the instruction."""
+        items = to_memory(self, i, d)
+        mc, ops, guard = self.mc, d.ops, None
+        if ops.get('UPg', 7) != 7 or ops.get('UPg@not'):
+            guard = {'Pg': self.P(ops['UPg']), 'Pg_not': ops.get('UPg@not', 0)}
+        elif ops.get('Pg', 7) != 7 or ops.get('Pg@not'):
+            guard = {'Pg': ops['Pg'], 'Pg_not': ops.get('Pg@not', 0)}
+        if guard is not None:
+            plain = mc.assemble('stl__sImmOffset', Ra=1, Rb=2, Ra_offset=0)
+            under = mc.assemble('stl__sImmOffset', Ra=1, Rb=2, Ra_offset=0, **guard)
+            for item in items:
+                if item.what.startswith('mem: store '):
+                    item.word ^= plain ^ under
+        return items
+
+    def from_memory_no_old(self, i, d):
+        """What an instruction under a guard writes is not loaded before it: the store after it
+        writes what the register happened to hold when the instruction did not run."""
+        saved = translate.pairing.unguarded
+        translate.pairing.unguarded = lambda d: True
+        try:
+            return from_memory(self, i, d)
+        finally:
+            translate.pairing.unguarded = saved
+
+    def to_memory_no_read_sb(self, i, d):
+        """A store that does not say when it has read."""
+        items = to_memory(self, i, d)
+        for item in items:
+            d70 = self.mc.decode(70, item.word)
+            if d70 and d70.mnemonic == 'STL':
+                item.word |= 7 << READ_BARRIER
+                item.late = False
+        return items
+
+
+
+    def frame_top_wrong_const(self, i, items):
+        """The base loaded from another constant (c[0x0][0x20] instead of c[0x0][0x28])."""
+        if self._base is None:
+            self._base = self.take(1)
+            items.append(translate.Item(self.mc.assemble('mov__RCR_RC', Rd=self._base, Sb_bank=0, Sb_addr=0x20 // 4), i, 'mem: base'))
+        return self._base
+
+    # ---- level 3 controls: the values that the moves of the frame carry ----
+    AROUND = ('wait', 'save', 'restore', 'lane', 'kept', 'settled', 'to pairs', 'from pairs', 'held: back', 'held: kept', 'late predicate')
+
+    def is_core(what):
+        return what not in AROUND and not what.startswith(('mem: ', 'room: '))
+
+    def reordered(self, pick):
+        """The items of each instruction put in the order that `pick` gives for them (None: as
+        they are), before the schedule is made: the first of them waits for what the first
+        waited for, and what follows an item that asks to be waited for waits for it. So the
+        order is the only thing wrong."""
+        items, out, k, changed = self.items, [], 0, False
+        while k < len(items):
+            j = k
+            while j < len(items) and items[j].origin == items[k].origin:
+                j += 1
+            group = items[k:j]
+            new = pick(group) if all(item.target is None for item in group) else None
+            if new is not None and new != group:
+                new[0].word |= group[0].word & (63 << WAIT)
+                for n, item in enumerate(new):
+                    item.first = n == 0
+                group, changed = new, True
+            out += group
+            k = j
+        if changed:
+            for k, item in enumerate(out[:-1]):
+                for board in ([item.then] if item.then is not None else []) + item.also:
+                    out[k + 1].word |= 1 << (WAIT + board)
+            self.items = out
+
+    def register_of(self, item, operand):
+        d70 = self.mc.decode(70, item.word)
+        return d70.ops.get(operand) if d70 is not None else None
+
+    def schedule_store_before(self):
+        def pick(group):
+            whats = [item.what for item in group]
+            core = [k for k, w in enumerate(whats) if is_core(w)]
+            # (With the base, when it is loaded for the stores.)
+            moved = [k for k, w in enumerate(whats) if core and k > core[-1] and (w.startswith('mem: store ') or w == 'mem: base')]
+            if not any(whats[k].startswith('mem: store ') for k in moved):
+                return None
+            return group[:core[0]] + [group[k] for k in moved] + [item for k, item in enumerate(group) if k >= core[0] and k not in moved]
+        reordered(self, pick)
+        schedule(self)
+
+    def schedule_base_late(self):
+        def pick(group):
+            bases = [k for k, item in enumerate(group) if item.what == 'mem: base']
+            if not bases:
+                return None
+            users = [k for k, item in enumerate(group)
+                     if k > bases[0] and item.what.startswith(('mem: load ', 'mem: store '))
+                     and register_of(self, item, 'Ra') == register_of(self, group[bases[0]], 'Rd')]
+            if not users:
+                return None
+            b, u = bases[0], users[0]
+            return group[:b] + group[b + 1:u + 1] + [group[b]] + group[u + 1:]
+        reordered(self, pick)
+        schedule(self)
+
+    def schedule_back_first(self):
+        def pick(group):
+            aways = [k for k, item in enumerate(group) if item.what.startswith('room: ') and item.what.endswith(' away')]
+            backs = [item for item in group if item.what.startswith('room: ') and item.what.endswith(' back')]
+            if not aways or not backs:
+                return None
+            rest = [item for item in group if item not in backs]
+            at = aways[-1] + 1
+            return rest[:at] + backs + rest[at:]
+        reordered(self, pick)
+        schedule(self)
+
+    def schedule_back_before_store(self):
+        def pick(group):
+            backs = [item for item in group if item.what.startswith('room: ') and item.what.endswith(' back')]
+            stores = [k for k, item in enumerate(group) if item.what.startswith('mem: store ')]
+            away = {register_of(self, item, 'Rd') for item in backs}
+            if not backs or not stores or not any(register_of(self, group[k], 'Rb') in away for k in stores):
+                return None
+            rest = [item for item in group if item not in backs]
+            at = rest.index(group[stores[0]])
+            return rest[:at] + backs + rest[at:]
+        reordered(self, pick)
+        schedule(self)
+
+    def schedule_away_after_load(self):
+        def pick(group):
+            aways = [item for item in group if item.what.startswith('room: ') and item.what.endswith(' away')]
+            loads = [k for k, item in enumerate(group) if item.what.startswith('mem: load ')]
+            away = {register_of(self, item, 'Rb') for item in aways}
+            if not aways or not loads or not any(register_of(self, group[k], 'Rd') in away for k in loads):
+                return None
+            last = group[loads[-1]]
+            rest = [item for item in group if item not in aways]
+            at = rest.index(last) + 1
+            return rest[:at] + aways + rest[at:]
+        reordered(self, pick)
+        schedule(self)
+
+    def load_into(self, items, u, r):
+        """The load of uniform register `u` among `items` made to write register `r`, which
+        then stands for `u` in what the instruction becomes."""
+        mc = self.mc
+        self._mem_regs[u] = r
+        for item in items:
+            if item.what == 'mem: load UR%d' % u:
+                d70 = mc.decode(70, item.word)
+                item.word = mc.assemble('ldl__sImmOffset', Rd=r, Ra=d70.ops['Ra'], Ra_offset=d70.ops.get('Ra_offset', 0),
+                                        dst_wr_sb=d70.ops.get('dst_wr_sb', 7))
+
+    def alone(self, d):
+        """The uniform registers of the frame that instruction `d` reads, one register each."""
+        read, written, together = self.in_frame(d)
+        return sorted(u for u in read if u not in together and u - 1 not in together)
+
+    def from_memory_into_home(self, i, d):
+        items = from_memory(self, i, d)
+        if items and self.borrow is not None and self.borrow.homes:
+            homes = self.borrow.homes
+            there = [homes[u] for l, u, *_ in d.reads if l == 'U' and u in homes] + [homes[u] for l, u in d.writes if l == 'U' and u in homes]
+            mine = alone(self, d)
+            if there and mine:
+                load_into(self, items, mine[0], there[0])
+        return items
+
+    def from_memory_into_operand(self, i, d):
+        items = from_memory(self, i, d)
+        if items and self.borrow is not None:
+            reads = [r for l, r, *_ in d.reads if l == 'R' and 2 <= r < 255]
+            writes = {r for l, r in d.writes if l == 'R'}
+            # (One that it writes too, where there is one: a register of the program that the
+            # translation may write at that instruction.)
+            both = [r for r in reads if r in writes]
+            mine = alone(self, d)
+            if reads and mine:
+                load_into(self, items, mine[0], (both or reads)[0])
+        return items
+
+    def from_memory_shared(self, i, d):
+        items = from_memory(self, i, d)
+        if items and self.borrow is not None:
+            mine = alone(self, d)
+            if len(mine) >= 2:
+                load_into(self, items, mine[1], self._mem_regs[mine[0]])
+        return items
+
+    def to_memory_other(self, i, d):
+        items = to_memory(self, i, d)
+        if not items or not translate.pairing.unguarded(d):
+            return items        # (What an instruction under a guard writes was loaded: rule B3 has that.)
+        read, written, together = self.in_frame(d)
+        mc = self.mc
+        c = mc.md70.by_name['stl__sImmOffset']
+        for k, item in enumerate(items):
+            m = re.match(r'mem: store UR(\d+)$', item.what)
+            if m and int(m.group(1)) not in read and int(m.group(1)) not in together and int(m.group(1)) - 1 not in together:
+                d70 = mc.decode(70, item.word)
+                word = mc.assemble('stl__sImmOffset', Ra=d70.ops['Ra'], Rb=d70.ops['Rb'] ^ 1, Ra_offset=d70.ops.get('Ra_offset', 0))
+                items[k] = self.late(c, word, i, item.what)
+        return items
+
+    def to_memory_stray(self, i, d):
+        items = to_memory(self, i, d)
+        if items and self.borrow is not None:
+            read, written, together = self.in_frame(d)
+            other = [u for u in sorted(self.borrow.slots) if u not in read and u not in written]
+            if written and other:
+                mc = self.mc
+                top, offset = self.slot(other[0], i, items)
+                word = mc.assemble('stl__sImmOffset', Ra=top, Rb=self._mem_regs[min(written)], Ra_offset=offset)
+                items.append(self.late(mc.md70.by_name['stl__sImmOffset'], word, i, 'mem: store UR%d' % other[0]))
+        return items
+
+    # ---- level 3 product controls ----
+    def product_odd_before_l3(self, i, d, wait):
+        """Odd computed before the gathering that still reads half: move the two 'kept: odd'
+        instructions to right after the 'kept: half' instructions and before 'neighbour'."""
+        new = matrix_product(self, i, d, wait)
+        if not (self.borrow is not None and self.borrow.everything):
+            return new
+        odd_items = [item for item in new if item.what == 'kept: odd']
+        rest_items = [item for item in new if item.what != 'kept: odd']
+        # Insert odd items right after the last 'kept: half' and before 'neighbour'.
+        insert_at = next((k for k, item in enumerate(rest_items) if item.what == 'neighbour'), len(rest_items))
+        return rest_items[:insert_at] + odd_items + rest_items[insert_at:]
+
+    def product_odd_pair_l3(self, i, d, wait):
+        """A pair from an odd register: make take(2) return an odd register for the first pair."""
+        if not (self.borrow is not None and self.borrow.everything):
+            return matrix_product(self, i, d, wait)
+        orig_free = self.borrow.__class__.free_at
+        pair_count = [0]
+        def odd_free(borrow_self, inst, width=1, given=0):
+            r = orig_free(borrow_self, inst, width, given)
+            if width == 2 and r is not None and r % 2 == 0:
+                pair_count[0] += 1
+                if pair_count[0] == 1:
+                    # Return an odd register instead.
+                    return r + 1
+            return r
+        self.borrow.__class__.free_at = odd_free
+        try:
+            return matrix_product(self, i, d, wait)
+        finally:
+            self.borrow.__class__.free_at = orig_free
+
+    def product_soon_l3(self, i, d, wait):
+        """Selections too soon after the last step: set the stall on the last HMMA step to 2
+        instead of 8 (floats) or 13 (halves)."""
+        new = matrix_product(self, i, d, wait)
+        if not (self.borrow is not None and self.borrow.everything):
+            return new
+        products = [item for item in new if item.what == 'product']
+        if products:
+            products[-1].word = with_stall(products[-1].word, 2)
+        return new
+
+    all_controls.update({
+        'no_lane_l3': {},
+        'odd_pair_l3': {'from_memory': from_memory_odd_pair},
+        'no_r1_lower': {},
+        'wrong_r1_lower': {},
+        'no_attr_raise': {},
+        'wrong_slot_load': {'from_memory': from_memory_wrong_slot},
+        'no_store_l3': {'to_memory': to_memory_none},
+        'held_busy_l3': {},
+        'unkept_holder_l3': {},
+        'shared_holder_l3': {},
+        'home_unsaid': {},
+        'guarded_store_l3': {'to_memory': to_memory_guarded},
+        'no_old_load_l3': {'from_memory': from_memory_no_old},
+        'no_load_wait': {},
+        'store_no_read_sb': {'to_memory': to_memory_no_read_sb},
+        'no_borrow_wait_l3': {},
+        'wrong_base_const': {'frame_top': frame_top_wrong_const},
+        'base_after_use_l3': {'schedule': schedule_base_late},
+        'missing_pool_line': {},
+        'no_c3_wait': {},
+        'store_before_l3': {'schedule': schedule_store_before},
+        'store_other_l3': {'to_memory': to_memory_other},
+        'stray_store_l3': {'to_memory': to_memory_stray},
+        'standin_home_l3': {'from_memory': from_memory_into_home},
+        'standin_operand_l3': {'from_memory': from_memory_into_operand},
+        'standin_shared_l3': {'from_memory': from_memory_shared},
+        # ---- room controls ----
+        'room_reads_orig': {},
+        'room_home_alive': {},
+        'room_no_back': {},
+        'room_back_wrong_word': {},
+        'room_away_after_write': {},
+        'room_same_word': {},
+        'room_at_branch': {},
+        'room_depth_wrong': {},
+        'room_frame_short': {},
+        'room_missing_lives': {},
+        'room_no_back_wait': {},
+        'room_scratch_busy': {},
+        'room_back_first': {'schedule': schedule_back_first},
+        'room_back_before_store': {'schedule': schedule_back_before_store},
+        'room_away_after_load': {'schedule': schedule_away_after_load},
+        'copy_after_write': {},
+        # ---- level 3 product controls ----
+        'product_odd_before_l3': {'matrix_product': product_odd_before_l3},
+        'product_busy_take_l3': {},
+        'product_odd_pair_l3': {'matrix_product': product_odd_pair_l3},
+        'product_no_s2r_wait_l3': {},
+        'product_soon_l3': {'matrix_product': product_soon_l3},
+        # ---- level 3 load with UR controls ----
+        'load_ur_wrong_slot_l3': {},
+        'load_ur_no_wait_l3': {},
+    })
+    return all_controls[control]
+
+
+CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', 'returns', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
+# (Those of pairs of products on whole rows: only when the translator makes them, not with VF_PAIRS=0.)
+PAIR_CONTROLS = ['rowlane', 'otherrow', 'rowwait', 'rowread', 'halfswap', 'halfk', 'inplace', 'stepfast', 'unsettled', 'unsynced', 'unpermuted', 'unconverted', 'notalso']
+CONTROLS += PAIR_CONTROLS
+# (Those of borrowed registers: only when VF_BORROW=1.)
+BORROW_CONTROLS = ['alive_pair', 'alive_home', 'no_borrow_wait', 'no_late_borrow', 'written_pair', 'shared_home', 'overlap_pool', 'short_home', 'pool_in_home_unsaid']
+CONTROLS += BORROW_CONTROLS
+# (Those of level 3: only when VF_BORROW>=2 and a function uses the frame.)
+FRAME_CONTROLS = ['no_lane_l3', 'odd_pair_l3', 'no_r1_lower', 'wrong_r1_lower', 'wrong_slot_load', 'no_store_l3', 'held_busy_l3', 'unkept_holder_l3', 'shared_holder_l3', 'home_unsaid', 'guarded_store_l3', 'no_old_load_l3', 'no_load_wait', 'store_no_read_sb', 'wrong_base_const', 'missing_pool_line', 'no_attr_raise', 'no_borrow_wait_l3', 'no_c3_wait',
+                  'store_before_l3', 'store_other_l3', 'stray_store_l3', 'standin_home_l3', 'standin_operand_l3', 'standin_shared_l3',
+                  'base_after_use_l3']
+CONTROLS += FRAME_CONTROLS
+# (Those of a frame addressed from its top, which a register is loaded with: at VF_BORROW=3,
+# and wherever the program moves its stack pointer in a way that is not followed.)
+BASE_CONTROLS = ['wrong_base_const', 'base_after_use_l3']
+# (Those of room made: only when VF_BORROW>=5 and a function has room.)
+ROOM_CONTROLS = ['room_reads_orig', 'room_home_alive', 'room_no_back', 'room_back_wrong_word', 'room_away_after_write', 'room_same_word', 'room_at_branch', 'room_depth_wrong', 'room_frame_short', 'room_missing_lives', 'room_no_back_wait', 'room_scratch_busy', 'copy_after_write',
+                 'room_back_first', 'room_back_before_store', 'room_away_after_load']
+CONTROLS += ROOM_CONTROLS
+# (Those of level-3 products: only when VF_BORROW>=7 and a function has products at level 3.)
+PRODUCT_L3_CONTROLS = ['product_odd_before_l3', 'product_busy_take_l3', 'product_odd_pair_l3', 'product_no_s2r_wait_l3', 'product_soon_l3', 'load_ur_wrong_slot_l3', 'load_ur_no_wait_l3']
+CONTROLS += PRODUCT_L3_CONTROLS
+# (Of another kind: the PROGRAM is changed, and what is validated is the translator's own
+# translation of it. The validator objects where it is the more careful of the two; no objection
+# is what a translator as careful as the validator gets, and is no hole.)
+CHANGES_THE_PROGRAM = ['copy_after_write']
+
+
+def naming_code(data):
+    """The cubin `data` with its first relocation on code made to name the function it is on;
+    None when it has no relocation on code."""
+    container = elf.Elf(data)
+    symbols = container.symbols()
+    for s in container.sections:
+        if s.type in (elf.SHT_REL, elf.SHT_RELA) and s.info < len(container.sections) and container.sections[s.info].name.startswith('.text.') and len(s.data) >= 16:
+            own = next((k for k, symbol in enumerate(symbols) if symbol[3] == s.info and symbol[1] & 15 == 2), None)
+            if own is not None:
+                offset, info = struct.unpack_from('<QQ', s.data, 0)
+                s.data = struct.pack('<QQ', offset, (own << 32) | (info & 0xffffffff)) + s.data[16:]
+                return container.write()
+    return None
+
+
+def run(mc, control, path, out_dir, untouched, validated=True):
+    """(problems validate.py finds, its first objection) for one cubin; (None, '') when the control
+    changed nothing in its translation, which `untouched` holds by path. (`validated` false: the
+    translation as it is is kept there and not validated.)"""
+    originals = {name: getattr(Function, name) for name in ('stand_ins', 'liveness', 'late', 'schedule', 'return_addresses', 'matrix_load', 'matrix_product', 'kept', 'kept_gathering', 'given_back', 'all_predicates', 'waits_for', 'masked',
+                                                             'kept_for_rows', 'whole_rows', 'half_of_pair', 'converted',
+                                                             'from_memory', 'to_memory', 'frame_top')}
+    for name, replacement in patched(control).items():
+        setattr(Function, name, replacement)
+    stall, relocations_of = translate.with_stall, translate.relocations_of
+    # Slow-predicate controls.
+    if control == 'slowno':
+        # The wait is left out: delayed cleared.
+        orig_stand_ins_sn = Function.stand_ins
+        def no_delay_stand_ins(self):
+            orig_stand_ins_sn(self)
+            self.delayed = {}
+        originals['stand_ins'] = Function.stand_ins
+        Function.stand_ins = no_delay_stand_ins
+    elif control == 'slowshort':
+        # The wait is too short: 13 made 3, 26 made 15.
+        orig_stand_ins_ss = Function.stand_ins
+        def short_delay_stand_ins(self):
+            orig_stand_ins_ss(self)
+            for i in list(self.delayed):
+                if self.delayed[i] >= 26:
+                    self.delayed[i] = 15
+                elif self.delayed[i] >= 13:
+                    self.delayed[i] = 3
+        originals['stand_ins'] = Function.stand_ins
+        Function.stand_ins = short_delay_stand_ins
+    elif control == 'slownowait':
+        # The first NOP does not wait for all scoreboards. (The words are changed when the
+        # function is assembled, `Function.finish`: `Function.translate` returns the bytes.)
+        orig_finish_snw = Function.finish
+        def nowait_finish(self):
+            for item in self.items:
+                if item.what == 'late predicate' and (item.word >> WAIT) & 63 == 63:
+                    item.word &= ~(63 << WAIT)
+                    break
+            return orig_finish_snw(self)
+        originals['finish'] = Function.finish
+        Function.finish = nowait_finish
+    elif control == 'slownever':
+        # `never` not respected: force slow_predicates to 0 so the translator picks never-predicates.
+        orig_stand_ins_snv = Function.stand_ins
+        def no_never_stand_ins(self):
+            orig_stand_ins_snv(self)
+            self.slow_predicates = 0
+            self.delayed = {}
+        originals['stand_ins'] = Function.stand_ins
+        Function.stand_ins = no_never_stand_ins
+    elif control == 'slowsaved':
+        # Drop the delay at the first instruction of a SAVED life whose stand-in is slow:
+        # the writes within the run then have no coverage.
+        orig_stand_ins_ssv = Function.stand_ins
+        def no_saved_delay_stand_ins(self):
+            orig_stand_ins_ssv(self)
+            saved_first = set()
+            for q, p, saved, part in self.lives:
+                if saved and not isinstance(saved, str) and len(part) >= 2:
+                    if self.slow_predicates >> p & 1:
+                        saved_first.add(part[0])
+            for i in list(self.delayed):
+                if i in saved_first:
+                    del self.delayed[i]
+        originals['stand_ins'] = Function.stand_ins
+        Function.stand_ins = no_saved_delay_stand_ins
+    # Borrow controls: patch Borrowed methods.
+    Borrowed = translate.Borrowed
+    borrow_saved = {}
+    # (The pair is what `Borrowed.free_at` gives for a width of two: the controls on it change that
+    # answer and leave the registers taken one by one alone.)
+    if control == 'alive_pair':
+        borrow_saved['free_at'] = Borrowed.free_at
+        orig = Borrowed.free_at
+        def bad_pair(self, i, width=1, given=0):
+            good = orig(self, i, width, given)
+            if good is None or width != 2:
+                return good
+            held = self.busy[i] | self.taken[i] | given
+            for r in range(2, self.top + 2 - width, 2):
+                if any(held >> (r + k) & 1 for k in range(width)):
+                    return r
+            return good
+        Borrowed.free_at = bad_pair
+    elif control == 'alive_home':
+        borrow_saved['__init__'] = Borrowed.__init__
+        orig_init = Borrowed.__init__
+        def bad_init(self, f, *args, **kwargs):
+            orig_init(self, f, *args, **kwargs)
+            for u, r in list(self.homes.items()):
+                if r + 2 <= self.top + 1:
+                    self.homes[u] = r + 1
+                    self.used.discard(r)
+                    self.used.add(r + 1)
+        Borrowed.__init__ = bad_init
+    elif control == 'no_borrow_wait':
+        # Where the first instruction of what an instruction became waits for all six scoreboards
+        # (it writes a borrowed register), it waits for what the original waited for only.
+        orig_finish_nbw = Function.finish
+        def no_wait_finish(self):
+            if self.borrow is not None:
+                for item in self.items:
+                    if item.first and item.changed and (item.word >> WAIT) & 63 == 63:
+                        src_wait = (self.src[item.origin].word >> WAIT) & 63
+                        item.word = (item.word & ~(63 << WAIT)) | (src_wait << WAIT)
+            return orig_finish_nbw(self)
+        originals['finish'] = Function.finish
+        Function.finish = no_wait_finish
+    elif control == 'no_late_borrow':
+        # An instruction of the program that was made to say when it has read (it reads a
+        # borrowed register late) does not say it.
+        orig_finish_nlb = Function.finish
+        def no_late_finish(self):
+            if self.borrow is not None and self.borrow.used:
+                for item in self.items:
+                    if item.says:
+                        item.word |= 7 << READ_BARRIER
+                        item.says = False
+            return orig_finish_nlb(self)
+        originals['finish'] = Function.finish
+        Function.finish = no_late_finish
+    elif control == 'shared_home':
+        borrow_saved['__init__'] = Borrowed.__init__
+        orig_init_sh = Borrowed.__init__
+        def no_taken_init(self, f, *args, **kwargs):
+            orig_init_sh(self, f, *args, **kwargs)
+            # Clear `taken` so that two URs may share a home.
+            self.taken = [0] * len(self.taken)
+        Borrowed.__init__ = no_taken_init
+    elif control == 'held_busy_l3':
+        borrow_saved['kept'] = Borrowed.kept
+        orig_kept_busy = Borrowed.kept
+        def busy_kept(self, span):
+            # A register where the program holds something at an instruction of the span, and
+            # that the translation has not taken there.
+            union = taken = 0
+            for i in span:
+                union |= self.busy[i]
+                taken |= self.taken[i]
+            for r in range(self.top, 1, -1):
+                if union >> r & 1 and not taken >> r & 1:
+                    for i in span:
+                        self.taken[i] |= 1 << r
+                    self.used.add(r)
+                    return r
+            return orig_kept_busy(self, span)
+        Borrowed.kept = busy_kept
+    elif control == 'shared_holder_l3':
+        borrow_saved['kept'] = Borrowed.kept
+        orig_kept_shared = Borrowed.kept
+        def shared_kept(self, span):
+            # The register of the first predicate held, for every one after it where the
+            # program has nothing in it: whatever else of the translation is there.
+            first = getattr(self, '_shared_holder', None)
+            if first is not None and not any(self.busy[i] >> first & 1 for i in span):
+                for i in span:
+                    self.taken[i] |= 1 << first
+                return first
+            r = orig_kept_shared(self, span)
+            if first is None:
+                self._shared_holder = r
+            return r
+        Borrowed.kept = shared_kept
+    elif control == 'unkept_holder_l3':
+        borrow_saved['kept'] = Borrowed.kept
+        orig_kept_free = Borrowed.kept
+        def free_kept(self, span):
+            r = orig_kept_free(self, span)
+            if r is not None:
+                for i in span:
+                    self.taken[i] &= ~(1 << r)
+            return r
+        Borrowed.kept = free_kept
+    elif control in ('overlap_pool', 'pool_in_home_unsaid'):
+        borrow_saved['free_at'] = Borrowed.free_at
+        orig_pair_ov = Borrowed.free_at
+        def ignore_taken_pair(self, i, width=1, given=0):
+            if width != 2:
+                return orig_pair_ov(self, i, width, given)
+            # Ignore `taken` so the pool may overlap an alive home.
+            held = self.busy[i] | given
+            for r in range(2, self.top + 2 - width, 2):
+                if not held >> r & ((1 << width) - 1):
+                    return r
+            return None
+        Borrowed.free_at = ignore_taken_pair
+    elif control == 'written_pair':
+        borrow_saved['free_at'] = Borrowed.free_at
+        borrow_saved['__init__'] = Borrowed.__init__
+        orig_pair = Borrowed.free_at
+        orig_init_wp = Borrowed.__init__
+        def init_save_writes(self, f, *args, **kwargs):
+            orig_init_wp(self, f, *args, **kwargs)
+            self._src_writes = [0] * len(f.src)
+            for i, d in enumerate(f.src):
+                for l, x in d.writes:
+                    if l == 'R' and x != 255:
+                        self._src_writes[i] |= 1 << x
+        Borrowed.__init__ = init_save_writes
+        def pick_written(self, i, width=1, given=0):
+            good = orig_pair(self, i, width, given)
+            if good is None or width != 2:
+                return good
+            # (`busy` has what the instruction writes: a pair that it writes is looked for among
+            # those that no home and nothing given already has.)
+            held = self.taken[i] | given
+            writes = self._src_writes[i] if hasattr(self, '_src_writes') else 0
+            mask = (1 << width) - 1
+            for r in range(2, self.top + 2 - width, 2):
+                if not held >> r & mask and any(writes >> (r + k) & 1 for k in range(width)):
+                    return r
+            return good
+        Borrowed.free_at = pick_written
+    given, source = path, open(path, 'rb').read()
+    if control == 'batched':
+        translate.with_stall = lambda word, cycles, marks=False: stall(word, cycles)
+    if control == 'named':
+        source = naming_code(source)
+        if source is None:
+            return None, ''
+        translate.relocations_of = lambda *args: (relocations_of(*args)[0], set(), set())
+    try:
+        listing, lives = [], []
+        out, report = translate.translate(source, mc, listing, lives)
+    finally:
+        translate.with_stall, translate.relocations_of = stall, relocations_of
+        for name, original in originals.items():
+            setattr(Function, name, original)
+        for name, original in borrow_saved.items():
+            setattr(Borrowed, name, original)
+    if control == 'as it is':
+        untouched[path] = out
+        if not validated:
+            return None, ''
+    elif control == 'unlisted':
+        # The same translation; the map without the last instruction of each function.
+        last = {}
+        for k, row in enumerate(listing):
+            last[row[0]] = k
+        listing = [row for k, row in enumerate(listing) if k not in set(last.values())]
+    elif control == 'swapped':
+        # In each function, the first two instructions that follow each other, come from two
+        # instructions, are unchanged and are no branches: exchanged, in the code and in the map.
+        container = elf.Elf(out)
+        rows_of = collections.defaultdict(list)
+        for k, row in enumerate(listing):
+            rows_of[row[0]].append(k)
+        for name, ks in rows_of.items():
+            section = container.section('.text.' + name)
+            data = bytearray(section.data)
+            for x, y in zip(ks, ks[1:]):
+                (_, nx, ox, wx), (_, ny, oy, wy) = listing[x], listing[y]
+                dx, dy = (mc.decode(70, int.from_bytes(data[n:n + 16], 'little')) for n in (nx, ny))
+                if wx == wy == 'same' and ox != oy and ny == nx + 16 and None not in (dx, dy) and 'BRU' not in (dx.kind, dy.kind) and data[nx:nx + 16] != data[ny:ny + 16]:
+                    data[nx:nx + 16], data[ny:ny + 16] = data[ny:ny + 16], data[nx:nx + 16]
+                    listing[x], listing[y] = (name, nx, oy, 'same'), (name, ny, ox, 'same')
+                    break
+            section.data = bytes(data)
+        out = container.write()
+    elif control == 'unmoved':
+        # The translation as it is; the relocations on code where they were in the original.
+        container, before = elf.Elf(out), elf.Elf(source)
+        for s in container.sections:
+            if s.type in (elf.SHT_REL, elf.SHT_RELA) and s.info < len(container.sections) and container.sections[s.info].name.startswith('.text.'):
+                s.data = before.section(s.name).data
+        out = container.write()
+        if out == untouched[path]:
+            return None, ''
+    elif control == 'named':
+        # The check is given the original that was translated: the one with the relocation changed.
+        given = os.path.join(out_dir, 'original.' + os.path.basename(path))
+        open(given, 'wb').write(source)
+    elif control == 'no_c3_wait':
+        # C3 control: find a pool register that the program writes late somewhere, at an
+        # original instruction that has NO mem: store after it. Clear the 63-wait.
+        container = elf.Elf(out)
+        # Build: program registers written late (original sm_75 code).
+        orig_data = open(path, 'rb').read()
+        orig_e = elf.Elf(orig_data)
+        late_written = set()
+        for s in orig_e.sections:
+            if s.name.startswith('.text.') and s.type == 1:
+                for at in range(0, len(s.data), 16):
+                    w75 = int.from_bytes(s.data[at:at+16], 'little')
+                    d75 = mc.decode(75, w75)
+                    if d75 is None:
+                        continue
+                    wb = (w75 >> WRITE_BARRIER) & 7
+                    if wb != 7 and d75.kind in machine.LATE:
+                        for l, r in d75.writes:
+                            if l == 'R':
+                                late_written.add(r)
+        # Find pool declarations at instructions without stores.
+        by_old = collections.defaultdict(list)
+        for row in listing:
+            by_old[row[2]].append((row[1], row[3]))
+        pool_at = {}  # {old_offset: set of registers}
+        for entry in lives:
+            if len(entry) >= 4 and entry[3] == 'pool':
+                for off in entry[4]:
+                    pool_at.setdefault(off, set()).update(range(entry[2], entry[2] + entry[1]))
+        changed = False
+        for func_name in {row[0] for row in listing}:
+            section = container.section('.text.' + func_name)
+            if section is None:
+                continue
+            data = bytearray(section.data)
+            for old_off in sorted(pool_at):
+                regs = pool_at[old_off]
+                if not regs & late_written:
+                    continue
+                parts = by_old.get(old_off, [])
+                # No store AND no mem: at all (so B3 and the existing wait check cannot report).
+                has_mem = any(w.startswith('mem:') for _, w in parts)
+                if has_mem:
+                    continue
+                # Clear the 63-wait from every instruction of this sequence.
+                for new_off, what in sorted(parts):
+                    word = int.from_bytes(data[new_off:new_off+16], 'little')
+                    if (word >> WAIT) & 63 == 63:
+                        word &= ~(63 << WAIT)
+                        data[new_off:new_off+16] = word.to_bytes(16, 'little')
+                        changed = True
+                        break
+                if changed:
+                    break
+            if changed:
+                section.data = bytes(data)
+                break
+        if changed:
+            out = container.write()
+        if out == untouched[path]:
+            return None, ''
+    elif control == 'no_lane_l3':
+        # Drop the S2R for the per-instruction lane: replace with NOP in the binary,
+        # keep the map entry (so the validator sees the kind 'lane' but the instruction is a NOP).
+        container = elf.Elf(out)
+        nop = machine.NOP.to_bytes(16, 'little')
+        changed = False
+        for row in listing:
+            name, new_off, old_off, what = row
+            if what == 'lane' and old_off != 0:
+                section = container.section('.text.' + name)
+                data = bytearray(section.data)
+                data[new_off:new_off + 16] = nop
+                section.data = bytes(data)
+                changed = True
+        if not changed:
+            return None, ''
+        out = container.write()
+        if out == untouched[path]:
+            return None, ''
+    elif control == 'no_r1_lower':
+        # Remove the IADD3 R1, R1, -frame, RZ instruction from the binary and the map.
+        container = elf.Elf(out)
+        new_listing = []
+        for row in listing:
+            name, new_off, old_off, what = row
+            if what.startswith('mem: R1 -='):
+                # Remove this instruction from code and shift everything after it.
+                section = container.section('.text.' + name)
+                data = bytearray(section.data)
+                # Replace the IADD3 with a NOP.
+                nop = machine.NOP.to_bytes(16, 'little')
+                data[new_off:new_off + 16] = nop
+                section.data = bytes(data)
+                # Keep the map entry but it's now a NOP.
+            new_listing.append(row)
+        listing[:] = new_listing
+        out = container.write()
+        if out == untouched[path]:
+            return None, ''
+    elif control == 'wrong_r1_lower':
+        # R1 lowered by the wrong amount: double the frame size in the IADD3.
+        container = elf.Elf(out)
+        for row in listing:
+            name, new_off, old_off, what = row
+            if what.startswith('mem: R1 -='):
+                section = container.section('.text.' + name)
+                data = bytearray(section.data)
+                word = int.from_bytes(data[new_off:new_off + 16], 'little')
+                d70 = mc.decode(70, word)
+                if d70 and d70.mnemonic == 'IADD3':
+                    sb = d70.ops.get('Sb', 0)
+                    new_word = mc.assemble('iadd3_imm__RsIR_RIR', Rd=1, Ra=1, Sb=sb * 2, Rc=255)
+                    # Preserve the scheduling bits.
+                    sched_mask = 0x3FFFF << machine.USCHED
+                    new_word = (new_word & ~sched_mask) | (word & sched_mask)
+                    data[new_off:new_off + 16] = new_word.to_bytes(16, 'little')
+                    section.data = bytes(data)
+                    break
+        out = container.write()
+        if out == untouched[path]:
+            return None, ''
+    elif control == 'no_load_wait':
+        # Clear the wait bit on the instruction after the last mem: load of each instruction.
+        container = elf.Elf(out)
+        by_old = collections.defaultdict(list)
+        for row in listing:
+            by_old[row[2]].append((row[1], row[3]))
+        changed = False
+        for old_off, parts in by_old.items():
+            loads = [(n, w) for n, w in sorted(parts) if w.startswith('mem: load ')]
+            if not loads:
+                continue
+            last_load_new = loads[-1][0]
+            # Find the instruction right after the last load.
+            all_news = sorted(n for n, w in parts)
+            after_idx = all_news.index(last_load_new) + 1 if last_load_new in all_news else -1
+            if after_idx < len(all_news):
+                next_new = all_news[after_idx]
+            else:
+                next_new = last_load_new + 16
+            name = listing[0][0]
+            section = container.section('.text.' + name)
+            if section and next_new + 16 <= len(section.data):
+                data = bytearray(section.data)
+                # Find the write scoreboard of the last load.
+                lw = int.from_bytes(data[last_load_new:last_load_new + 16], 'little')
+                wb = (lw >> WRITE_BARRIER) & 7
+                if wb != 7:
+                    nw = int.from_bytes(data[next_new:next_new + 16], 'little')
+                    if (nw >> WAIT) & 63 >> wb & 1:
+                        nw &= ~(1 << (WAIT + wb))
+                        data[next_new:next_new + 16] = nw.to_bytes(16, 'little')
+                        section.data = bytes(data)
+                        changed = True
+        if changed:
+            out = container.write()
+        if out == untouched[path]:
+            return None, ''
+    elif control == 'no_attr_raise':
+        # Undo the attribute raise: set 0x11, 0x12, 0x23 back to the original's values.
+        container, before = elf.Elf(out), elf.Elf(source)
+        for section_name in ['.nv.info'] + [s.name for s in container.sections if s.name.startswith('.nv.info.')]:
+            s = container.section(section_name)
+            orig_s = before.section(section_name)
+            if s is not None and orig_s is not None:
+                # Replace the attribute values for 0x11, 0x12, 0x23 with the original's.
+                d = bytearray(s.data)
+                orig_d = orig_s.data
+                pos, opos = 0, 0
+                while pos + 4 <= len(d) and opos + 4 <= len(orig_d):
+                    fmt, attr, val = d[pos], d[pos+1], struct.unpack_from('<H', d, pos+2)[0]
+                    ofmt, oattr, oval = orig_d[opos], orig_d[opos+1], struct.unpack_from('<H', orig_d, opos+2)[0]
+                    if fmt == 4 and attr in (0x11, 0x12, 0x23) and pos + 12 <= len(d) and ofmt == 4 and oattr == attr and opos + 12 <= len(orig_d):
+                        struct.pack_into('<I', d, pos + 8, struct.unpack_from('<I', orig_d, opos + 8)[0])
+                    pos += 4 + val if fmt == 4 else 4
+                    opos += 4 + oval if ofmt == 4 else 4
+                s.data = bytes(d)
+        out = container.write()
+        if out == untouched[path]:
+            return None, ''
+    elif control == 'no_borrow_wait_l3':
+        # At level 3: the first instruction of a sequence that writes a borrowed register
+        # does NOT wait for all six scoreboards. Remove the 63 << WAIT from the first
+        # instruction of each sequence that has mem: kinds.
+        container = elf.Elf(out)
+        funcs = {row[0] for row in listing}
+        by_func = collections.defaultdict(list)
+        for row in listing:
+            by_func[row[0]].append(row)
+        for name, rows in by_func.items():
+            section = container.section('.text.' + name)
+            if section is None:
+                continue
+            data = bytearray(section.data)
+            by_old = collections.defaultdict(list)
+            for _, new, old, what in rows:
+                by_old[old].append((new, what))
+            for old, parts in by_old.items():
+                has_mem = any(w.startswith('mem: ') for _, w in parts)
+                if not has_mem:
+                    continue
+                # Clear the 63 << WAIT from EVERY instruction of the sequence.
+                for new, w in sorted(parts):
+                    word = int.from_bytes(data[new:new + 16], 'little')
+                    if (word >> WAIT) & 63 == 63:
+                        word &= ~(63 << WAIT)
+                        data[new:new + 16] = word.to_bytes(16, 'little')
+            section.data = bytes(data)
+        out = container.write()
+        if out == untouched[path]:
+            return None, ''
+    elif control == 'short_home':
+        # The first home whose declared life has an instruction, not its first nor its last,
+        # that names no uniform register: that instruction is left out of the life.
+        source = elf.Elf(open(path, 'rb').read())
+        def names_none(function, at):
+            section = source.section('.text.' + function)
+            d = mc.decode(75, int.from_bytes(section.data[at:at + 16], 'little')) if section is not None else None
+            return d is not None and not any(x[0] == 'U' for x in d.reads + d.writes)
+        for k, row in enumerate(lives or []):
+            if len(row) < 5 or row[3] != 'home' or len(row[4]) < 3:
+                continue
+            inside = [at for at in row[4][1:-1] if names_none(row[0], at)]
+            if inside:
+                lives[k] = tuple(row[:4]) + ([at for at in row[4] if at != inside[0]],)
+                break
+        else:
+            return None, ''
+    elif control == 'home_unsaid':
+        # The first register that is the home of two uniform registers: the lines of the second.
+        by_register = collections.defaultdict(list)
+        for row in lives or []:
+            if len(row) >= 5 and row[3] == 'home' and row[1] not in by_register[(row[0], row[2])]:
+                by_register[(row[0], row[2])].append(row[1])
+        twice = next(((name, r, us[1]) for (name, r), us in by_register.items() if len(us) > 1), None)
+        if twice is None:
+            return None, ''
+        lives[:] = [row for row in lives if not (len(row) >= 5 and row[3] == 'home' and (row[0], row[2], row[1]) == twice)]
+    elif control == 'pool_in_home_unsaid':
+        # The lines that say a pair is taken where one of its registers is a home declared there
+        # are left out.
+        homes = collections.defaultdict(set)
+        for row in lives or []:
+            if len(row) >= 5 and row[3] == 'home':
+                homes[(row[0], row[2])].update(row[4])
+        kept = []
+        for row in lives or []:
+            if len(row) >= 5 and row[3] == 'pool' and any(at in homes.get((row[0], row[2] + k), ()) for at in row[4] for k in range(row[1])):
+                continue
+            kept.append(row)
+        if len(kept) == len(lives or []):
+            return None, ''
+        lives[:] = kept
+    elif control == 'missing_pool_line':
+        # Remove the first pool line from the .lives output.
+        if lives:
+            removed = False
+            for k in range(len(lives) - 1, -1, -1):
+                if len(lives[k]) >= 4 and lives[k][3] == 'pool':
+                    lives.pop(k)
+                    removed = True
+                    break
+            if not removed:
+                return None, ''
+    # ---- room controls (VF_BORROW>=5, room made) ----
+    elif control == 'room_reads_orig':
+        # A register put away that the original instruction reads: replace the first room: away's
+        # register with one the original reads. In the binary: change the STL's source register.
+        container = elf.Elf(out)
+        orig_data = open(path, 'rb').read()
+        orig_e = elf.Elf(orig_data)
+        changed = False
+        for row in listing:
+            name, new_off, old_off, what = row
+            if not what.startswith('room: R') or 'away' not in what:
+                continue
+            # Find what the original reads.
+            sec = orig_e.section('.text.' + name)
+            if sec is None or old_off + 16 > len(sec.data):
+                continue
+            d75 = mc.decode(75, int.from_bytes(sec.data[old_off:old_off + 16], 'little'))
+            if d75 is None:
+                continue
+            orig_reads = {r for l, r, *_ in d75.reads if l == 'R' and r != 255 and r >= 2}
+            if not orig_reads:
+                continue
+            victim = min(orig_reads)
+            # Patch the STL to store this register instead.
+            section = container.section('.text.' + name)
+            data = bytearray(section.data)
+            word = int.from_bytes(data[new_off:new_off + 16], 'little')
+            d70 = mc.decode(70, word)
+            if d70 and d70.mnemonic == 'STL':
+                new_word = mc.assemble('stl__sImmOffset', Ra=d70.ops['Ra'], Rb=victim,
+                                       Ra_offset=d70.ops.get('Ra_offset', 0))
+                sched_mask = (63 << WAIT) | (7 << READ_BARRIER) | (7 << WRITE_BARRIER) | (0xF << machine.USCHED)
+                new_word = (new_word & ~sched_mask) | (word & sched_mask)
+                data[new_off:new_off + 16] = new_word.to_bytes(16, 'little')
+                section.data = bytes(data)
+                changed = True
+                break
+        if not changed:
+            return None, ''
+        out = container.write()
+    elif control == 'room_home_alive':
+        # A register put away that is a home alive at that instruction: add a fake home line
+        # to .lives at the room instruction's offset for the room register itself. The validator's
+        # rule S should report "register Rn is a home alive at this instruction".
+        changed = False
+        room_entries = [(k, e) for k, e in enumerate(lives) if len(e) >= 4 and e[3] == 'room']
+        if room_entries:
+            k, entry = room_entries[0]
+            func_name, _, reg, _, offsets = entry
+            # Add a home line for this register at this offset.
+            lives.append((func_name, 99, reg, 'home', offsets))
+            changed = True
+        if not changed:
+            return None, ''
+    elif control == 'room_no_back':
+        # The back (LDL) left out: replace with NOP.
+        container = elf.Elf(out)
+        nop = machine.NOP.to_bytes(16, 'little')
+        changed = False
+        for row in listing:
+            name, new_off, old_off, what = row
+            if what.startswith('room: R') and 'back' in what:
+                section = container.section('.text.' + name)
+                data = bytearray(section.data)
+                data[new_off:new_off + 16] = nop
+                section.data = bytes(data)
+                changed = True
+                break
+        if not changed:
+            return None, ''
+        out = container.write()
+    elif control == 'room_back_wrong_word':
+        # The back loads from another word (offset + 4).
+        container = elf.Elf(out)
+        changed = False
+        for row in listing:
+            name, new_off, old_off, what = row
+            if what.startswith('room: R') and 'back' in what:
+                section = container.section('.text.' + name)
+                data = bytearray(section.data)
+                word = int.from_bytes(data[new_off:new_off + 16], 'little')
+                d70 = mc.decode(70, word)
+                if d70 and d70.mnemonic == 'LDL':
+                    offset = d70.ops.get('Ra_offset', 0)
+                    new_word = mc.assemble('ldl__sImmOffset', Rd=d70.ops['Rd'], Ra=d70.ops['Ra'],
+                                           Ra_offset=(offset + 4) & 0xFFFFFF,
+                                           dst_wr_sb=d70.ops.get('dst_wr_sb', 7))
+                    sched_mask = (63 << WAIT) | (0xF << machine.USCHED)
+                    new_word = (new_word & ~sched_mask) | (word & sched_mask)
+                    data[new_off:new_off + 16] = new_word.to_bytes(16, 'little')
+                    section.data = bytes(data)
+                    changed = True
+                    break
+        if not changed:
+            return None, ''
+        out = container.write()
+    elif control == 'room_away_after_write':
+        # The away (STL) moved after the first instruction that writes the room register:
+        # swap the away with the first core instruction of the same original.
+        container = elf.Elf(out)
+        by_old = collections.defaultdict(list)
+        for row in listing:
+            by_old[(row[0], row[2])].append((row[1], row[3]))
+        changed = False
+        for (fname, old_off), parts in by_old.items():
+            aways = [(n, w) for n, w in sorted(parts) if w.startswith('room: R') and 'away' in w]
+            core = [(n, w) for n, w in sorted(parts) if not w.startswith('room:') and not w.startswith('mem:') and w not in ('wait', 'save', 'restore', 'late predicate', 'lane', 'kept', 'held: back', 'held: kept', 'settled', 'to pairs', 'from pairs')]
+            if aways and core:
+                # Swap the first away with the first core instruction.
+                section = container.section('.text.' + fname)
+                data = bytearray(section.data)
+                a_off, c_off = aways[0][0], core[0][0]
+                data[a_off:a_off+16], data[c_off:c_off+16] = data[c_off:c_off+16], data[a_off:a_off+16]
+                # Also swap in the listing.
+                for k, row in enumerate(listing):
+                    if row[0] == fname and row[1] == a_off:
+                        listing[k] = (fname, a_off, old_off, core[0][1])
+                    elif row[0] == fname and row[1] == c_off:
+                        listing[k] = (fname, c_off, old_off, aways[0][1])
+                section.data = bytes(data)
+                changed = True
+                break
+        if not changed:
+            return None, ''
+        out = container.write()
+    elif control == 'room_same_word':
+        # Two registers put away in the same word: set the second away's offset to the first's.
+        container = elf.Elf(out)
+        by_old = collections.defaultdict(list)
+        for row in listing:
+            by_old[(row[0], row[2])].append((row[1], row[3]))
+        changed = False
+        for (fname, old_off), parts in by_old.items():
+            aways = [(n, w) for n, w in sorted(parts) if w.startswith('room: R') and 'away' in w]
+            if len(aways) >= 2:
+                section = container.section('.text.' + fname)
+                data = bytearray(section.data)
+                # Read offset of first away.
+                w1 = int.from_bytes(data[aways[0][0]:aways[0][0]+16], 'little')
+                d1 = mc.decode(70, w1)
+                if d1 and d1.mnemonic == 'STL':
+                    off1 = d1.ops.get('Ra_offset', 0)
+                    # Set the second away to the same offset.
+                    w2 = int.from_bytes(data[aways[1][0]:aways[1][0]+16], 'little')
+                    d2 = mc.decode(70, w2)
+                    if d2 and d2.mnemonic == 'STL':
+                        new_word = mc.assemble('stl__sImmOffset', Ra=d2.ops['Ra'], Rb=d2.ops['Rb'], Ra_offset=off1)
+                        sched_mask = (63 << WAIT) | (7 << READ_BARRIER) | (7 << WRITE_BARRIER) | (0xF << machine.USCHED)
+                        new_word = (new_word & ~sched_mask) | (w2 & sched_mask)
+                        data[aways[1][0]:aways[1][0]+16] = new_word.to_bytes(16, 'little')
+                        section.data = bytes(data)
+                        changed = True
+                        break
+        if not changed:
+            return None, ''
+        out = container.write()
+    elif control == 'room_at_branch':
+        # A register is declared put away at an instruction where nothing puts it away: a room
+        # line is added to what the translator says, for R2 at the first branch or exit of a
+        # function that has room. (A register declared so may be written by the sequence of its
+        # instruction while it holds something: the validator must ask for the store and the
+        # load, rule U of validate.py. Until 2026-11-20 it took the declaration on trust.)
+        orig_data = open(path, 'rb').read()
+        orig_e = elf.Elf(orig_data)
+        added = False
+        for entry in lives:
+            if len(entry) >= 4 and entry[3] == 'room':
+                # Found a room entry; now find a branch in the same function.
+                func_name = entry[0]
+                sec = orig_e.section('.text.' + func_name)
+                if sec is None:
+                    continue
+                for at in range(0, len(sec.data), 16):
+                    d75 = mc.decode(75, int.from_bytes(sec.data[at:at+16], 'little'))
+                    if d75 is not None and d75.kind == 'BRU' and d75.mnemonic in ('BRA', 'EXIT'):
+                        # Add a room line at this branch instruction.
+                        lives.append((func_name, 1, 2, 'room', [at]))
+                        added = True
+                        break
+                if added:
+                    break
+        if not added:
+            return None, ''
+    elif control == 'room_depth_wrong':
+        # Depth wrong by the program's own frame (k_param_table): change the offset of the first
+        # room away STL to use depth=0 instead of the actual depth.
+        container = elf.Elf(out)
+        orig_data = open(path, 'rb').read()
+        orig_e = elf.Elf(orig_data)
+        changed = False
+        for row in listing:
+            name, new_off, old_off, what = row
+            if what.startswith('room: R') and 'away' in what:
+                section = container.section('.text.' + name)
+                data = bytearray(section.data)
+                word = int.from_bytes(data[new_off:new_off + 16], 'little')
+                d70 = mc.decode(70, word)
+                if d70 and d70.mnemonic == 'STL':
+                    offset = d70.ops.get('Ra_offset', 0)
+                    # Subtract the depth to make it wrong (pretend depth is 0).
+                    # Find the original depth at this instruction.
+                    sec = orig_e.section('.text.' + name)
+                    if sec is None:
+                        continue
+                    # Compute the original's R1 movements: find IADD3 R1, R1, imm before old_off.
+                    depth = 0
+                    for at in range(16, min(old_off + 16, len(sec.data)), 16):
+                        w75 = int.from_bytes(sec.data[at:at+16], 'little')
+                        d75 = mc.decode(75, w75)
+                        if d75 is not None and d75.c.name == 'iadd3_imm__RsIR_RIR' and d75.ops.get('Rd') == 1 and d75.ops.get('Ra') == 1 and d75.ops.get('Rc', 255) == 255:
+                            imm = d75.ops['Sb'] - (1 << 32) if d75.ops['Sb'] >> 31 else d75.ops['Sb']
+                            depth -= imm
+                    if depth == 0:
+                        continue
+                    # Change offset to what it would be with depth=0 (subtract depth).
+                    new_offset = offset - depth
+                    if new_offset < 0:
+                        new_offset = 0
+                    new_word = mc.assemble('stl__sImmOffset', Ra=d70.ops['Ra'], Rb=d70.ops['Rb'],
+                                           Ra_offset=new_offset)
+                    sched_mask = (63 << WAIT) | (7 << READ_BARRIER) | (7 << WRITE_BARRIER) | (0xF << machine.USCHED)
+                    new_word = (new_word & ~sched_mask) | (word & sched_mask)
+                    data[new_off:new_off + 16] = new_word.to_bytes(16, 'little')
+                    section.data = bytes(data)
+                    changed = True
+                    break
+        if not changed:
+            return None, ''
+        out = container.write()
+    elif control == 'room_frame_short':
+        # Frame not raised by the words of room: set frame attributes back to just the slot size.
+        container, before = elf.Elf(out), elf.Elf(source)
+        # Compute the slot-only frame size.
+        n_slots = 0
+        for entry in lives:
+            if len(entry) >= 4 and entry[3] == 'slot':
+                n_slots += 1
+        slot_frame = (4 * n_slots + 15) & ~15 if n_slots > 0 else 0
+        has_room = any(len(e) >= 4 and e[3] == 'room' for e in lives)
+        if not has_room or slot_frame == 0:
+            return None, ''
+        # Find the full frame size.
+        full_frame = 0
+        for entry in lives:
+            if len(entry) >= 4 and entry[3] == 'frame':
+                full_frame = entry[1]
+                break
+        if full_frame <= slot_frame:
+            return None, ''
+        # Change the frame entry in lives to the slot-only size.
+        for k, entry in enumerate(lives):
+            if len(entry) >= 4 and entry[3] == 'frame':
+                lives[k] = (entry[0], slot_frame, entry[2], entry[3], entry[4])
+                break
+    elif control == 'room_missing_lives':
+        # Remove all room lines from .lives.
+        before_len = len(lives)
+        lives[:] = [e for e in lives if not (len(e) >= 4 and e[3] == 'room')]
+        if len(lives) == before_len:
+            return None, ''
+    elif control == 'room_no_back_wait':
+        # Drop the wait for the last back's scoreboard: clear it on the instruction after.
+        container = elf.Elf(out)
+        by_old = collections.defaultdict(list)
+        for row in listing:
+            by_old[(row[0], row[2])].append((row[1], row[3]))
+        changed = False
+        for (fname, old_off), parts in by_old.items():
+            backs = [(n, w) for n, w in sorted(parts) if w.startswith('room: R') and 'back' in w]
+            if not backs:
+                continue
+            last_back = backs[-1][0]
+            section = container.section('.text.' + fname)
+            if section is None:
+                continue
+            data = bytearray(section.data)
+            # Find the write scoreboard of the last back.
+            bw = int.from_bytes(data[last_back:last_back + 16], 'little')
+            wb = (bw >> WRITE_BARRIER) & 7
+            if wb == 7:
+                continue
+            # Clear the wait on the next instruction.
+            next_new = last_back + 16
+            if next_new + 16 <= len(data):
+                nw = int.from_bytes(data[next_new:next_new + 16], 'little')
+                if (nw >> WAIT) >> wb & 1:
+                    nw &= ~(1 << (WAIT + wb))
+                    data[next_new:next_new + 16] = nw.to_bytes(16, 'little')
+                    section.data = bytes(data)
+                    changed = True
+                    break
+        if not changed:
+            return None, ''
+        out = container.write()
+    elif control == 'room_scratch_busy':
+        # A scratch register of a matrix load at a room instruction is neither free nor put away:
+        # patch the 'thread' LOP3 (which writes the scratch register) to write R14 instead,
+        # and patch the LEA instructions that read it. R14 is a register the program uses, not
+        # put away. The validator's whole-truth check should report it.
+        container = elf.Elf(out)
+        by_old = collections.defaultdict(list)
+        for row in listing:
+            by_old[(row[0], row[2])].append((row[1], row[3]))
+        changed = False
+        for (fname, old_off), parts in by_old.items():
+            has_room = any(w.startswith('room:') for _, w in parts)
+            thread_parts = [(n, w) for n, w in sorted(parts) if w == 'thread']
+            if not has_room or not thread_parts:
+                continue
+            section = container.section('.text.' + fname)
+            if section is None:
+                continue
+            data = bytearray(section.data)
+            # Read the thread instruction to find the destination register.
+            tn = thread_parts[0][0]
+            tw = int.from_bytes(data[tn:tn + 16], 'little')
+            td = mc.decode(70, tw)
+            if td is None or td.mnemonic != 'LOP3':
+                continue
+            old_rd = td.ops.get('Rd', -1)
+            if old_rd < 2:
+                continue
+            # Replace the destination with R14 (a busy register).
+            new_rd = 14
+            # Patch the LOP3 destination: replace old_rd in the word's register field.
+            # Use the decoded instruction to find the field and patch it directly.
+            for kind, fields, field_data in mc.d70.plan(td.c):
+                if kind == 'operand' and field_data == 'Rd':
+                    tw = fields[0].put(tw, new_rd)
+                    break
+            data[tn:tn + 16] = tw.to_bytes(16, 'little')
+            # Patch every LEA/IADD3 of this instruction that reads old_rd: replace with new_rd.
+            address_parts = [(n, w) for n, w in sorted(parts) if w in ('address', 'address of the row')]
+            for an, aw in address_parts:
+                aw_word = int.from_bytes(data[an:an + 16], 'little')
+                ad = mc.decode(70, aw_word)
+                if ad is None:
+                    continue
+                did_patch = False
+                for kind, fields, field_data in mc.d70.plan(ad.c):
+                    if kind == 'operand' and isinstance(field_data, str) and field_data.startswith('R') and field_data != 'Rd':
+                        if ad.ops.get(field_data) == old_rd:
+                            aw_word = fields[0].put(aw_word, new_rd)
+                            did_patch = True
+                if did_patch:
+                    data[an:an + 16] = aw_word.to_bytes(16, 'little')
+            section.data = bytes(data)
+            changed = True
+            break
+        if not changed:
+            return None, ''
+        out = container.write()
+    elif control == 'copy_after_write':
+        # Control for fix 3 of the exact-call check: in the original sm_75 binary, swap the
+        # copy of the return-address register (IMAD.MOV.U32 R', RZ, RZ, mov_reg) with the
+        # write that follows it (IMAD.MOV.U32 mov_reg, RZ, RZ, 0x0), so the write happens
+        # first. The call must become inexact, and the pool registers must be reported as not
+        # free (or the register liveness marked as not computed).
+        orig_data = open(path, 'rb').read()
+        orig_e = elf.Elf(orig_data)
+        changed = False
+        for s in orig_e.sections:
+            if not s.name.startswith('.text.') or s.type != 1:
+                continue
+            data = bytearray(s.data)
+            n = len(data) // 16
+            # Find a RET.REL.NODEC in this function.
+            for i in range(n):
+                d = mc.decode(75, int.from_bytes(data[16*i:16*i+16], 'little'))
+                if d is None or d.c.name != 'ret__REL':
+                    continue
+                rp = d.ops.get('Ra', -1)
+                if rp < 0:
+                    continue
+                # Walk backward from the RET to find the copy (IMAD.MOV.U32 R', RZ, RZ, R).
+                for j in range(i - 1, max(i - 32, -1), -1):
+                    dj = mc.decode(75, int.from_bytes(data[16*j:16*j+16], 'little'))
+                    if dj is None:
+                        break
+                    # Is this the copy? IMAD.MOV (or MOV) where Rd = rp, Ra = RZ, Rb = RZ.
+                    # On sm_75, IMAD.MOV.U32 R24, RZ, RZ, R25 is class imad__RRR_RRR with
+                    # Ra=255, Rb=255, Rc=source. MOV R24, R25 is mov__RR.
+                    is_imad_copy = (dj.ops.get('Rd') == rp and dj.ops.get('Ra') == 255
+                                    and dj.ops.get('Rb') == 255 and 'imad' in dj.c.name)
+                    is_mov_copy = (dj.c.name.startswith('mov__') and dj.ops.get('Rd') == rp)
+                    if is_imad_copy or is_mov_copy:
+                        # The source register: Rc for IMAD, Rb or Ra for MOV.
+                        if is_imad_copy:
+                            mov_src = dj.ops.get('Rc', -1)
+                        else:
+                            mov_src = next((r for l, r, *_ in dj.reads if l == 'R' and r != 255), -1)
+                        if mov_src < 2 or mov_src == 255:
+                            continue
+                        # Find the next write to mov_src after the copy.
+                        for k in range(j + 1, min(j + 8, n)):
+                            dk = mc.decode(75, int.from_bytes(data[16*k:16*k+16], 'little'))
+                            if dk is None:
+                                break
+                            if any(l == 'R' and r == mov_src for l, r in dk.writes):
+                                # Swap instructions j and k (put the write before the copy).
+                                data[16*j:16*j+16], data[16*k:16*k+16] = data[16*k:16*k+16], data[16*j:16*j+16]
+                                s.data = bytes(data)
+                                changed = True
+                                break
+                        break
+                    if any(l == 'R' and r == rp for l, r in dj.writes):
+                        break
+                if changed:
+                    break
+            if changed:
+                break
+        if not changed:
+            return None, ''
+        # Re-translate the patched original and validate against it.
+        patched_orig = os.path.join(out_dir, 'patched.' + os.path.basename(path))
+        open(patched_orig, 'wb').write(orig_e.write())
+        listing2, lives2 = [], []
+        out2, _ = translate.translate(open(patched_orig, 'rb').read(), mc, listing2, lives2)
+        given = patched_orig
+        out, listing, lives = out2, listing2, lives2
+    elif control == 'product_busy_take_l3':
+        # Add a pool entry at an HMMA instruction for a register that the program uses there
+        # (Ra: the A operand, which IS busy): the translator says it took a register that holds
+        # something.
+        orig_data = open(path, 'rb').read()
+        orig_e = elf.Elf(orig_data)
+        added = False
+        for entry in lives:
+            if len(entry) >= 4 and entry[3] == 'pool':
+                func_name = entry[0]
+                for at in entry[4]:
+                    sec = orig_e.section('.text.' + func_name)
+                    if sec is None or at + 16 > len(sec.data):
+                        continue
+                    d75 = mc.decode(75, int.from_bytes(sec.data[at:at+16], 'little'))
+                    if d75 is not None and 'hmma' in d75.c.name:
+                        ra = d75.ops.get('Ra', -1)
+                        if ra >= 2 and ra != 255:
+                            lives.append((func_name, 1, ra, 'pool', [at]))
+                            added = True
+                            break
+                if added:
+                    break
+        if not added:
+            return None, ''
+    elif control == 'product_no_s2r_wait_l3':
+        # Clear the SEQUENCE wait from the first 'kept: low' instruction after a 'lane' at a
+        # level-3 product: the first reader of the lane no longer waits for the S2R.
+        container = elf.Elf(out)
+        changed = False
+        by_old = collections.defaultdict(list)
+        for row in listing:
+            by_old[(row[0], row[2])].append((row[1], row[3]))
+        for (fname, old_off), parts in by_old.items():
+            if not any(w == 'kept: low' for _, w in parts):
+                continue
+            # Find the first 'kept: low' instruction.
+            for n, w in sorted(parts):
+                if w == 'kept: low':
+                    section = container.section('.text.' + fname)
+                    if section is None:
+                        break
+                    data = bytearray(section.data)
+                    word = int.from_bytes(data[n:n+16], 'little')
+                    if ((word >> WAIT) & 63) >> translate.SEQUENCE & 1:
+                        word &= ~(1 << (WAIT + translate.SEQUENCE))
+                        data[n:n+16] = word.to_bytes(16, 'little')
+                        section.data = bytes(data)
+                        changed = True
+                    break
+            if changed:
+                break
+        if not changed:
+            return None, ''
+        out = container.write()
+    elif control == 'load_ur_wrong_slot_l3':
+        # At level 3: change the offset of the first LDL (mem: load URn) that is followed by a
+        # matrix load sequence: add 4 to the offset (loads from the wrong slot). The validator's
+        # B2 check should catch it.
+        container = elf.Elf(out)
+        changed = False
+        by_old = collections.defaultdict(list)
+        for row in listing:
+            by_old[(row[0], row[2])].append((row[1], row[3]))
+        for (fname, old_off), parts in by_old.items():
+            has_load_ur = any(w.startswith('mem: load UR') for _, w in parts)
+            has_group = any(w == 'group' for _, w in parts)
+            if not has_load_ur or not has_group:
+                continue
+            for n, w in sorted(parts):
+                if w.startswith('mem: load UR'):
+                    section = container.section('.text.' + fname)
+                    if section is None:
+                        break
+                    data = bytearray(section.data)
+                    word = int.from_bytes(data[n:n+16], 'little')
+                    d70 = mc.decode(70, word)
+                    if d70 and d70.mnemonic == 'LDL':
+                        offset = d70.ops.get('Ra_offset', 0)
+                        new_word = mc.assemble('ldl__sImmOffset', Rd=d70.ops['Rd'], Ra=d70.ops['Ra'],
+                                               Ra_offset=(offset + 4) & 0xFFFFFF,
+                                               dst_wr_sb=d70.ops.get('dst_wr_sb', 7))
+                        sched_mask = (63 << WAIT) | (0xF << machine.USCHED)
+                        new_word = (new_word & ~sched_mask) | (word & sched_mask)
+                        data[n:n+16] = new_word.to_bytes(16, 'little')
+                        section.data = bytes(data)
+                        changed = True
+                    break
+            if changed:
+                break
+        if not changed:
+            return None, ''
+        out = container.write()
+    elif control == 'load_ur_no_wait_l3':
+        # At level 3: clear the write scoreboard on the last LDL (mem: load URn) before a matrix
+        # load sequence, so the next instruction does not wait for it. The validator's B2 check
+        # (the wait on the last load) should catch it.
+        container = elf.Elf(out)
+        changed = False
+        by_old = collections.defaultdict(list)
+        for row in listing:
+            by_old[(row[0], row[2])].append((row[1], row[3]))
+        for (fname, old_off), parts in by_old.items():
+            loads_ur = [(n, w) for n, w in sorted(parts) if w.startswith('mem: load UR')]
+            has_group = any(w == 'group' for _, w in parts)
+            if not loads_ur or not has_group:
+                continue
+            last_load = loads_ur[-1][0]
+            section = container.section('.text.' + fname)
+            if section is None:
+                continue
+            data = bytearray(section.data)
+            word = int.from_bytes(data[last_load:last_load+16], 'little')
+            wb = (word >> WRITE_BARRIER) & 7
+            if wb != 7:
+                # Clear the write scoreboard.
+                word |= 7 << WRITE_BARRIER
+                data[last_load:last_load+16] = word.to_bytes(16, 'little')
+                # Also clear the wait on the next instruction.
+                next_inst = last_load + 16
+                if next_inst + 16 <= len(data):
+                    nw = int.from_bytes(data[next_inst:next_inst+16], 'little')
+                    nw &= ~(1 << (WAIT + wb))
+                    data[next_inst:next_inst+16] = nw.to_bytes(16, 'little')
+                section.data = bytes(data)
+                changed = True
+            if changed:
+                break
+        if not changed:
+            return None, ''
+        out = container.write()
+    elif out == untouched[path]:
+        return None, ''
+    new = os.path.join(out_dir, os.path.basename(path))
+    open(new, 'wb').write(out)
+    with open(new + '.map', 'w') as f:
+        for row in listing:
+            f.write('%s\t%x\t%x\t%s\n' % row)
+    translate.write_lives(new + '.map.lives', lives)
+    said = subprocess.run([sys.executable, '-I', os.path.join(HERE, 'validate.py'), given, new, new + '.map'],
+                          capture_output=True, text=True).stdout
+    m = re.search(r'(\d+) instructions of (\d+) functions checked, (\d+) problems', said)
+    if m is None:
+        return -1, (said.strip().splitlines() or ['validate.py said nothing'])[-1]
+    first = next((line.strip() for line in said.splitlines()[1:] if not re.match(r'\s*\d+ \(', line)), '')
+    return int(m.group(3)), first
+
+
+def main():
+    args, chosen, paths, unchecked = sys.argv[1:], [], [], False
+    while args:
+        if args[0] == '-c' and len(args) > 1 and args[1] in CONTROLS:
+            chosen.append(args[1])
+            args = args[2:]
+        elif args[0] == '-u':
+            unchecked, args = True, args[1:]
+        else:
+            paths.append(args.pop(0))
+    if not paths or any(p.startswith('-') for p in paths):
+        print(__doc__)
+        return 2
+    mc = machine.Machine()
+    ok, untouched = True, {}
+    with tempfile.TemporaryDirectory(prefix='vf-controls-') as out_dir:
+        print('%-10s %s' % ('control', '  '.join('%14s' % os.path.basename(p)[:14] for p in paths)))
+        for control in CONTROLS:
+            if chosen and control not in chosen and control != 'as it is':
+                continue
+            if control in PAIR_CONTROLS and not translate.PAIRS:
+                continue
+            if control in BORROW_CONTROLS and not translate.BORROW:
+                continue
+            if control in FRAME_CONTROLS and translate.BORROW < 2:
+                continue
+            if control in PRODUCT_L3_CONTROLS and translate.BORROW < 7:
+                continue
+            if control == 'as it is' and unchecked:
+                for path in paths:
+                    run(mc, control, path, out_dir, untouched, validated=False)
+                print('%-10s (made here, not validated: -u)' % control)
+                continue
+            results = [run(mc, control, path, out_dir, untouched) for path in paths]
+            counts = [problems for problems, _ in results]
+            changed = [c for c in counts if c is not None]
+            good = (all(c == 0 for c in counts) if control == 'as it is'
+                    else all(c >= 0 for c in changed) if control in CHANGES_THE_PROGRAM and changed
+                    else (any(c > 0 for c in changed) and all(c >= 0 for c in changed)))
+            ok = ok and good
+            verdict = 'as expected' if good else 'changes nothing in these cubins: name one that has what it takes away' if not changed else 'NOT AS EXPECTED'
+            print('%-10s %s   %s' % (control, '  '.join('%14s' % ('=' if c is None else 'failed' if c < 0 else c) for c in counts), verdict))
+            example = next((first for problems, first in results if problems and first), None)
+            if example:
+                print('           e.g. %s' % re.sub(r'_Z\w+', '<function>', example)[:150])
+    if not translate.PAIRS:
+        print('(the controls of pairs on whole rows were not run: the translator makes none with VF_PAIRS=0)')
+    if not translate.BORROW:
+        print('(the controls of borrowed registers were not run: the translator does not borrow with VF_BORROW=0)')
+    print('every control is objected to, and the translation as it is to nothing' if ok else 'NOT EVERY CONTROL IS OBJECTED TO (a hole in the check, a fault in the translation, or cubins that lack what a control takes away): see above')
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

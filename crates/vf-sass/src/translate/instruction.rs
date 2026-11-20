@@ -1,0 +1,455 @@
+//! Per-instruction translation: `translate_one` decides what each sm_75 instruction
+//! becomes (a plain rule, a sequence for a uniform operand, a matrix instruction,
+//! or nothing at all), and the specific translators for IMAD_HI, IMNMX, strided
+//! constants, ULDC, and ULDC at an index.
+
+use crate::assemble;
+use crate::decode::{Decoded, LETTER_Q, LETTER_U};
+use crate::generated::fields::*;
+use crate::generated::special::*;
+use crate::rule;
+
+use super::context::{Ctx, apply_rule};
+use super::matrix::{translate_matrix_load, translate_matrix_product};
+use super::matrix::{translate_rule, translate_uniform_address};
+use super::util::{late, put_operand, put_operand_by_class, put_operand_on_word};
+use super::{ARRIVES, Item, Refused, with_stall};
+
+// ---- translate_one ----
+
+pub(super) fn translate_one(ctx: &mut Ctx, i: usize, d: &Decoded) -> Result<Vec<Item>, Refused> {
+    let w = d.word;
+    let name = d.name;
+
+    // 1. Already an sm_70 instruction with no uniform operands
+    if ctx.dec70.decode(w).is_some()
+        && !d.reads.iter().any(|&(l, _, _)| l == LETTER_U || l == LETTER_Q)
+        && !d.writes.iter().any(|&(l, _)| l == LETTER_U || l == LETTER_Q)
+    {
+        return Ok(vec![Item::new(w, i, "same", false)]);
+    }
+
+    let guard = if d.has_op(OP_PG) {
+        vec![
+            ("Pg", assemble::OpVal::Int(d.op_or(OP_PG, 7))),
+            ("Pg_not", assemble::OpVal::Int(d.op_or(OP_PG_AT_NOT, 0))),
+        ]
+    } else {
+        Vec::new()
+    };
+    let wait = w & (63u128 << WAIT);
+
+    // Matrix instructions: Turing's LDSM and HMMA.1688.
+    if matches!(name, "ldsm__sImmOffset" | "ldsm__URsIR") {
+        if ctx.q.is_some() && ctx.q.unwrap().loads.contains_key(&i) {
+            return ctx.whole_rows(i, d, wait);
+        }
+        return translate_matrix_load(ctx, i, d, &guard, wait);
+    }
+    if name == "hmma_x8_" {
+        if ctx.q.is_some() && ctx.q.unwrap().sites.contains_key(&i) {
+            return ctx.half_of_pair(i, d, wait);
+        }
+        return translate_matrix_product(ctx, i, d, wait);
+    }
+
+    // 2. IMAD.HI
+    if name.starts_with("imad_hi__") {
+        return translate_imad_hi(ctx, i, d, &guard, wait);
+    }
+
+    // 3. IMNMX
+    if name.starts_with("imnmx__") {
+        return translate_imnmx(ctx, i, d, &guard, wait);
+    }
+
+    // 4. Memory with stride
+    if STRIDED.contains(&name) && d.op_or(OP_STRIDE, 0) != 0 {
+        return translate_stride(ctx, i, d, wait);
+    }
+
+    // 5. ULDC
+    if name == "uldc_const__RCR" {
+        return translate_uldc(ctx, i, d, w);
+    }
+
+    // A constant at a place that a uniform register gives
+    if name == "uldc_ur_offset_" {
+        return translate_uldc_at_index(ctx, i, d, wait);
+    }
+
+    // 6. Uniform address
+    for &(prefix, plain) in UNIFORM_ADDRESS {
+        if name.starts_with(prefix) {
+            return translate_uniform_address(ctx, i, d, plain);
+        }
+    }
+
+    // 7. R2UR
+    if name == "r2ur__noOR" && d.op_or(OP_PU, 7) == 7 {
+        let r_dest = ctx.r(d.op_or(OP_URD, 63))?;
+        let mut ops = guard.clone();
+        ops.push(("Rd", assemble::OpVal::Int(r_dest)));
+        ops.push(("Rb", assemble::OpVal::Int(d.op_or(OP_RA, 255))));
+        let mov =
+            assemble::assemble("mov__RRR_RR", &ops).ok_or_else(|| Refused("cannot assemble MOV for R2UR".into()))?;
+        let mov = (mov & !(31u128 << USCHED)) | (w & (31u128 << USCHED)) | wait;
+        return Ok(vec![Item::new(mov, i, "move", true)]);
+    }
+
+    // 8. Cache hint
+    if matches!(name, "ldg__sImmOffset" | "ld__sImmOffset") && d.op_or(OP_SP2, 0) != 0 {
+        let cleared = put_operand(d, OP_SP2, 0, 75)?;
+        if ctx.dec70.decode(cleared).is_some() {
+            return Ok(vec![Item::new(cleared, i, "without its cache hint", true)]);
+        }
+    }
+
+    // 9. Rule
+    if let Some(target) = rule::rule_of_target(d.class_id) {
+        return translate_rule(ctx, i, d, target);
+    }
+
+    Err(Refused(format!(
+        "no translation for {} ({}) at 0x{:x}",
+        d.name,
+        d.mnemonic,
+        16 * i
+    )))
+}
+
+fn translate_imad_hi(
+    ctx: &mut Ctx,
+    i: usize,
+    d: &Decoded,
+    guard: &[(&str, assemble::OpVal)],
+    _wait: u128,
+) -> Result<Vec<Item>, Refused> {
+    let name = d.name;
+    // Its carry into the predicate that guards the instruction: the move after the product
+    // would go by the carry. No code seen does that.
+    let carry = d.op_or(OP_PU, 7);
+    if carry != 7 && carry == d.op_or(OP_PG, 7) {
+        return Err(Refused(format!(
+            "IMAD.HI with its carry into the predicate that guards it at 0x{:x}",
+            16 * i
+        )));
+    }
+    let suffix = &name["imad_hi__".len()..];
+    let wide_target = format!("imad_wide__{}", suffix.replace("RUR_RUR", "RRR_RRR"));
+    let rule_idx = rule::find_rule(name, &wide_target, "")
+        .ok_or_else(|| Refused(format!("no rule from {} to {}", name, wide_target)))?;
+    let wide = apply_rule(ctx, rule_idx, i, d)?;
+    let wide_name70 = rule::rule_sm70_name(rule_idx);
+    let pair = ctx.pool(2)?;
+    let wide = put_operand_by_class(wide_name70, wide, "Rd", pair as u64, false)?;
+    let mut ops = guard.to_vec();
+    ops.push(("Rd", assemble::OpVal::Int(d.op_or(OP_RD, 255))));
+    ops.push(("Rb", assemble::OpVal::Int(pair + 1)));
+    let mov =
+        assemble::assemble("mov__RRR_RR", &ops).ok_or_else(|| Refused("cannot assemble MOV for IMAD.HI".into()))?;
+    let mov = (mov & !(31u128 << USCHED)) | (d.word & (31u128 << USCHED));
+    Ok(vec![
+        Item::new(wide & !REUSE, i, "product", true),
+        Item::new(mov, i, "upper half", true),
+    ])
+}
+
+fn translate_imnmx(
+    ctx: &mut Ctx,
+    i: usize,
+    d: &Decoded,
+    guard: &[(&str, assemble::OpVal)],
+    wait: u128,
+) -> Result<Vec<Item>, Refused> {
+    if d.op_or(OP_PP, 7) != 7 {
+        return Err(Refused(format!(
+            "IMNMX under a predicate that is not constant at 0x{:x}",
+            16 * i
+        )));
+    }
+    let (p, saved) = ctx.predicates.scratch_at[&i];
+    let larger = d.op_or(OP_PP_AT_NOT, 0);
+    let fmt_val = d.op_or(OP_FMT, 0);
+    // FMT enum for IMNMX: 0=U32, 1=S32
+    let fmt_name = match fmt_val {
+        0 => "U32".to_string(),
+        1 => "S32".to_string(),
+        _ => fmt_val.to_string(),
+    };
+
+    let name = d.name;
+    let (compare, select) = if name.ends_with("__RRR_RRR") || name.ends_with("__RUR_RUR") {
+        let b = if d.has_op(OP_URB) {
+            ctx.r(d.op_or(OP_URB, 63))?
+        } else {
+            d.op_or(OP_RB, 255)
+        };
+        let cmp = assemble::assemble(
+            "isetp__RRR_RR",
+            &[
+                ("Pu", assemble::OpVal::Int(p)),
+                ("Ra", assemble::OpVal::Int(d.op_or(OP_RA, 255))),
+                ("Rb", assemble::OpVal::Int(b)),
+                ("icmp", assemble::OpVal::Str("LT")),
+                ("fmt", assemble::OpVal::Str(&fmt_name)),
+                ("bop", assemble::OpVal::Str("AND")),
+            ],
+        )
+        .ok_or_else(|| Refused("cannot assemble ISETP for IMNMX".into()))?;
+        let mut ops = guard.to_vec();
+        ops.extend([
+            ("Rd", assemble::OpVal::Int(d.op_or(OP_RD, 255))),
+            ("Ra", assemble::OpVal::Int(d.op_or(OP_RA, 255))),
+            ("Rb", assemble::OpVal::Int(b)),
+            ("Pp", assemble::OpVal::Int(p)),
+            ("Pp_not", assemble::OpVal::Int(larger)),
+        ]);
+        let sel =
+            assemble::assemble("sel__RRR_RRR", &ops).ok_or_else(|| Refused("cannot assemble SEL for IMNMX".into()))?;
+        (cmp, sel)
+    } else if name.ends_with("__RsIR_RIR") {
+        let cmp = assemble::assemble(
+            "isetp__RsIR_RI",
+            &[
+                ("Pu", assemble::OpVal::Int(p)),
+                ("Ra", assemble::OpVal::Int(d.op_or(OP_RA, 255))),
+                ("Sb", assemble::OpVal::Int(d.op_or(OP_SB, 0))),
+                ("icmp", assemble::OpVal::Str("LT")),
+                ("fmt", assemble::OpVal::Str(&fmt_name)),
+                ("bop", assemble::OpVal::Str("AND")),
+            ],
+        )
+        .ok_or_else(|| Refused("cannot assemble ISETP for IMNMX".into()))?;
+        let mut ops = guard.to_vec();
+        ops.extend([
+            ("Rd", assemble::OpVal::Int(d.op_or(OP_RD, 255))),
+            ("Ra", assemble::OpVal::Int(d.op_or(OP_RA, 255))),
+            ("Sb", assemble::OpVal::Int(d.op_or(OP_SB, 0))),
+            ("Pp", assemble::OpVal::Int(p)),
+            ("Pp_not", assemble::OpVal::Int(larger)),
+        ]);
+        let sel =
+            assemble::assemble("sel__RuIR_RIR", &ops).ok_or_else(|| Refused("cannot assemble SEL for IMNMX".into()))?;
+        (cmp, sel)
+    } else if name.ends_with("__RCR_RCR") {
+        let cmp_ops = vec![
+            ("Pu", assemble::OpVal::Int(p)),
+            ("Ra", assemble::OpVal::Int(d.op_or(OP_RA, 255))),
+            ("icmp", assemble::OpVal::Str("LT")),
+            ("fmt", assemble::OpVal::Str(&fmt_name)),
+            ("bop", assemble::OpVal::Str("AND")),
+            ("Sb_bank", assemble::OpVal::Int(d.op_or(OP_SB_BANK, 0))),
+            ("Sb_addr", assemble::OpVal::Int(d.op_or(OP_SB_ADDR, 0))),
+        ];
+        let cmp = assemble::assemble("isetp__RCR_RC", &cmp_ops)
+            .ok_or_else(|| Refused("cannot assemble ISETP for IMNMX".into()))?;
+        let mut ops = guard.to_vec();
+        ops.extend([
+            ("Rd", assemble::OpVal::Int(d.op_or(OP_RD, 255))),
+            ("Ra", assemble::OpVal::Int(d.op_or(OP_RA, 255))),
+            ("Pp", assemble::OpVal::Int(p)),
+            ("Pp_not", assemble::OpVal::Int(larger)),
+            ("Sb_bank", assemble::OpVal::Int(d.op_or(OP_SB_BANK, 0))),
+            ("Sb_addr", assemble::OpVal::Int(d.op_or(OP_SB_ADDR, 0))),
+        ]);
+        let sel =
+            assemble::assemble("sel__RCR_RCR", &ops).ok_or_else(|| Refused("cannot assemble SEL for IMNMX".into()))?;
+        (cmp, sel)
+    } else {
+        return Err(Refused(format!("this form of IMNMX: {}", name)));
+    };
+
+    let select = (select & !(31u128 << USCHED))
+        | (d.word & (31u128 << USCHED))
+        | if !name.ends_with("RUR") { d.word & REUSE } else { 0 };
+    let mut new = vec![
+        Item::new(compare | wait, i, "comparison", true),
+        Item::new(select | wait, i, "selection", true),
+    ];
+    if let Some(k) = saved {
+        // (Every predicate holds something there: the one it computes into is saved around it.)
+        new.insert(0, ctx.saved(k, p, i)?);
+        new.push(ctx.given_back(k, p, i)?);
+    }
+    Ok(new)
+}
+
+fn translate_stride(ctx: &mut Ctx, i: usize, d: &Decoded, wait: u128) -> Result<Vec<Item>, Refused> {
+    let stride_val = d.op_or(OP_STRIDE, 0);
+    let shift = match stride_val {
+        1 => 2,
+        2 => 3,
+        3 => 4,
+        _ => return Err(Refused(format!("unknown stride {}", stride_val))),
+    };
+    let ra = d.op_or(OP_RA, 255);
+    // The register times the stride in the pool, then the plain instruction on it.
+    let shadow = ctx.pool(1)?;
+    let scale = assemble::assemble(
+        "shf__RuIR_RIR",
+        &[
+            ("Rd", assemble::OpVal::Int(shadow)),
+            ("Ra", assemble::OpVal::Int(ra)),
+            ("Sb", assemble::OpVal::Int(shift)),
+            ("Rc", assemble::OpVal::Int(255)),
+            ("dir", assemble::OpVal::Str("L")),
+            ("fmt", assemble::OpVal::Str("U32")),
+        ],
+    )
+    .ok_or_else(|| Refused("cannot assemble SHF for stride".into()))?;
+    let mut plain = put_operand(d, OP_STRIDE, 0, 75)?;
+    plain = put_operand_on_word(d, plain, OP_RA, shadow as u64, 75)?;
+    Ok(vec![
+        Item::new(scale | wait, i, "stride", true),
+        late(d.name, plain, i, "on the product")?,
+    ])
+}
+
+fn translate_uldc(ctx: &mut Ctx, i: usize, d: &Decoded, w: u128) -> Result<Vec<Item>, Refused> {
+    let sz_val = d.op_or(OP_SZ, 0);
+    let urd = d.op_or(OP_URD, 63);
+    let sa_bank = d.op_or(OP_SA_BANK, 0);
+    let sa_addr = d.op_or(OP_SA_ADDR, 0);
+
+    let upg = d.op_or(OP_UPG, 7);
+    let upg_not = d.op_or(OP_UPG_AT_NOT, 0);
+    let guard = vec![
+        ("Pg", assemble::OpVal::Int(ctx.p(upg)?)),
+        ("Pg_not", assemble::OpVal::Int(upg_not)),
+    ];
+
+    // Determine size from enum value (SZ_U8_S8_U16_S16_32_64 enum of uldc_const__RCR)
+    let sizes: Vec<&str> = match sz_val {
+        0 => vec!["U8"],
+        1 => vec!["S8"],
+        2 => vec!["U16"],
+        3 => vec!["S16"],
+        4 => vec!["32"],
+        5 => vec!["64"],
+        _ => vec![],
+    };
+    let small = sizes.iter().find(|&&s| matches!(s, "U8" | "S8" | "U16" | "S16"));
+    if let Some(kind) = small {
+        let bits: u32 = kind[1..].parse().unwrap_or(8);
+        let at = sa_addr % 4;
+        if at * 8 + bits > 32 {
+            return Err(Refused(format!(
+                "ULDC of bytes that straddle two words at 0x{:x}",
+                16 * i
+            )));
+        }
+        let r = ctx.r(urd)?;
+        let mut out = vec![];
+        let mut ops = guard.clone();
+        ops.push(("Rd", assemble::OpVal::Int(r)));
+        ops.push(("Sb_bank", assemble::OpVal::Int(sa_bank)));
+        ops.push(("Sb_addr", assemble::OpVal::Int(sa_addr / 4)));
+        out.push(Item::new(
+            assemble::assemble("mov__RCR_RC", &ops).ok_or_else(|| Refused("cannot assemble MOV for ULDC".into()))?,
+            i,
+            "constant",
+            true,
+        ));
+        let up = 32 - bits - 8 * at;
+        if up > 0 {
+            let mut ops2 = guard.clone();
+            ops2.extend([
+                ("Rd", assemble::OpVal::Int(r)),
+                ("Ra", assemble::OpVal::Int(r)),
+                ("Sb", assemble::OpVal::Int(up)),
+                ("Rc", assemble::OpVal::Int(255)),
+                ("dir", assemble::OpVal::Str("L")),
+                ("fmt", assemble::OpVal::Str("U32")),
+            ]);
+            out.push(Item::new(
+                assemble::assemble("shf__RuIR_RIR", &ops2)
+                    .ok_or_else(|| Refused("cannot assemble SHF for ULDC".into()))?,
+                i,
+                "bytes",
+                true,
+            ));
+        }
+        let fmt_str = if kind.starts_with('S') { "S32" } else { "U32" };
+        let mut ops3 = guard.clone();
+        ops3.extend([
+            ("Rd", assemble::OpVal::Int(r)),
+            ("Ra", assemble::OpVal::Int(255)),
+            ("Sb", assemble::OpVal::Int(32 - bits)),
+            ("Rc", assemble::OpVal::Int(r)),
+            ("dir", assemble::OpVal::Str("R")),
+            ("fmt", assemble::OpVal::Str(fmt_str)),
+            ("hilo", assemble::OpVal::Str("HI")),
+        ]);
+        let last =
+            assemble::assemble("shf__RuIR_RIR", &ops3).ok_or_else(|| Refused("cannot assemble SHF for ULDC".into()))?;
+        let last = (last & !(31u128 << USCHED)) | (w & (31u128 << USCHED));
+        out.push(Item::new(last, i, "bytes", true));
+        return Ok(out);
+    }
+
+    if !sizes.iter().any(|&s| s == "32" || s == "64") {
+        return Err(Refused(format!("ULDC of {} bits at 0x{:x}", sizes.join("/"), 16 * i)));
+    }
+    if !sa_addr.is_multiple_of(4) {
+        return Err(Refused(format!(
+            "ULDC of a constant that is not at a multiple of 4 at 0x{:x}",
+            16 * i
+        )));
+    }
+    let is_64 = sizes.contains(&"64");
+    let n_halves = if is_64 { 2 } else { 1 };
+    let mut out = vec![];
+    for half in 0..n_halves {
+        let mut ops = guard.clone();
+        ops.push(("Rd", assemble::OpVal::Int(ctx.r(urd + half)?)));
+        ops.push(("Sb_bank", assemble::OpVal::Int(sa_bank)));
+        ops.push(("Sb_addr", assemble::OpVal::Int(sa_addr / 4 + half)));
+        out.push(Item::new(
+            assemble::assemble("mov__RCR_RC", &ops).ok_or_else(|| Refused("cannot assemble MOV for ULDC".into()))?,
+            i,
+            "constant",
+            true,
+        ));
+    }
+    let last = out.last_mut().unwrap();
+    last.word = (last.word & !(31u128 << USCHED)) | (w & (31u128 << USCHED));
+    Ok(out)
+}
+
+/// A constant at a place that a uniform register gives. Turing has it at once. On Volta a load of
+/// constants brings it some cycles later and says so on a scoreboard, which what follows was not
+/// written to wait for: an instruction that does nothing waits for it there. (By then the load has
+/// long read the register: it needs no copy.)
+fn translate_uldc_at_index(ctx: &mut Ctx, i: usize, d: &Decoded, wait: u128) -> Result<Vec<Item>, Refused> {
+    use assemble::OpVal::Int;
+    if d.op_or(OP_URA, 63) == 63 {
+        return Err(Refused(format!(
+            "ULDC at an index that is the zero register at 0x{:x}",
+            16 * i
+        )));
+    }
+    let guard = ctx.p(d.op_or(OP_UPG, 7))?;
+    let to = ctx.r(d.op_or(OP_URD, 63))?;
+    let index = ctx.r(d.op_or(OP_URA, 63))?;
+    let load = assemble::assemble(
+        "ldc__RaNonRZ",
+        &[
+            ("Pg", Int(guard)),
+            ("Pg_not", Int(d.op_or(OP_UPG_AT_NOT, 0))),
+            ("sz", Int(d.op_or(OP_SZ, 0))),
+            ("Rd", Int(to)),
+            ("Ra", Int(index)),
+            ("Sa_bank", Int(d.op_or(OP_SA_BANK, 0))),
+            ("Ra_offset", Int(d.op_or(OP_SA_OFFSET, 0))),
+            ("dst_wr_sb", Int(ARRIVES)),
+        ],
+    )
+    .ok_or_else(|| Refused("cannot assemble LDC for ULDC".into()))?;
+    let arrived =
+        (with_stall(NOP, 1, false) & !(31u128 << USCHED)) | (d.word & (31u128 << USCHED)) | (1u128 << (WAIT + ARRIVES));
+    Ok(vec![
+        Item::new(load | wait, i, "constant at an index", true),
+        Item::new(arrived, i, "until it is there", true),
+    ])
+}

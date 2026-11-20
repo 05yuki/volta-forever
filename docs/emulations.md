@@ -1,0 +1,664 @@
+# Instructions of later GPUs on Volta
+
+What a Tesla V100 (compute capability 7.0) computes in place of an instruction it does not
+have. Each section says what the sequence is, why, what is exact and what is not, and where
+to look in the code. The emulations apply to PTX (program text) adapted for Volta by the
+lowering pass (`crates/vf-ptx/src/lower/`); section 10 says which of them also exist in
+translated machine code (`crates/vf-sass/src/translate/`).
+
+Programs that carry PTX for sm_75 or later have their PTX rewritten for sm_70 before the
+driver compiles it. Programs that carry only sm_75 machine code have it translated function
+by function. In both cases the instructions a V100 lacks are replaced by sequences of
+instructions it has. A kernel that runs such sequences is announced on the console; a
+kernel whose instructions have no sequence is refused when the program asks for it.
+
+The test suite (`tests/gpu/run.sh`) checks every emulated form against a host model of the
+instruction. The host models are the definitions of the PTX manual, and the test values are
+those where an answer is decided: halfway points of a rounding, limits of a range, sums
+that are exact in any order. The tests are in `tests/kernels/`.
+
+Where a result depends on the order or the width of the sums (a product of floats on
+arbitrary values), no manual says what the hardware does, and "the hardware's answer" is not
+one thing: Volta's own product, Turing's and Blackwell's do not add alike. For those cases the
+sections below give what was measured against an RTX 5090.
+
+## 1. What Volta's tensor cores do
+
+A V100 has one tensor-core instruction: `mma.sync.aligned.m8n8k4` on halves (f16), with
+f16 or f32 accumulators. It computes four independent 8x8x4 matrix products per warp, one
+per octet (lanes `4q..4q+3` and `16+4q..16+4q+3`). Each thread holds:
+
+- **A**: 4 half values, its row of the octet's 8x4 input matrix.
+- **B**: 4 half values, its column of the octet's 4x8 input matrix.
+- **C/D (f32)**: 8 values, scattered positions in the octet's 8x8 output.
+- **C/D (f16)**: 8 values, one complete row of the 8x8 output.
+
+Every product of two f16 values is exact as an f32; the instruction adds four of them and
+the accumulator, in f32.
+
+Volta has no tensor-core instruction for int8, bf16, tf32, f64, FP8 or the 4-bit formats.
+It does have `dp4a` (the dot product of four pairs of int8, accumulated into an int32),
+which is used by the integer emulation.
+
+Programs compiled for Turing (sm_75) and later ask for products of other shapes (`m16n8k8`,
+`m16n8k16`, `m16n8k32`, `m8n8k16`, ...) and other element types. Each is built from what
+Volta has, as the sections below describe.
+
+## 2. Products of halves and floats of later shapes
+
+### FP16 products: m16n8k8, m16n8k16
+
+The instruction `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32` computes a 16x8x8
+product over the full warp (32 threads). A thread in group g (lane = 4g + t, t in 0..3)
+holds two A registers (rows g and g+8), one B register, and four D registers (the results
+for its rows and columns).
+
+**Decomposition.** Each Turing product becomes two of Volta's `mma.m8n8k4`, one for even k
+and one for odd k (a product of a chain is computed otherwise: "Chains of products" below):
+
+1. The A registers of the thread are used as column-major operands. The first product takes
+   them as they are; the second takes them with their halves swapped (`shf.l.wrap.b32` by
+   16), which exchanges even and odd elements of k.
+2. The B operand must be redistributed. A thread provides four elements of one value of k
+   for four columns. Five warp shuffles (`shfl.sync`) bring each thread the elements it
+   needs from the lanes that hold them.
+3. With f32 accumulators, a thread's four results are in registers 0..3 (even thread number)
+   or 4..7 (odd), selected by `selp`. The other four registers hold sums of unrelated terms
+   and are discarded.
+4. With f16 accumulators, the result is in Volta layout: half of what the thread needs and
+   half of what the thread two lanes away needs. One shuffle each way converts between the
+   two layouts.
+
+The `m16n8k16` shape is two `m16n8k8` products on the two halves of k, the second
+accumulating on the first.
+
+**Exactness.** The products are computed on Volta's tensor cores. Each term (f16 x f16) is
+exact as an f32. What differs from a later GPU is how the eight terms of k and the
+accumulator are added: here four at a time, by Volta's instruction (the even k, then the odd
+k), each sum rounded to f32; later hardware adds otherwise, in an accumulator wider than f32.
+
+- On the inputs of the test suite, where every sum is exact whatever its order, every result
+  is the host model's, and an RTX 5090 gives the same (all shapes of the FP16 product).
+- On random values of mixed magnitudes the last bits differ. Of 327,680 results of one
+  `m16n8k8` (zero accumulators) through the machine-code translation, which adds in the same
+  order, compared with an RTX 5090's: 47.6 % identical, 41.2 % one unit of the last place
+  away, 10.2 % two to four, 1.1 % further, the largest where terms cancel (2026-11-18).
+
+A program built for Volta computes its products with the same instruction and has the same
+kind of difference from later hardware.
+
+**Example.** A product of constant halves, before and after adaptation (`bin/vf adapt`):
+
+Before (PTX for sm_75):
+```
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+    {%d0, %d1, %d2, %d3}, {%a0, %a1}, {%b0}, {%c0, %c1, %c2, %c3};
+```
+
+After (PTX for sm_70, the core of the sequence):
+```
+shf.l.wrap.b32 %vf_r0, %a0, %a0, 16;         // A with halves swapped
+shf.l.wrap.b32 %vf_r1, %a1, %a1, 16;
+shfl.sync.bfly.b32 %vf_r2, %b0, 4, 31, -1;   // five shuffles gather B
+  ... (4 shifts and 2 selp to assemble the upper/lower halves) ...
+shfl.sync.idx.b32 %vf_r9, %vf_r7, %vf_s0, 31, -1;
+shfl.sync.idx.b32 %vf_r10, %vf_r7, %vf_s1, 31, -1;
+shfl.sync.idx.b32 %vf_r11, %vf_r8, %vf_s0, 31, -1;
+shfl.sync.idx.b32 %vf_r12, %vf_r8, %vf_s1, 31, -1;
+mma.sync.aligned.m8n8k4.col.row.f32.f16.f16.f32 // first Volta product (even k)
+    {...}, {%a0, %a1}, {%vf_r9, %vf_r10}, {...};
+mma.sync.aligned.m8n8k4.col.row.f32.f16.f16.f32 // second (odd k)
+    {...}, {%vf_r0, %vf_r1}, {%vf_r11, %vf_r12}, {...};
+selp.b32 %d0, %vf_r25, %vf_r21, %vf_p1;  // choose this thread's results
+selp.b32 %d1, %vf_r26, %vf_r22, %vf_p1;
+selp.b32 %d2, %vf_r27, %vf_r23, %vf_p1;
+selp.b32 %d3, %vf_r28, %vf_r24, %vf_p1;
+```
+
+The preamble (computed once per function, 10 instructions) reads the lane and derives the
+indices, masks and predicates the sequences use. The sequence above uses 29 scratch registers and no
+register of the program beyond the operands.
+
+### Ampere shapes: m16n8k16 on FP16
+
+`mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` has four A registers (the first two
+for k 0..7, the other two for k 8..15) and two B registers. It becomes two `m16n8k8`
+products, the second accumulating on the first: four of Volta's `mma.m8n8k4`.
+
+### Remembered operands
+
+The lowering remembers what it derives from the operands of a product: the A registers with
+their halves swapped, the gathered B, an f16 accumulator in Volta's layout. When several
+products use the same register with nothing writing it in between, it is derived once.
+
+### Chains of products
+
+Four or more `m16n8k8` products with f32 accumulators that follow one another on the same
+four accumulator registers, in straight-line code, are a chain, and are computed otherwise:
+one `mma.m8n8k4.row.col` for each product instead of two. The accumulator is kept in eight
+registers of the rewriting, in Volta's layout and split: the two halves of k of a product are
+computed by different octets of the warp, and each lane holds partial sums that only the end
+of the chain adds up. The registers of the program get the accumulator back before any
+statement that names one of them, before a label or a branch, and at the bounds of a block.
+
+A register is followed by its name, and it has one: a member of a family written with zeros
+before its number (`%d00` for `%d0` of `.reg .b32 %d<4>`, the same register to the
+assembler) is written as the family declares it before anything else is done
+(`lower/names.rs`). A function that writes a member so is refused when the name could mean
+something else, under either spelling: a register declared on its own under the name of a
+member, two families with a name in common, a variable (`.shared .b32 %d00;` in a block is
+that variable there, and `mov.u32 %d1, %d00;` its address), a label, a parameter. Which of
+two declarations the assembler follows depends on the blocks, on their order and on where the
+name is written; the rewriting does not guess. The registers and labels that the rewriting
+adds have names that begin with `%vf_` and `$vf_`: a function that has such a name
+already is refused too.
+
+The statements of a body are read as text, and a comment is not code: the comments of a body
+that is rewritten are written over with spaces before anything reads it (a body in which
+nothing is rewritten is left as it came). A family declared as `%d<4> /* four */` is the same
+family, and a name that only a comment mentions is declared by nothing.
+
+Measured on products whose operands are held in registers (what `vf adapt` makes of
+`tests/kernels/ptx-cases/padded-chain-read.ptx`, and of the same with fewer products):
+alone, a product is two Volta products, five shuffles and 17 statements in all; in a chain,
+one Volta product, six shuffles and 9 statements. The chain itself costs 8 statements to
+begin from zero (44, with 16 shuffles, to begin from values that the program computed) and
+28, with 12 shuffles, to end. Timings are in `docs/performance.md` ("Flash attention").
+
+### Operands loaded from shared memory
+
+Most tensor-core operands come from shared memory through `ldmatrix` (section 3). A first
+pass over the function body finds operand registers that one `ldmatrix` loads and nothing
+else writes. That `ldmatrix` then loads them a second time in the layout Volta takes, so
+that the product uses rows and columns directly instead of gathering by shuffles:
+
+- Both operands of an FP16 product from plain `ldmatrix`: the product is split along halves
+  of k instead of even and odd. The form is `mma.m8n8k4.row.col` (not `.col.row`).
+- The B operand from `ldmatrix.trans`: four words of two rows of the loaded matrix.
+
+A register used only this way is never loaded in Turing layout.
+
+### What it costs
+
+A single `m16n8k8` on halves with f32 accumulators: 19 instructions, after a 10-instruction
+preamble computed once per function. When B is already gathered: 8 instructions (6 when A
+is also reused). The same product in machine code: 25 instructions, or 14 when B is kept
+from the product before (section 10). What this costs in time is in `docs/performance.md`,
+"Where the time goes".
+
+**Test cases.** `tests/gpu/run.sh`: `tensor-core` (37 kernels, 0 wrong), `chains`
+(7 kernels, 0 wrong), `kept` (5 kernels, 0 wrong), and the PTX-only cases
+(`ptx-family-declared-again`, `ptx-accumulator-as-operand`, and others).
+
+## 3. Matrix loads and moves
+
+### ldmatrix
+
+`ldmatrix.sync.aligned.m8n8.x4.b16` loads four 8x8 matrices from shared memory, one row
+per thread, into four registers. It is a warp-cooperative load. Volta lacks it.
+
+**On Volta.** For each of the 1, 2 or 4 matrices: the address of the thread's row is
+obtained by a shuffle from the lane that holds it, the offset of the thread's pair of
+elements is added, and 4 bytes are loaded from shared memory. For the transposed form
+(`ldmatrix.trans`), each matrix needs two rows fetched by shuffles and two 2-byte loads,
+the two halves assembled.
+
+A 16-byte load from shared memory faults on a V100 when its address is not a multiple of
+16. The PTX manual requires every address to be aligned
+to its access size. By default (`VF_ALIGNED_ROWS` on, `Options::aligned_rows`) the layer
+takes the manual at its word and loads 16 bytes. A program whose rows are elsewhere stops
+with a misaligned-address fault (error 716), and `VF_ALIGNED_ROWS=0` makes the layer
+test the addresses at runtime: if a row is not at a multiple of 16 the same bytes are
+loaded word by word. The test costs 17 % to a factor of two on a program's emulated
+tensor-core kernels; every program tested keeps its rows aligned.
+
+**Instruction counts.** Plain `ldmatrix` of 4 matrices: 17 instructions (2 for the
+preamble, 3 or 4 per matrix). Transposed: 38 (3 + 9 per matrix).
+
+**movmatrix.** `movmatrix.sync.aligned.m8n8.trans.b16` transposes a matrix fragment across
+lanes. It becomes two warp shuffles.
+
+**stmatrix.** Refused: no Volta sequence. No library of the census uses it.
+
+**Test cases.** `tests/gpu/run.sh`: the `tensor-core` and `ampere` cases load every
+operand with `ldmatrix` and check every register of every thread against the host model.
+The `tensor-core-tested` case runs the same kernels with `VF_ALIGNED_ROWS=0`, including
+those whose rows are deliberately elsewhere: 42 kernels, 0 wrong.
+
+## 4. bf16
+
+A bf16 (bfloat16) is the upper half of a 32-bit float: the same 8-bit exponent, 7 bits of
+mantissa instead of 23. A V100 has no instruction for bf16. The layer emulates arithmetic,
+comparisons, conversions and atomic additions.
+
+### Products
+
+bf16 tensor-core products (`mma.sync.aligned.m16n8k16` and `m16n8k8` on bf16;
+`m16n8k8` and `m16n8k4` on tf32; `m8n8k4` on f64) get no help from Volta's tensor cores: a
+half does not hold the exponent range of a bf16 or an f64. Each thread gathers its rows of
+A and its columns of B from the other lanes (shuffles, as for the integer products) and
+computes its sums with `fma.rn.f32`, one term after the other in the order of k. A bf16 is
+made an f32 by a shift of 16 (exact). All sums are complete before a result is written, so
+that the instruction's atomicity is preserved.
+
+**Instruction counts.** One `m16n8k16` on bf16: 199 instructions (64 `fma`, 32 shuffles).
+One `m16n8k8` on bf16: 116. One `m16n8k8` on tf32: 103 (plus operand truncation, below).
+One `m16n8k4` on tf32: 68. One `m8n8k4` on f64: 63. These are whole-kernel counts;
+roughly 30 of each read the operands and store the results.
+
+**Accuracy.** The layer adds the terms one at a time with `fma.rn.f32` (23-bit mantissa,
+round-to-nearest-even). An RTX 5090 uses a wider internal accumulator (~25-bit mantissa
+with truncation to f32). The difference (measured 2026-11-17 on an RTX 5090 with 768,000
+random results):
+
+| Type | Results that differ from RTX 5090 | Magnitude |
+|---|---|---|
+| bf16 m16n8k16 | ~20% of random values | 1 to 2 ULP |
+| bf16 m16n8k8 | ~20% | 1 to 2 ULP |
+| tf32 m16n8k8 | not measured since the operands are cut as the hardware cuts them (before: ~40 %) | |
+| f64 m8n8k4 | 0% | exact |
+
+For tf32, the layer cuts the operands to 10 bits of mantissa (`and.b32 reg, reg, 0xFFFFE000`),
+as the hardware was measured to (the low 13 bits dropped, not rounded). What is left should
+be the difference in the sums, as for bf16; it was not measured again.
+
+Both rounding behaviors (the layer's sequential f32 `fma` and the hardware's wider
+accumulator) are valid implementations of the PTX specification, which requires
+"accumulation with at least single precision". The products of bf16 operands are exact (a
+bf16 x bf16 has at most 14 significant bits, well within f32).
+
+### Arithmetic
+
+| Instruction | On Volta |
+|---|---|
+| `neg.bf16` | Flip the sign bit |
+| `add.bf16`, `add.bf16x2` | Operands as f32 (a shift), `add.rn.f32`, rounded to bf16 |
+| `mul.bf16` | Same with `mul.rn.f32` |
+| `fma.rn.bf16`, `fma.rn.bf16x2` | Rounded to odd in f32 first (from `fma.rm.f32` and `fma.rp.f32`), then to bf16 |
+| `cvt.rn.bf16.f64` | f32 rounded to odd (from `cvt.rm.f32.f64` and `cvt.rp.f32.f64`), then to bf16 |
+| `setp.<cmp>.bf16` | Comparison of the two f32 |
+| `set.<cmp>.bf16x2.bf16x2` | Two comparisons, 1.0 or 0.0 as bf16 in each half |
+
+**One rounding, not two.** Computing an `fma` in f32 and then rounding to bf16 would round
+twice, which can give the wrong answer: a first rounding can land on a halfway point, and
+the second rounding (ties to even) goes the wrong way. This happens for 14% of `fma`
+operands whose result is near a bf16 halfway point (measured on 300,000 each of `fma`,
+`add`, `mul` and `cvt`). The fix:
+the f32 result is rounded to odd first (the value whose last mantissa bit is 1, chosen from
+the two directed roundings), which preserves the information the second rounding needs.
+Cost: two `fma` and three instructions instead of one `fma`.
+
+For `add` and `mul` the double rounding is harmless. The product of two significands of 8
+bits has at most 16 bits: it is exact as an f32. The f32 sum of two bf16 is not always exact
+(1 + 2^-30: both are bf16 values, and their f32 sum is 1), but rounding it to bf16 gives
+what one rounding of the exact sum gives. The two could differ only for a sum that is within
+half a unit of f32 of a point halfway between two bf16 values without being on it, and no
+sum of two numbers of 8 significant bits is. This was computed rather than argued: for every
+pair of significands, both signs and the 44 distances between the exponents from 0 to 43
+(further apart, the smaller term changes neither result), on exact integers: 1,433,536 sums,
+of which 852,096 are not exact as f32, and the two ways of rounding agree in all of them.
+(A sum small enough to be subnormal as an f32 is exact, and bf16 has the exponents of f32.)
+
+### Atomic additions
+
+`atom.add.noftz.bf16` and `atom.add.noftz.bf16x2`: a compare-and-swap loop. The thread
+reads the word, adds as above, and gives both the old and new values to `atom.cas`, which
+writes the sum only if the word still holds the original value. If another thread
+intervened, the loop retries with the new value. The `.sem` and `.scope` qualifiers of the
+original instruction are placed on the `atom.cas`.
+
+Under a predicate the entire loop is skipped: a thread whose predicate is false does not
+touch memory. The bf16x2 form uses `atom.cas.b32` on the whole word. `atom.cas.b16` is
+available from sm_70.
+
+**Test cases.** `tests/gpu/run.sh`: `bf16` (15 kernels, 0 wrong). The arithmetic tests
+use operands at and near bf16 halfway points, subnormals, NaN and infinity. The atomic
+tests run 64 threads adding to the same address.
+
+## 5. Integer products
+
+### Turing: m8n8k16
+
+`mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32` computes two 32-bit sums per thread: the
+dot product of the thread's 16-byte row of A with two 16-byte columns of B. Volta has no
+integer tensor-core instruction.
+
+**On Volta.** Each thread's row of A (one register, four bytes) and its columns of B are
+gathered from other lanes with shuffles. The B columns (eight registers total) come from
+eight lanes, four shuffles each. Each sum is four `dp4a.s32.s32` instructions, one for each
+group of 4 consecutive k-elements. The two sums are interleaved: three steps of the first,
+three of the second, then the last step of each (which writes the destination register).
+The accumulator is passed through.
+
+Signed, unsigned and mixed forms are all supported (`dp4a.s32.s32` for signed, `.u32.u32`
+for unsigned, mixed by inserting conversions).
+
+**Example.** Before:
+```
+mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+    {%d0, %d1}, {%a0}, {%b0}, {%c0, %c1};
+```
+
+After:
+```
+shfl.sync.idx.b32 %vf_r0, %a0, %vf_ia0, 31, -1;  // gather row of A (4 shuffles)
+shfl.sync.idx.b32 %vf_r1, %a0, %vf_ia1, 31, -1;
+shfl.sync.idx.b32 %vf_r2, %a0, %vf_ia2, 31, -1;
+shfl.sync.idx.b32 %vf_r3, %a0, %vf_ia3, 31, -1;
+shfl.sync.idx.b32 %vf_r4, %b0, %vf_ib0, 31, -1;  // gather columns of B (8 shuffles)
+  ...
+shfl.sync.idx.b32 %vf_r11, %b0, %vf_ib7, 31, -1;
+dp4a.s32.s32 %vf_r12, %vf_r0, %vf_r4, %c0;     // three dp4a of sum 1
+dp4a.s32.s32 %vf_r12, %vf_r1, %vf_r5, %vf_r12;
+dp4a.s32.s32 %vf_r12, %vf_r2, %vf_r6, %vf_r12;
+dp4a.s32.s32 %vf_r13, %vf_r0, %vf_r8, %c1;     // three dp4a of sum 2
+dp4a.s32.s32 %vf_r13, %vf_r1, %vf_r9, %vf_r13;
+dp4a.s32.s32 %vf_r13, %vf_r2, %vf_r10, %vf_r13;
+dp4a.s32.s32 %d0, %vf_r3, %vf_r7, %vf_r12;     // last dp4a of each sum
+dp4a.s32.s32 %d1, %vf_r3, %vf_r11, %vf_r13;
+```
+
+**Exactness.** Each `dp4a` computes the exact dot product of four int8 pairs; the sum of
+16 such products cannot overflow an int32 (maximum 16 * 128 * 128 = 262,144). The emulation
+gives the hardware's answer: 0 differences on an RTX 5090 (measured 2026-11-17).
+
+**`.satfinite`.** The qualifier saturates the final sum to the int32 range on overflow. The
+layer computes the product sum from zero (which cannot overflow) and adds the accumulator
+last with `add.sat.s32`.
+
+### Ampere shapes: m16n8k16, m16n8k32
+
+Each is a composition of Turing products. `m16n8k16` is two Turing products (rows 0-7 and
+8-15) with the same B. `m16n8k32` is four: for each half of the rows, the first 16 columns
+then the last 16, the second accumulating on the first. The decomposition follows from the
+fragment layouts of the PTX manual.
+
+### A operands loaded from shared memory
+
+Kernels keep many A operands in registers through long unrolled loops, four registers for
+each. When the A operand was loaded by `ldmatrix` and nothing between the load and the
+product can change the memory (no label, no store to shared memory, no call, no barrier),
+the layer keeps only the address of the row and loads the 16 bytes at each product with
+`ld.volatile.shared.v4.u32` (marked `volatile` so the compiler does not keep the result).
+This frees the four gathered registers and eliminates stack spills: the integer kernels of
+llama.cpp's q6_K format dropped from 3.95 times the native `dp4a` kernel's time to 1.88
+(measured 2026-11-16 with llama.cpp's `test-backend-ops perf`, `tests/gpu/llamacpp-ops.sh`).
+
+**Test cases.** `tests/gpu/run.sh`: `tensor-core` (integer kernels among the 37),
+`ampere` (31 kernels, 0 wrong).
+
+## 6. FP8
+
+### Conversions
+
+**Decode (FP8 to f16).** Every value of `e4m3` and `e5m2` is exactly a half. `e5m2` has the
+exponent of a half: its byte is the upper byte of the half. `e4m3` has a narrower exponent,
+but its seven bits below the sign, placed in bits 13..7 of a half, give the value divided
+by 256 (the exponent fields differ by exactly 8). Multiplication by 256 (a half) recovers
+the value, exactly. The NaN byte `0x7f` of `e4m3` (which would decode to 480) is detected:
+bits 14..9 are set to make a NaN of the same sign.
+
+| Form | Instructions | Exact |
+|---|---|---|
+| `cvt.rn.f16x2.e4m3x2` | 30 (in the test kernel) | yes |
+| `cvt.rn.f16x2.e5m2x2` | 14 | yes |
+
+**Encode (f32 to FP8).** The value (divided by 256 for `e4m3`) is cut to a half towards
+zero (`cvt.rz.f16.f32`), a bit records whether the cut dropped anything, and the byte is
+that half without its low bits, rounded to nearest even on them and on that bit. What is
+beyond the largest finite value becomes that value (`.satfinite`: 448 for `e4m3`, 57,344
+for `e5m2`). A NaN becomes the NaN of the format. Rounding to a half first and then to the
+byte would round twice and be wrong at the halfway points; the layer rounds once.
+
+| Form | Instructions |
+|---|---|
+| `cvt.rn.satfinite.e4m3x2.f32` | 48 (for two values) |
+| `cvt.rn.satfinite.e5m2x2.f32` | 48 |
+| `cvt.rn.satfinite.e4m3x2.f16x2` | (the same technique on the f16 input) |
+| `cvt.rn.satfinite.e5m2x2.f16x2` | |
+
+### Products
+
+`mma.sync.aligned.m16n8k32` on `e4m3` and `e5m2`, with f32 accumulators. The k = 32
+layout gives a thread four consecutive k-elements in each register. Each pair of bytes
+becomes a pair of halves (exact, as above), and the product is four FP16 `m16n8k8` in a
+row (eight of Volta's `mma.m8n8k4`). No lane is asked for anything to decode, and the
+halves of an operand used by several products are made once.
+
+**Instruction count.** 225 to 353 instructions per product (the range is across the three
+type combinations: e4m3xe4m3, e4m3xe5m2, e5m2xe5m2).
+
+**Exactness.** The conversion to halves is exact, and the products are FP16 products on
+Volta's tensor cores, with what section 2 says of them: on the inputs of the test suite,
+where the sums are exact, no difference from the host model nor from an RTX 5090 (measured
+2026-11-17); on arbitrary values, last bits that depend on how the sums are made (the
+MXF8F6F4 row of section 8 shows how much on E4M3 operands).
+
+**Test cases.** `tests/gpu/run.sh`: `fp8` (19 kernels, 0 wrong). Tests cover every byte
+pair decoded, conversions at and around every value and halfway point of both formats,
+products of the three type combinations, and operands from `ldmatrix`.
+
+## 7. FP4 and exponent-only formats
+
+### E2M1 (4-bit float)
+
+A 4-bit float with 2 exponent bits (bias 1) and 1 mantissa bit. The 16 values: 0, 0.5, 1,
+1.5, 2, 3, 4, 6, and their negatives. Every value is an exact f16 half.
+
+**Conversions.** `cvt.rn.f16x2.e2m1x2` (decode): exact. The upper nibble gives the upper
+half, the lower nibble the lower half. `cvt.rn.satfinite.e2m1x2.f32` (encode): round to
+nearest, ties to even. NaN becomes +6 (the format has no NaN); values beyond +-6 become
++-6. The `.relu` variant sets negative inputs to +0.
+
+### UE8M0 (unsigned 8-bit exponent)
+
+An 8-bit format representing powers of two: 2^(e - 127) for bytes 1 to 254. Byte 0 is
+2^(-127) (not zero). Byte 0xFF is NaN.
+
+**What the hardware does with byte 0 and 0xFF** (measured on an RTX 5090, 2026-11-17,
+`tests/kernels/blackwell/ref/decode_ue8m0.bin`):
+- Byte 0 decodes to bf16 `0x0040`, which is the bf16 subnormal for 2^(-127).
+- Byte 0xFF decodes to bf16 `0x7FFF` (a quiet NaN, all mantissa bits set).
+
+**Encode.** `cvt.rp.satfinite.ue8m0x2.f32` (round toward +infinity) and
+`cvt.rz.satfinite.ue8m0x2.f32` (round toward zero). For subnormals: `.rp` gives byte 0
+when the mantissa is at or below `0x400000` (which is exactly 2^(-127)) and byte 1 above
+it; `.rz` gives byte 0 for all subnormals. Zero goes to byte 0. NaN to 0xFF. Infinity to
+0xFE. The sign is ignored. The `.rn` modifier is rejected by the assembler (ptxas 13.5).
+The from-bf16 forms (`cvt.{rz,rp}.satfinite.ue8m0x2.bf16x2`) follow the same rules.
+
+### UE4M3 (the scale of NVFP4)
+
+A 7-bit unsigned E4M3 (bit 7 is ignored): 4 exponent bits (bias 7), 3 mantissa bits. Byte
+0 is zero. Byte `0x7f` is NaN. The 128 distinct values range from 2^(-9) (the smallest
+subnormal) to 448. Measured exhaustively on an RTX 5090 (all 256 byte values,
+`tests/kernels/blackwell/ref_scaled/`).
+
+### Agreement with the RTX 5090
+
+Every conversion of every value of the formats matches the RTX 5090's output byte for byte
+(measured 2026-11-17 on the RTX 5090 and on a V100 through the layer: 201,010 records in 9
+reference files, `tests/gpu/run.sh` `fp4-hardware`). The reference files are in
+`tests/kernels/blackwell/ref/` and cover every byte of E2M1 (with and without `.relu`),
+every pair of bytes of UE8M0, and every rounding boundary of the encode forms.
+
+**Test cases.** `tests/gpu/run.sh`: `fp4` (10 kernels, 0 wrong), `fp4-hardware` (9
+reference files, the same byte for byte).
+
+## 8. Block-scaled products
+
+Blackwell (sm_120) introduces block-scaled tensor-core products: `mma.sync.aligned` with
+`.block_scale`, where the operands are E2M1 or E4M3 and each block of k-elements has its
+own scale factor. The layer emulates three forms:
+
+| Kind | Operands | Scale type | Scale_vec | K |
+|---|---|---|---|---|
+| `kind::mxf4` (MXFP4) | E2M1 | UE8M0 | 2X | 64 |
+| `kind::mxf4nvf4` (NVFP4) | E2M1 | UE4M3 | 4X | 64 |
+| `kind::mxf8f6f4` (MXF8F6F4) | E4M3 | UE8M0 | 1X | 32 |
+
+The formula: D[r][c] = C[r][c] + sum over blocks b of (scale_A[r][b] * scale_B[c][b] *
+sum over k in block b of A[r][k] * B[k][c]).
+
+### What the layer computes
+
+For each block:
+
+1. E2M1 nibbles are decoded to exact halves (every E2M1 value is an f16). For E4M3 (the
+   MXF8F6F4 form), bytes are decoded to halves as in section 6.
+2. The block's k-values are shuffled to all four threads of the group and fed to Volta's
+   `mma.m8n8k4` products. The f32 block sum is exact for E2M1 (at most 16 * 36 = 576,
+   which is 10 bits).
+3. The block sum is multiplied by the product of the two scales, and the scaled sums of the
+   blocks are added in f64. (For NVFP4 the scales are combined and applied in f32, where
+   every such product is exact: a UE4M3 scale has few significant bits and the block sum is a
+   small integer of quarters. The sum over the blocks is in f64 for every form.)
+4. The final f64 sum is converted to f32: by truncation toward zero for `scale_vec::4X`
+   (NVFP4), by round-to-nearest-even for `scale_vec::2X` and `1X`.
+
+### Scale distribution
+
+The scales are read from specific threads and bytes of the scale register, controlled by
+the `thread_id_a`, `thread_id_b` and `byte_id` selectors of the instruction.
+
+**scale_A** (`thread_id_a = 0`): thread 0 of the group provides the scale for the upper
+row (rows 0..7), thread 1 for the lower (rows 8..15).
+
+**scale_B** (`thread_id_b = 0`): for column c, the scale comes from lane 4c.
+
+**Blocks of k.** For `scale_vec::2X` (MXFP4): 2 blocks of 32, using scale bytes 0 and 1
+(or 2 and 3 for `byte_id = 2`). For `scale_vec::4X` (NVFP4): 4 blocks of 16, split by
+thread pair within the group: threads 0,1 for blocks 0 and 2, threads 2,3 for blocks 1
+and 3. For `scale_vec::1X` (MXF8F6F4): 1 block of 32.
+
+**NaN scales.** A NaN in scale_A makes every result of the row it controls `0x7fffffff`. A
+NaN in scale_B makes every result of its column `0x7fffffff`.
+
+### Selectors implemented and refused
+
+The layer implements `thread_id_a` 0 and 1, `thread_id_b` 0 and 1, `byte_id` 0 and 2
+(the two values the assembler accepts for `scale_vec::2X`). `thread_id_b` 2 and 3, and
+`byte_id` 1 or 3 with a single scale, are lowered but have no reference vectors.
+Selectors the instruction does not have (a byte 4, a pair of threads beyond 3, `byte_id`
+1 with two scales) are refused when the program is read. `kind::mxf4nvf4` with UE8M0
+scales is refused (not verified against the hardware).
+
+### Agreement with the RTX 5090
+
+Measured 2026-11-18 on an RTX 5090 and a V100. The counts are what `tests/gpu/run.sh`
+(`block-scaled`) holds the layer to today:
+
+| Kind | Cases | Total results | Identical | 1-ULP | Beyond 1-ULP | NaN mismatch |
+|---|---|---|---|---|---|---|
+| **NVFP4** (`kind::mxf4nvf4`, 4X) small | 284 | 36,352 | **36,352 (100.0%)** | 0 | 0 | 0 |
+| **NVFP4** (`kind::mxf4nvf4`, 4X) large | 3,179 | 406,912 | **405,861 (99.74%)** | 1,051 (0.26%) | 0 | 0 |
+| **MXFP4** (`kind::mxf4`, 2X) small | 284 | 36,352 | 36,242 (99.70%) | 106 | 4 | 0 |
+| **MXFP4** (`kind::mxf4`, 2X) large | 3,079 | 394,112 | 371,635 (94.30%) | 21,636 (5.49%) | 841 | 0 |
+| **MXF8F6F4** (`kind::mxf8f6f4`, 1X) small | 284 | 36,352 | 24,272 (66.8%) | 8,059 (22.2%) | 4,021 | 0 |
+| **MXF8F6F4** (`kind::mxf8f6f4`, 1X) large | 3,029 | 387,712 | 308,475 (79.6%) | 52,538 (13.6%) | 26,699 | 0 |
+
+The "small" sets are the original 284-case reference vectors; the "large" sets add
+rounding discriminators, random accumulators and one-block tests.
+
+**Where the forms differ and why.**
+
+- **NVFP4 (4X).** The best agreement. Each block has at most 16 E2M1 values: the block
+  sums are small (max 576) and fit exactly in f32. The f64 scale arithmetic adds no
+  rounding. The 1,051 results at 1-ULP on the large set are from the truncation-to-f32
+  boundary: the hardware's wider accumulator (~25 bits) rounds differently from the f64
+  model at the edge.
+- **MXFP4 (2X).** Larger block sums (max 1,152 per block). The same f32 tensor-core sums
+  as NVFP4, but the rounding model (round-to-nearest-even) accounts for 5.5% at 1-ULP.
+  The 841 results beyond 1-ULP on the large set (and 4 on the small set) are from
+  extreme-scale cases (scales near 2^127 and large accumulators).
+- **MXF8F6F4 (1X).** The differences come from the sums of the FP8 product itself (Volta's
+  product adds four terms at a time in f32, the hardware in a wider accumulator: section 2),
+  not from the scale arithmetic. With all scales at 1 (UE8M0 byte 127), the
+  block-scaled form gives identical results to the plain FP8 product (measured on the
+  RTX 5090, 12,800 results).
+
+Extra forms tested against the RTX 5090 (300 cases each): `thread_id_a = 1`,
+`thread_id_b = 1`, `byte_id = 2` with two scales, and E5M2 operands (the `kind::mxf8f6f4`
+form). All consistent with the main forms, no NaN mismatches.
+
+**Test cases.** `tests/gpu/run.sh`: `block-scaled` (10 forms checked, counts as above).
+The reference vectors are in `tests/kernels/blackwell/ref_scaled/`.
+
+## 9. Other instructions
+
+### tanh
+
+`tanh.approx.f32` is expanded to `1 - 2 / (exp(2x) + 1)`, using `ex2.approx` and
+`rcp.approx`, and `x` itself where `|x| < 0.004`. These are instructions every target has.
+
+### Instructions with a plain equivalent
+
+| Instruction | On Volta |
+|---|---|
+| `cp.async.ca.shared.global [dst], [src], size` | A plain load from global memory and a store to shared memory. `cp.async.commit_group` and `cp.async.wait_group` become no-ops (the copies are synchronous). |
+| `ld.global.v8.b32` (256-bit load) | Two `ld.global.v4.b32` (128-bit loads). The second half is loaded first when the base register is a destination of the first half. |
+| `st.global.v4.b64` (256-bit store) | Two `st.global.v2.b64` (128-bit stores). |
+| `cvt.rn.f16x2.f32` (pack two f32 to f16x2) | `cvt.rn.f16.f32` for each, then `mov.b32` to pack. |
+| `cvt.rn.bf16x2.f32` | The same with bf16 (a shift to f32, `cvt.rn.f16.f32` of that, shifts to assemble). |
+| `cvt.rn.tf32.f32` | The 10-bit mantissa (zero the low 13 bits), ties to even: 9 instructions. |
+| `redux.sync.{add,min,max}.{s32,u32}` | A tree of warp shuffles. |
+| `{min,max}.NaN.f32` | The comparison with the standard `min`/`max` does not propagate NaN; this form does. It is a comparison and a `selp`. |
+| `{min,max,add,mul,...}.relu.{s32,f32,...}` | The operation followed by a clamp to zero. |
+| `fma.rn.f32x2`, `add.rn.f32x2`, ... | Arithmetic on pairs of f32, packed in a 64-bit register. Each is two scalar operations. |
+| `ld.global.L2::cache_hint` | The cache hint is dropped; the load is otherwise unchanged. |
+| `griddepcontrol` | Dropped (a Hopper/Blackwell instruction for grid-level dependencies, which Volta's driver does not support). |
+
+### What is refused
+
+An instruction that has no Volta sequence makes its function trap; the kernels that need
+that function are refused when the program asks for them. The refusal names the kernel and
+the reason (on the console and in the error returned to the program, error 218).
+
+**Instructions without a sequence** (from the PTX census of NVIDIA's libraries): clusters
+of blocks (`barrier.cluster`, `mapa`, `getctarank`), barriers in memory (`mbarrier`),
+tensor maps (`tensormap`), multicast memory (`multimem`), and `stmatrix`. All are
+instructions of Hopper (sm_90) or later that have no meaningful equivalent on Volta.
+
+**What the driver's compiler refuses.** The lowering rewrites or traps the instructions it
+knows. The driver may still refuse what remains: a function whose compiler error is
+collected is replaced by a trap, and its kernels are refused at the lookup
+(`crates/vf-ptx/src/refused.rs`). The other kernels of the module work.
+
+**Test cases.** `tests/gpu/run.sh`: `refuse-library`, `refuse-module` (through both driver
+interfaces: a refused kernel is refused at the lookup, the others run; an emulated kernel
+is announced).
+
+## 10. The same emulations in machine code
+
+The machine-code translator (`crates/vf-sass/src/translate/`) rewrites sm_75 cubins to
+sm_70, function by function. The tensor-core instructions it replaces are those of Turing:
+
+| sm_75 instruction | Replaced by | Notes |
+|---|---|---|
+| `LDSM` (ldmatrix), 1/2/4 matrices | Shuffles, loads (same logic as section 3) | 17 instructions for 4 matrices |
+| `LDSM` transposed | Shuffles, 2-byte loads, assembly | 38 instructions for 4 matrices |
+| `HMMA.1688` (mma.m16n8k8), f32 accumulators | Two of Volta's `HMMA.884` (8 steps), B gathered by 5 shuffles | 25 instructions; 14 when B is kept |
+| `HMMA.1688`, f16 accumulators | Same with 4 steps and exchanges | 31 instructions; 20 when B is kept |
+
+Differences from the PTX path:
+- The B operand is **kept** across products that use the same register: a product after one
+  that gathered from the same B, with nothing writing that register in between, skips the
+  gathering (11 instructions fewer). This is what `tests/gpu/run.sh` `kept` and
+  `kept-machine-code` test.
+- Products are done **in pairs on whole rows** where two products read the same A and the two
+  B registers of a pair, with operands that unconditional `LDSM` brought: the two are computed
+  by two of Volta's products on rows loaded directly in Volta's layout, with no gathering at
+  all (`docs/pairs.md`). The `pairs`, `pairs-machine-code`, `groups` and
+  `groups-machine-code` test cases exercise this form.
+- Masks and selections replace predicates (the translator must not use a predicate of the
+  program).
+- The lane is read once at the function's entry.
+
+**What is not in machine code.** Integer products (emulated with `dp4a` in PTX only), FP8
+products, block-scaled products, bf16 and tf32 products, bf16 arithmetic, conversions of
+FP8/E2M1/UE8M0, and all other instructions of section 9: these appear only in PTX and are
+handled by the PTX lowering. The machine-code translator handles what sm_75 machine code
+has: Turing's matrix load and product on halves.
+
+The mechanism of the translator (register allocation, timing rules, what is refused, the
+two implementations) is described in `docs/translator.md`.

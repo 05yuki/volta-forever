@@ -1,0 +1,350 @@
+#!/bin/bash
+# GPU tests of the proxy, on a machine with a V100:
+#   tests/gpu/run.sh [GPU]
+# GPU is the PCI-order index of the GPU to use (default 0). Builds the test programs once into
+# $VF_OUT (default $VF_TEST_ROOT), then runs each case and prints PASS or FAIL; exit status 1
+# on any FAIL. The tree tested is the one this script is in; the build tested is its dist/lib, or
+# the directory $VF_PROXY (a build staged beside the installed one).
+set -uo pipefail
+W=$(cd "$(dirname "$0")/../.." && pwd)
+. "$W/tests/gpu/env.sh"
+G=$W/tests/kernels
+T=$W/toolkits
+out=${VF_OUT:-$VF_TEST_ROOT}
+proxy=${VF_PROXY:-$W/dist/lib}
+export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=${1:-0}
+. "$W/tests/gpu/cache.sh"
+
+mkdir -p "$out/bin" "$out/logs"
+[ -x "$out/bin/drvrun" ] && [ "$out/bin/drvrun" -nt "$G/drvrun.c" ] || gcc -O2 -Wall -o "$out/bin/drvrun" "$G/drvrun.c" -ldl -lm || exit 2
+[ -x "$out/bin/tcrun" ] && [ "$out/bin/tcrun" -nt "$G/tcrun.c" ] || gcc -O2 -Wall -o "$out/bin/tcrun" "$G/tcrun.c" -ldl -lm || exit 2
+[ -x "$out/bin/ptxrun" ] && [ "$out/bin/ptxrun" -nt "$G/ptxrun.c" ] || gcc -O2 -Wall -o "$out/bin/ptxrun" "$G/ptxrun.c" -ldl || exit 2
+[ -x "$out/bin/rt_probe.135.sm75ptx" ] || "$G/build-rt-probe.sh" "$out/bin" >/dev/null || exit 2
+[ -e "$W/dist/forward/libcublas.so.13" ] || { echo "missing: $W/dist/forward (run scripts/build-forwarders.sh)"; exit 2; }
+
+failed=0
+# check NAME EXPECTED-REGEX... : the case's output is in $log; every regex must match a line of it.
+check() {
+    local name=$1 ok=1; shift
+    for want in "$@"; do grep -Eq -- "$want" "$log" || { ok=0; echo "    missing: $want"; }; done
+    if [ $ok = 1 ]; then echo "PASS  $name"; else echo "FAIL  $name (output: $log)"; failed=1; fi
+}
+drv() {  # drv NAME MODULE EXPECTED... : load MODULE through the proxy with the driver-API harness
+    local name=$1 module=$2; shift 2
+    log=$out/logs/$name.log
+    DRVRUN_LIBCUDA=$proxy/libcuda.so.1 VF_LOG_LEVEL=3 "$out/bin/drvrun" "$module" >"$log" 2>&1
+    check "$name" "$@"
+}
+tc() {  # tc NAME MODULE EXPECTED... : run the tensor-core kernels of MODULE through the proxy and check them against the host models
+    local name=$1 module=$2; shift 2
+    log=$out/logs/$name.log
+    # The proxy takes the rows that ldmatrix reads to be at multiples of 16 and does not test them:
+    # the kernels whose rows are deliberately elsewhere would fault, and are left out (-a), except
+    # with VF_ALIGNED_ROWS=0, which makes the proxy test.
+    local only=-a
+    [ "${VF_ALIGNED_ROWS:-1}" = 0 ] && only=
+    DRVRUN_LIBCUDA=$proxy/libcuda.so.1 VF_LOG_LEVEL=2 "$out/bin/tcrun" $only "$module" >"$log" 2>&1
+    check "$name" "$@"
+}
+px() {  # px NAME MODULE WORD... : run the kernel `k` of a PTX module through the proxy; every lane of a warp must store these words
+    local name=$1 module=$2; shift 2
+    log=$out/logs/$name.log
+    DRVRUN_LIBCUDA=$proxy/libcuda.so.1 VF_LOG_LEVEL=2 "$out/bin/ptxrun" "$module" k "$@" >"$log" 2>&1
+    check "$name" "^PASS k of"
+}
+rt() {  # rt NAME PROGRAM LIBRARY-PATH EXPECTED... : run a CUDA-runtime program with the proxy first in the path
+    local name=$1 program=$2 libs=$3; shift 3
+    log=$out/logs/$name.log
+    LD_LIBRARY_PATH=$proxy:$libs VF_LOG_LEVEL=2 "$out/bin/$program" >"$log" 2>&1
+    check "$name" "$@"
+}
+all7=("saxpy +ok" "mathk +ok" "block_sum +ok" "warp_sum +ok" "histo +ok" "half_dot +ok" "dbl +ok")
+
+drv native-cubin "$G/k_basic.128.sm70.cubin" "${all7[@]}"
+drv ptx-13.5-text "$G/k_basic.135.sm75.ptx" "PTX text without sm_70 code: PTX for sm_75 retargeted" "${all7[@]}"
+drv fatbin-elf75-ptx75 "$W/crates/vf-fatbin/tests/data/elf75-ptx75-zstd.fatbin" "fat binary without sm_70 code: PTX for sm_75 retargeted \(1 module\)" "${all7[@]}"
+drv fatbin-with-sm70 "$W/crates/vf-fatbin/tests/data/elf70-elf75-ptx70-lz4.fatbin" "fat binary with code for this GPU" "${all7[@]}"
+drv ptx-tanh "$G/k_tanh.135.sm75.fast.ptx" "PTX for sm_75 retargeted \(1 module, 1 tanh expanded\)" "tanhk +ok"
+tc tensor-core "$G/k_tensor.135.sm75.ptx" "PTX for sm_75 retargeted \(1 module, 106 tensor-core instructions rewritten\)" "37 kernels, 0 wrong"
+tc chains "$G/k_chains.135.sm75.ptx" "PTX for sm_75 retargeted \(1 module, 77 tensor-core instructions rewritten\)" "7 kernels, 0 wrong"
+# Kernels that exist as PTX text only (tests/kernels/ptx-cases): four products
+# on accumulators that hold 1.0, after a scope that declares their family again and sets its own
+# registers to zero (33 in every register: 32 until 2026-11-19, the 1.0 was lost), the same with
+# another name in the scope, and a product that takes a register of its own accumulator as its A
+# operand, on f32 accumulators (34 in the upper rows, 32 below: 24 until then) and on f16 ones
+# (72 and 16: 8 until then).
+px ptx-family-declared-again "$G/ptx-cases/zeros-shadow.ptx" 42040000 42040000 42040000 42040000
+px ptx-family-of-another-name "$G/ptx-cases/zeros-renamed.ptx" 42040000 42040000 42040000 42040000
+px ptx-accumulator-as-operand "$G/ptx-cases/alias-a.ptx" 42080000 42080000 42000000 42000000
+px ptx-accumulator-as-operand-f16 "$G/ptx-cases/alias-a-f16.ptx" 54805480 4c004c00
+# A member of a family of registers written with zeros before its number (%d00 for %d0 of
+# %d<4>: the same register to the assembler) reads the accumulator in the middle of a chain of
+# products: 32.0 after four of the eight, and 64.0 in the others at the end.
+px ptx-padded-chain-read "$G/ptx-cases/padded-chain-read.ptx" 42000000 42800000 42800000 42800000
+# The same with comments inside the declaration of the family and between the operands of the
+# statement that reads: a comment is not code (read with its comment, the declaration was not
+# taken for a family until 2026-11-21, and what was read was 0).
+px ptx-padded-chain-read-commented "$G/ptx-cases/padded-chain-read-commented.ptx" 42000000 42800000 42800000 42800000
+tc ampere "$G/k_ampere.135.sm80.ptx" "PTX for sm_80 retargeted \(1 module, 25 tensor-core instructions rewritten\)" "31 kernels, 0 wrong"
+# FP8: the conversions both ways, and the products, which run on the tensor cores as products of halves.
+tc fp8 "$G/k_fp8.135.sm89.ptx" "PTX for sm_89 retargeted \(1 module, 8 tensor-core instructions rewritten\)" "19 kernels, 0 wrong"
+# The conversions of the 4-bit floats (E2M1) and of the exponents alone (UE8M0), against host models.
+tc fp4 "$G/k_fp4.135.sm120a.ptx" "PTX for sm_120 retargeted \(1 module\)" "10 kernels, 0 wrong"
+# The same conversions against what an RTX 5090 computed: on the inputs of the
+# reference files (every value of the small formats; for floats every midpoint with a float on each
+# side), the layer's results must be those files, byte for byte.
+B=$G/blackwell
+[ -x "$out/bin/fp4_vectors" ] && [ "$out/bin/fp4_vectors" -nt "$B/fp4_vectors.c" ] || gcc -O2 -o "$out/bin/fp4_vectors" "$B/fp4_vectors.c" -ldl -lm || exit 2
+log=$out/logs/fp4-hardware.log
+mkdir -p "$out/logs/fp4-hardware"
+DRVRUN_LIBCUDA=$proxy/libcuda.so.1 VF_LOG_LEVEL=1 "$out/bin/fp4_vectors" "$B/k_fp4_vectors.135.sm120a.ptx" "$out/logs/fp4-hardware" >"$log" 2>&1
+for f in "$B"/ref/*.bin; do
+    cmp -s "$f" "$out/logs/fp4-hardware/$(basename "$f")" && echo "the same: $(basename "$f")" || echo "NOT THE SAME: $(basename "$f")"
+done >>"$log"
+check fp4-hardware "^the same: decode_e2m1.bin" "^the same: decode_e2m1_relu.bin" "^the same: decode_ue8m0.bin" "^the same: encode_e2m1.bin" \
+    "^the same: encode_e2m1_relu.bin" "^the same: encode_ue8m0_rp.bin" "^the same: encode_ue8m0_rz.bin" \
+    "^the same: encode_ue8m0_bf16_rp.bin" "^the same: encode_ue8m0_bf16_rz.bin"
+# Block-scaled MMA (NVFP4, MXFP4, MXF8F6F4): against reference vectors that an RTX 5090 computed
+# (`docs/emulations.md`, "Block-scaled products"), form by form. The results are compared with the hardware's, one by one: identical,
+# one unit of the last place away, further away, a NaN against a number. The layer does not give the
+# hardware's results for every form (its sums are cut or rounded to f32 where the hardware's wider
+# accumulator does otherwise), so each form is held to what it gives today: no fewer identical
+# results, no more further away, no NaN mismatch. NVFP4 (kind::mxf4nvf4, 4X, UE4M3) is held to
+# more: nothing further than one unit, on every vector set. A form that gets worse fails.
+[ -x "$out/bin/mma_scaled_check" ] && [ "$out/bin/mma_scaled_check" -nt "$B/mma_scaled_check.c" ] || gcc -O2 -o "$out/bin/mma_scaled_check" "$B/mma_scaled_check.c" -ldl -lm || exit 2
+log=$out/logs/block-scaled.log
+: >"$log"
+scaled_run() {  # scaled_run MODULE SUFFIX [KERNEL...]
+    local module=$1 suffix=$2; shift 2
+    DRVRUN_LIBCUDA=$proxy/libcuda.so.1 VF_LOG_LEVEL=2 "$out/bin/mma_scaled_check" "$B/$module" "$B/ref_scaled" "$suffix" "$@" >>"$log" 2>&1 || true
+}
+scaled_run k_mma_scaled_forms.135.sm120a.ptx ""
+scaled_run k_mma_scaled_forms.135.sm120a.ptx _large
+scaled_run k_mma_scaled_extra.135.sm120a.ptx "" s_mxf4_tid_a1 s_mxf4_tid_b1 s_mxf4_bid_a2 s_mxf8_e5m2_1x
+scaled_form() {  # scaled_form NAME TOTAL MIN-IDENTICAL MAX-FURTHER MAX-ONE-UNIT (counts measured 2026-11-18)
+    local name=$1 total=$2 min_identical=$3 max_further=$4 max_one=$5 line identical one further nanmm launch tot
+    line=$(grep -E "^RESULT $name " "$log") || { echo "    missing: RESULT $name"; return 1; }
+    identical=$(sed -E 's/.* identical=([0-9]+).*/\1/' <<<"$line"); one=$(sed -E 's/.* one_unit=([0-9]+).*/\1/' <<<"$line")
+    further=$(sed -E 's/.* further=([0-9]+).*/\1/' <<<"$line"); nanmm=$(sed -E 's/.* nan_mismatch=([0-9]+).*/\1/' <<<"$line")
+    launch=$(sed -E 's/.* launch_fail=([0-9]+).*/\1/' <<<"$line"); tot=$(sed -E 's/.* total=([0-9]+).*/\1/' <<<"$line")
+    local ok=0
+    [ "$tot" = "$total" ] && [ "$launch" = 0 ] && [ "$nanmm" = 0 ] && [ "$identical" -ge "$min_identical" ] &&
+        [ "$further" -le "$max_further" ] && [ "$one" -le "$max_one" ] && ok=1
+    echo "    $name: identical $identical (>= $min_identical), one unit $one (<= $max_one), further $further (<= $max_further), NaN mismatches $nanmm (0), of $tot"
+    [ $ok = 1 ]
+}
+scaled_forms() {
+    local bad=0
+    # NVFP4: nothing further than one unit.
+    scaled_form s_nvf4_4x 36352 36352 0 0 || bad=1
+    scaled_form s_nvf4_4x_large 406912 405861 0 1051 || bad=1
+    # The other forms: no worse than today.
+    scaled_form s_mxf4_2x 36352 36242 4 106 || bad=1
+    scaled_form s_mxf4_2x_large 394112 371635 841 21636 || bad=1
+    scaled_form s_mxf8_e4m3_1x 36352 24272 4021 8059 || bad=1
+    scaled_form s_mxf8_e4m3_1x_large 387712 308475 26699 52538 || bad=1
+    # Other thread_id and byte_id values, E5M2 operands.
+    scaled_form s_mxf4_tid_a1 38400 36488 143 1769 || bad=1
+    scaled_form s_mxf4_tid_b1 38400 36365 186 1849 || bad=1
+    scaled_form s_mxf4_bid_a2 38400 36429 164 1807 || bad=1
+    scaled_form s_mxf8_e5m2_1x 38400 36359 578 1463 || bad=1
+    return $bad
+}
+if scaled_forms >"$log.forms"; then ok=PASS; else ok=FAIL; failed=1; fi
+cat "$log.forms"
+echo "$ok  block-scaled (output: $log)"
+check block-scaled-loaded "PTX for sm_120 retargeted \(1 module, 3 tensor-core instructions rewritten\)" \
+    "PTX for sm_120 retargeted \(1 module, 4 tensor-core instructions rewritten\)"
+# Instructions of the GPUs after Ampere with a plain equivalent: arithmetic on pairs of floats, cache policies.
+tc later "$G/k_later.135.sm100.ptx" "PTX for sm_100 retargeted \(1 module\)" "3 kernels, 0 wrong"
+# bf16 outside the products: arithmetic, comparisons, the conversion from f64, atomic additions.
+tc bf16 "$G/k_bf16.135.sm90.ptx" "PTX for sm_90 retargeted \(1 module\)" "15 kernels, 0 wrong"
+# The same with the addresses of the rows tested when the code runs, for programs that do not keep
+# them at multiples of 16: the kernels with such rows are run too.
+VF_ALIGNED_ROWS=0 tc tensor-core-tested "$G/k_tensor.135.sm75.ptx" "PTX for sm_75 retargeted \(1 module, 106 tensor-core instructions rewritten\)" "42 kernels, 0 wrong"
+VF_ALIGNED_ROWS=0 tc ampere-tested "$G/k_ampere.135.sm80.ptx" "PTX for sm_80 retargeted \(1 module, 25 tensor-core instructions rewritten\)" "35 kernels, 0 wrong"
+# The tensor-core kernels as machine code for sm_75, without program text: Turing's matrix load
+# and product on halves are replaced in the machine code (`docs/translator.md`, "Tensor-core products in machine code"). 28 of the 37 functions
+# are translated (integer products and MOVM are not, and are refused at the lookup); the rows of
+# a matrix may be at any address, so the kernels with rows elsewhere than at multiples of 16 run too.
+VF_ALIGNED_ROWS=0 tc tensor-core-machine-code "$G/k_tensor.135.sm75.cubin" "machine code for sm_75 translated \(37 functions\)" "9 of these functions are not translated" \
+    "emulated in t_mma_f32: 33 instructions added in translated machine code" "emulated in t_mma_f16: 39 instructions added in translated machine code" "32 kernels, 0 wrong"
+# Products that follow each other on one register of B: in machine code the elements of B are
+# gathered for the first and kept for the next ones, until something writes the register
+# (the same section). The same kernels as program text, where each product is rewritten by itself.
+tc kept-machine-code "$G/k_kept.135.sm75.cubin" "machine code for sm_75 translated \(5 functions\)" "5 kernels, 0 wrong"
+tc kept "$G/k_kept.135.sm75.ptx" "PTX for sm_75 retargeted \(1 module, 12 tensor-core instructions rewritten\)" "5 kernels, 0 wrong"
+# GROUP patterns: two A x four B = eight products per group, the accumulators chained along loops.
+# Each kernel exercises a different way of entering, leaving or interrupting such a chain.
+# Machine code: the translator takes 9 of the 11 functions; it refuses the one whose products are
+# predicated and the one whose accumulators are f16. (Until 2026-11-20 it refused three more,
+# g_once, g_partial and g_shared: a product of theirs writes its results over the register of its
+# B, which is no harm: `matrix_product`. FlashInfer's attention kernels have such products.)
+tc groups-machine-code "$G/k_groups.135.sm75.cubin" "machine code for sm_75 translated \(11 functions\)" "2 of these functions are not translated" "22 kernels, 0 wrong"
+tc groups "$G/k_groups.135.sm75.ptx" "PTX for sm_75 retargeted" "26 kernels, 0 wrong"
+# PAIRS patterns: unconditional loads in loops, testing the pairs-of-products-on-whole-rows arrangement.
+# Machine code: the translator takes 11 of 12 functions (p_uniform is refused: predicated HMMA).
+# (p_basic's count says the pairs were made: 234 instructions are added when each product is translated by itself.)
+tc pairs-machine-code "$G/k_pairs.135.sm75.cubin" "machine code for sm_75 translated \(12 functions\)" "1 of these functions is not translated" \
+    "emulated in p_basic: 91 instructions added in translated machine code" "34 kernels, 0 wrong"
+tc pairs "$G/k_pairs.135.sm75.ptx" "PTX for sm_75 retargeted" "37 kernels, 0 wrong"
+# The same machine code with each product translated by itself (VF_PAIRS=0), as it was before
+# pairs were the default: that path stays in use where a function has no register left for pairs.
+VF_PAIRS=0 tc pairs-machine-code-unpaired "$G/k_pairs.135.sm75.cubin" "machine code for sm_75 translated \(12 functions\)" "1 of these functions is not translated" \
+    "emulated in p_basic: 234 instructions added in translated machine code" "34 kernels, 0 wrong"
+VF_PAIRS=0 tc groups-machine-code-unpaired "$G/k_groups.135.sm75.cubin" "machine code for sm_75 translated \(11 functions\)" "2 of these functions are not translated" "22 kernels, 0 wrong"
+# Machine code alone: translated when it is loaded. Its seven kernels run; two have instructions added.
+translated=("machine code for sm_75 translated \(7 functions\)" "${all7[@]}"
+    "emulated in warp_sum: 1 instructions added in translated machine code"
+    "emulated in block_sum: 3 instructions added in translated machine code")
+drv cubin-sm75 "$G/k_basic.135.sm75.cubin" "cubin without sm_70 code: machine code" "${translated[@]}" "machine code of saxpy: for 7.0"
+# A program that is told a capability and asks which architecture the machine code of its kernel
+# is for is answered that capability, not the 7.0 of the translation (PyTorch's backward attention
+# asks, and stops when the answer is below the variant it chose).
+VF_CAPABILITY=7.5 drv cubin-sm75-told-7.5 "$G/k_basic.135.sm75.cubin" "machine code of saxpy: for 7.5" "saxpy +ok"
+# The same cubin with the first instruction of one kernel overwritten by a word that is no
+# instruction (16 bytes of 0xff at 0x2980): that kernel is in a function the translator refuses,
+# and is refused at the lookup, with the reason; the six others run.
+drv cubin-sm75-damaged "$G/k_basic.135.sm75.damaged.cubin" "machine code for sm_75 translated \(7 functions\)" "saxpy +ok" "mathk +ok" "block_sum +ok" "histo +ok" "half_dot +ok" "dbl +ok" \
+    "kernel warp_sum cannot run on this GPU and is not given to the program: its machine code for sm_75 is not translated \(the instruction ffffffffffffffffffffffffffffffff at 0x0 is not one of the sm_75 description\)"
+# The same code in a fat binary that also has PTX, which is what is taken unless told otherwise.
+VF_TRANSLATE=first drv fatbin-elf75-first "$W/crates/vf-fatbin/tests/data/elf75-ptx75-zstd.fatbin" "fat binary without sm_70 code: machine code" "${translated[@]}"
+VF_TRANSLATE=0 drv cubin-sm75-as-is "$G/k_basic.135.sm75.cubin" "cubin with machine code for sm_75 and later only" "-> 209 CUDA_ERROR_NO_BINARY_FOR_GPU"
+# The translator's own test kernels (tests/kernels/translate), one kind of rewriting each: every
+# source compiled for sm_70 by CUDA 12.9.2 and for sm_75 by CUDA 13.5; the sm_75 cubin goes through
+# the proxy, and each kernel must give what the sm_70 build gives on the same inputs.
+mkdir -p "$out/translate"
+[ -x "$out/bin/diffrun" ] && [ "$out/bin/diffrun" -nt "$G/translate/diffrun.c" ] || gcc -O2 -Wall -o "$out/bin/diffrun" "$G/translate/diffrun.c" -ldl -lm || exit 2
+mc() {  # mc FILE KERNELS : FILE.cu has KERNELS kernels that the translator takes
+    local built=$out/translate/$1
+    if ! [ "$built.sm75.cubin" -nt "$G/translate/$1.cu" ]; then
+        "$T/cuda-12.9.2/bin/nvcc" -arch=sm_70 -O3 -cubin -o "$built.sm70.cubin" "$G/translate/$1.cu" 2>/dev/null || exit 2
+        "$T/cuda-13.5.0/bin/nvcc" -arch=sm_75 -O3 -cubin -o "$built.sm75.cubin" "$G/translate/$1.cu" 2>/dev/null || exit 2
+    fi
+    log=$out/logs/translated-$1.log
+    # The native build against itself first: a kernel whose result depends on the order of its
+    # threads would fail here, and proves nothing below.
+    if ! "$out/bin/diffrun" "$built.sm70.cubin" "$built.sm70.cubin" 2>&1 | grep -Eq "SUMMARY: $2 PASS, 0 FAIL"; then
+        echo "FAIL  translated-$1 (its native build does not give the same result twice)"; failed=1; return
+    fi
+    LD_LIBRARY_PATH=$proxy VF_LOG_LEVEL=1 "$out/bin/diffrun" "$built.sm70.cubin" "$built.sm75.cubin" >"$log" 2>&1
+    check "translated-$1" "SUMMARY: $2 PASS, 0 FAIL"
+}
+mc k_translate 20
+mc k_calls 4
+mc k_loop_only 2
+mc k_simple_minmax 1
+mc k_uniform 4
+mc k_params 3
+mc k_uniform_math 2
+mc k_switch 12
+mc k_memory 7
+mc k_convert 2
+mc k_guards 3
+# The memory kernels again with another, equivalent schedule (waits_moved.py: where a load is
+# followed by a ULDC and then by its first reader, the wait is on the ULDC instead of the reader;
+# 6 waits of k_memory.sm75.cubin as CUDA 13.5 compiled it). Whatever an instruction becomes, its
+# wait must be kept: until 2026-11-17 the ULDC lost it and the two atomic kernels gave wrong sums
+# here.
+log=$out/logs/translated-waits-moved.log
+LD_LIBRARY_PATH=$proxy VF_LOG_LEVEL=1 "$out/bin/diffrun" "$G/translate/k_memory.sm70.cubin" "$G/translate/k_memory.waits-moved.sm75.cubin" >"$log" 2>&1
+check translated-waits-moved "SUMMARY: 7 PASS, 0 FAIL"
+# The guarded kernels with every uniform register kept in the thread's local memory (VF_BORROW=8:
+# what a kernel with no register to spare gets, here for all three), and with their guarded sums
+# and logical operations giving a predicate into the one that guards them (guard_written.py: 28
+# instructions of k_guards.sm75.cubin as CUDA 13.5 compiled it; the program computes the same).
+# What a translation adds after an instruction must not go by the guard of that instruction: until
+# 2026-11-20 the store of the uniform register did, and k_guarded_count and k_guarded_state gave
+# wrong results here.
+log=$out/logs/translated-guard-written.log
+VF_BORROW=8 LD_LIBRARY_PATH=$proxy VF_LOG_LEVEL=1 "$out/bin/diffrun" "$G/translate/k_guards.sm70.cubin" "$G/translate/k_guards.guard-written.sm75.cubin" >"$log" 2>&1
+check translated-guard-written "SUMMARY: 3 PASS, 0 FAIL" "3 kernels with emulated instructions were given to the program"
+
+rt runtime-12.9 rt_probe.129.sm70 "$T/cuda-12.9.2/lib" "own kernel: 0/65536 wrong" "sgemm check: 0 wrong" "half gemm check: 0 wrong"
+rt runtime-13.5-ptx rt_probe.135.sm75ptx "$T/cuda-13.5.0/lib" "runtime 13050, driver API 13000" "rt_probe.135.sm75ptx is told compute capability 7.5: its code starts there" "device 0: .*sm_75" "PTX for sm_75 retargeted" "own kernel: 0/65536 wrong" "machine code for sm_75 translated" "kernel volta_sgemm_.* is not given to the program: its machine code for sm_75 is not translated" "cublasCreate -> 0 " "cublasSgemm -> 13 "
+rt runtime-13.5-cublas-forwarded rt_probe.135.sm75ptx "$W/dist/forward:$T/cuda-12.9.2/lib" "device 0: .*sm_75" "own kernel: 0/65536 wrong" "libcublas.so.12[0-9.]* is told the real compute capability" "cuBLAS version 120902" "sgemm check: 0 wrong" "half gemm check: 0 wrong"
+VF_CAPABILITY=7.0 rt capability-forced rt_probe.135.sm75ptx "$T/cuda-13.5.0/lib" "is told compute capability 7.0, as VF_CAPABILITY asks" "device 0: .*sm_70" "own kernel: 0/65536 wrong" "cublasCreate -> 8 "
+VF_STATS=1 rt stats rt_probe.129.sm70 "$T/cuda-12.9.2/lib" "half gemm check: 0 wrong" "calls: .*cuLaunchKernel=[0-9]+"
+VF_ADAPT=0 rt adapt-off rt_probe.135.sm75ptx "$T/cuda-13.5.0/lib" "cudaGetLastError\(\) +-> 209"
+VF_LAZY=0 rt lazy-off rt_probe.135.sm75ptx "$T/cuda-13.5.0/lib" "own kernel: 0/65536 wrong" "lazy off,"
+
+# Kernels that cannot run on the GPU are refused when the program asks for them and the others of
+# their module work, through both interfaces; a kernel with emulated instructions is announced. At
+# the default log level: this is what the user sees.
+[ -x "$out/bin/test_refuse" ] && [ "$out/bin/test_refuse" -nt "$G/test_refuse.c" ] || gcc -O2 -Wall -o "$out/bin/test_refuse" "$G/test_refuse.c" -ldl -lm || exit 2
+refuse() {  # refuse NAME INTERFACE EXPECTED...
+    local name=$1 interface=$2; shift 2
+    log=$out/logs/$name.log
+    DRVRUN_LIBCUDA=$proxy/libcuda.so.1 "$out/bin/test_refuse" "$interface" >"$log" 2>&1
+    check "$name" "$@"
+}
+told=("ALL CHECKS PASSED"
+    "kernel refused_by_compiler cannot run on this GPU and is not given to the program: .*Unknown symbol '%never_declared'"
+    "kernel refused_by_layer cannot run on this GPU and is not given to the program: barrier.cluster.arrive: no Volta sequence"
+    "kernel caller_of_bad cannot run on this GPU .*Unknown symbol '%never_declared' \(in bad_helper, which it calls\)"
+    "warning: this GPU lacks instructions that kernels of the program were compiled with"
+    "emulated in soft: 1 tanh"
+    "1 kernel with emulated instructions was given to the program: 1 tanh")
+refuse refuse-library library "${told[@]}"
+refuse refuse-module module "${told[@]}"
+VF_LAZY=0 refuse refuse-library-lazy-off library "${told[@]}"
+
+# A kernel whose usual translation takes more registers than a block of 1,024 threads can have is
+# launched from a second translation that keeps to the kernel's own count (`docs/architecture.md`, "Launch"): taken
+# from a module and from a library, with an attribute that the program set on its kernel, in a
+# second context, after an unload; and never a kernel that reads data of its module. The
+# control: with the mechanism off the same blocks are refused.
+[ -x "$out/bin/fitrun" ] && [ "$out/bin/fitrun" -nt "$G/fitrun.c" ] || gcc -O2 -Wall -o "$out/bin/fitrun" "$G/fitrun.c" -ldl -lm || exit 2
+fit() {  # fit NAME OPTIONS EXPECTED...
+    local name=$1 options=$2; shift 2
+    log=$out/logs/$name.log
+    DRVRUN_LIBCUDA=$proxy/libcuda.so.1 VF_LOG_LEVEL=2 "$out/bin/fitrun" $options "$G/k_fit_test.135.sm75.cubin" >"$log" 2>&1
+    check "$name" "$@"
+}
+fit second-translation "" "37 checks, 0 wrong" \
+    "fit: k_fit_regs: blocks of 1024 threads take more registers than there are with the usual translation" \
+    "fit: k_fit_reads_global is not launched from a second translation: it can reach data of its module"
+VF_FIT=0 fit second-translation-off -x "37 checks, 0 wrong"
+
+# Proxy cache: a second run with a warm cache must skip adaptation and analysis and give the same
+# results, including the same refused kernels and the same emulation warnings.
+# In a local directory, whose files belong to whoever runs: the proxy refuses a cache that does not.
+cache_dir=/tmp/vf-cache-test-$$
+rm -rf "$cache_dir"
+cache_case() {  # cache_case RUN-NAME EXPECTED...
+    local name=$1; shift
+    log=$out/logs/$name.log
+    VF_PROXY_CACHE=$cache_dir DRVRUN_LIBCUDA=$proxy/libcuda.so.1 VF_LOG_LEVEL=2 VF_TIMING=1 \
+        "$out/bin/test_refuse" library >"$log" 2>&1
+    check "$name" "$@"
+}
+cache_case cache-cold "${told[@]}" "timing: cuLibraryLoadData: adapt"
+cache_case cache-warm "${told[@]}" "timing: cuLibraryLoadData: cache hit"
+# The warm run must NOT have adapted: "adapt" must not appear in its timing lines.
+if grep -q "timing: cuLibraryLoadData: adapt" "$out/logs/cache-warm.log"; then
+    echo "FAIL  cache-warm: adapted despite a cache hit ($out/logs/cache-warm.log)"; failed=1
+else
+    echo "PASS  cache-no-adapt: warm run did not adapt"
+fi
+# The translation of machine code is kept too: a second run takes it from the cache and gives the
+# same kernels, the refused one included, with the same messages.
+tcache() {  # tcache RUN-NAME EXPECTED...
+    local name=$1; shift
+    log=$out/logs/$name.log
+    VF_PROXY_CACHE=$cache_dir DRVRUN_LIBCUDA=$proxy/libcuda.so.1 VF_LOG_LEVEL=3 VF_TIMING=1 \
+        "$out/bin/drvrun" "$G/k_basic.135.sm75.damaged.cubin" >"$log" 2>&1
+    check "$name" "$@"
+}
+kept=("machine code for sm_75 translated \(7 functions\)" "saxpy +ok" "mathk +ok" "block_sum +ok" "histo +ok" "half_dot +ok" "dbl +ok"
+    "kernel warp_sum cannot run on this GPU and is not given to the program: its machine code for sm_75 is not translated \(the instruction"
+    "emulated in block_sum: 3 instructions added in translated machine code")
+tcache translation-cold "${kept[@]}" "timing: .*: machine code translated in"
+tcache translation-warm "${kept[@]}" "timing: .*: translation from the cache"
+if grep -q "machine code translated in" "$out/logs/translation-warm.log"; then
+    echo "FAIL  translation-warm: translated despite the cache ($out/logs/translation-warm.log)"; failed=1
+else
+    echo "PASS  translation-kept: warm run did not translate"
+fi
+rm -rf "$cache_dir"
+
+exit $failed

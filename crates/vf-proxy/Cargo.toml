@@ -1,0 +1,18 @@
+[package]
+name = "vf-proxy"
+description = "libcuda.so.1 for Volta GPUs: forwards to NVIDIA's driver library and adapts the code programs load"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "cuda"
+crate-type = ["cdylib"]
+
+[dependencies]
+vf-fatbin.workspace = true
+vf-ptx.workspace = true
+vf-adapt.workspace = true
+libc.workspace = true
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }

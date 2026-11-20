@@ -1,0 +1,43 @@
+.version 8.8
+.target sm_75
+.address_size 64
+// Four products that accumulate in %d0..%d3, a statement that reads %d00, four more products.
+// To the assembler %d00 is %d0 of the family %d<4>: the statement reads the accumulator as the
+// first four products left it, and the rewriting, which keeps the accumulator of a chain of
+// products in registers of its own, must have given it back to the program's by then (followed
+// as another name, %d00 read the zero that %d0 held before the chain).
+// Every f16 input is 1.0 (0x3c003c00) and the accumulators start at zero; each product adds 8
+// to every element. Stored: what was read (32.0, 0x42000000), then %d1..%d3 after the eight
+// products (64.0, 0x42800000).
+.visible .entry k(.param .u64 output) {
+.reg .u64 %out, %offset;
+.reg .b32 %d<4>, %a<2>, %b<4>, %observed, %lane;
+ld.param.u64 %out, [output];
+mov.u32 %lane, %laneid;
+mul.wide.u32 %offset, %lane, 16;
+add.u64 %out, %out, %offset;
+mov.b32 %a0, 0x3c003c00;
+mov.b32 %a1, 0x3c003c00;
+mov.b32 %b0, 0x3c003c00;
+mov.b32 %b1, 0x3c003c00;
+mov.b32 %b2, 0x3c003c00;
+mov.b32 %b3, 0x3c003c00;
+mov.b32 %d0, 0;
+mov.b32 %d1, 0;
+mov.b32 %d2, 0;
+mov.b32 %d3, 0;
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a1}, {%b0}, {%d0,%d1,%d2,%d3};
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a1}, {%b1}, {%d0,%d1,%d2,%d3};
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a1}, {%b2}, {%d0,%d1,%d2,%d3};
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a1}, {%b3}, {%d0,%d1,%d2,%d3};
+mov.b32 %observed, %d00;
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a1}, {%b0}, {%d0,%d1,%d2,%d3};
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a1}, {%b1}, {%d0,%d1,%d2,%d3};
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a1}, {%b2}, {%d0,%d1,%d2,%d3};
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a1}, {%b3}, {%d0,%d1,%d2,%d3};
+st.global.u32 [%out], %observed;
+st.global.u32 [%out+4], %d1;
+st.global.u32 [%out+8], %d2;
+st.global.u32 [%out+12], %d3;
+ret;
+}

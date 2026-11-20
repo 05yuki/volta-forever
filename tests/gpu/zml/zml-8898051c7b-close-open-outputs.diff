@@ -1,0 +1,18 @@
+--- a/zml/Compiler.zig
++++ b/zml/Compiler.zig
+@@ -671,7 +671,14 @@
+         fn cb(ctx: *@This(), tensor: *const Tensor) !void {
+             // Outputs with no declared sharding default to replication. Constrain the
+             // returned value so the partitioner produces a replicated output buffer.
+-            const output = if (tensor.shape()._sharding.mesh != null or tensor.shape().isFullyReplicated()) tensor.* else tensor.replicate();
++            var output = if (tensor.shape()._sharding.mesh != null or tensor.shape().isFullyReplicated()) tensor.* else tensor.replicate();
++            if (output.shape()._sharding.mesh) |out_mesh| if (output.shape().containsPartitionSpec(.open)) {
++                var partitioning = output.shape()._sharding.partition;
++                for (0..output.rank()) |ax| {
++                    if (partitioning.get(ax) == .open) partitioning = partitioning.set(ax, .replicated);
++                }
++                output = output.withPartitioning(out_mesh, partitioning);
++            };
+             const og_shape = output.shape();
+             if (og_shape.containsPartitionSpec(.open)) {
+                 log.err("Executable output {d} has open sharding: {f}. Specify a logical mesh axis or .replicated for every dimension.", .{ ctx.infos.len, og_shape });

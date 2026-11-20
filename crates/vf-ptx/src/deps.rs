@@ -1,0 +1,1862 @@
+//! Dependency analysis for PTX modules: which symbols each function references, and extraction of
+//! sub-modules containing a single entry function with its transitive dependencies.
+//!
+//! A PTX module has:
+//! - Module-level directives: `.version`, `.target`, `.address_size`
+//! - Module-level declarations and definitions: `.global`, `.const`, `.shared`, `.extern`, etc.
+//! - Function declarations (`.func ... ;`) and definitions (`.func ... { ... }`, `.entry ... { ... }`)
+//!
+//! A sub-module for one entry function contains the module header, the entry function, every device
+//! function it calls transitively, every global/const/shared symbol any of them references, and the
+//! declarations of every function they call that is not defined in this module.
+//!
+//! Splitting is unsafe when two entry functions in the same module write to the same module-level
+//! variable (the value written by one kernel would not be seen by the other if they are in separate
+//! driver modules). The analysis is conservative: if it cannot determine that splitting is safe, the
+//! module is loaded whole.
+
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+
+use crate::scan;
+
+fn is_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'.' | b'@')
+}
+
+/// A module-level variable declaration or definition.
+#[derive(Debug, Clone)]
+struct VarDecl {
+    /// Byte range in the module text (the complete declaration, including the trailing newline).
+    range: Range<usize>,
+    /// The identifier name.
+    name: String,
+    /// Whether this variable has `.visible` linkage. Recorded during parsing; checked by tests
+    /// that validate the parser's handling of linkage prefixes.
+    #[allow(dead_code)]
+    visible: bool,
+    /// Whether this is a `.global` or `.const` variable (persists across launches). `.shared` is
+    /// per-block per-launch and does not cause coherence issues when split.
+    persistent: bool,
+}
+
+/// A module-level function declaration (no body).
+#[derive(Debug, Clone)]
+struct FuncDecl {
+    range: Range<usize>,
+    name: String,
+}
+
+/// An entry-point or device-function definition.
+#[derive(Debug, Clone)]
+struct FuncDef {
+    /// Range of the entire definition (from the keyword to the closing `}`).
+    range: Range<usize>,
+    /// The function name.
+    name: String,
+    /// Range of the body (between the braces, inclusive).
+    body: Range<usize>,
+    /// Is this an `.entry` (kernel)?
+    #[allow(dead_code)]
+    is_entry: bool,
+}
+
+/// The dependency structure of a PTX module.
+#[derive(Debug)]
+pub struct ModuleInfo {
+    /// The full PTX text.
+    text: Vec<u8>,
+    /// Byte range of the module header (`.version`, `.target`, `.address_size`, leading comments).
+    header: Range<usize>,
+    /// `.file` directives at module level (kept in every sub-module for debug info).
+    file_directives: Vec<Range<usize>>,
+    /// Module-level variable declarations.
+    variables: Vec<VarDecl>,
+    /// Module-level function declarations (extern or forward, no body).
+    func_decls: Vec<FuncDecl>,
+    /// Function definitions (entries and device functions).
+    func_defs: Vec<FuncDef>,
+    /// Entry function names, in order.
+    pub entries: Vec<String>,
+    /// For each function (by name), the set of functions it references (calls, address-taken, etc.).
+    func_refs: HashMap<String, HashSet<String>>,
+    /// For each function, the set of module-level variable names it references.
+    var_refs: HashMap<String, HashSet<String>>,
+    /// Module-level variable names that are written (stored to) by at least one function.
+    written_vars: HashSet<String>,
+    /// Variables whose address escapes through another variable's initializer. Treated as written
+    /// for the split rule: the address could be loaded by any kernel and stored through.
+    escaped_vars: HashSet<String>,
+    /// Persistent variables that any function loads data from (the variable's name or a register
+    /// tainted by it appears in the address operand of a load instruction).
+    loaded_vars: HashSet<String>,
+    /// Names of persistent (.global, .const) variables.
+    persistent_names: HashSet<String>,
+    /// True when the module contains text at module level that the parser does not recognise.
+    pub has_unrecognised_items: bool,
+}
+
+/// Whether a module can be split into per-kernel sub-modules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Splittable {
+    /// Safe to split.
+    Yes,
+    /// Not safe to split, with the reason.
+    No { reason: String },
+}
+
+// ---------------------------------------------------------------------------
+// Body analysis
+// ---------------------------------------------------------------------------
+
+/// Collect identifiers in text that could be references to module-level names. Skips register
+/// names (`%...`), labels (`$L...`), numbers, comments, and strings.
+fn find_referenced_names(text: &str) -> HashSet<String> {
+    let bytes = text.as_bytes();
+    let mut names = HashSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(next) = scan::skip_comment(bytes, i) {
+            i = next;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i += 2,
+                    b'"' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+            continue;
+        }
+        if bytes[i] == b'%' {
+            i += 1;
+            while i < bytes.len() && is_name_byte(bytes[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i].is_ascii_digit() {
+            while i < bytes.len() && is_name_byte(bytes[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'_' || bytes[i] == b'$' || bytes[i].is_ascii_alphabetic() {
+            let start = i;
+            while i < bytes.len() && is_name_byte(bytes[i]) {
+                i += 1;
+            }
+            let name = &text[start..i];
+            if !name.starts_with("$L") {
+                names.insert(name.to_string());
+            }
+            continue;
+        }
+        i += 1;
+    }
+    names
+}
+
+/// Flow-insensitive taint analysis: which module-level variables might be written through a pointer
+/// in this function body.
+///
+/// Uses `scan::items` for statement parsing (handles braces, multi-line statements, inline asm).
+/// A register is tainted by a variable when any instruction has the variable's name or a tainted
+/// register among its source operands. Loads through a tainted address give data, not taint.
+/// The variable counts as written when a tainted register appears in a store, atomic, reduction,
+/// or call instruction. Iterates to true fixed point (the register sets are finite).
+///
+/// Performance: builds a reverse map from names to the variables they could taint, so the inner
+/// loop is proportional to (statements x distinct names per statement), not (statements x variables).
+/// CUDA runtime device functions that only read, not write through, their pointer arguments.
+/// Safe to exclude from the taint-to-write rule only when declared `.extern .func` (not defined
+/// in the module).
+const READONLY_EXTERN_CALLEES: &[&str] = &["vprintf", "__assertfail"];
+
+fn find_writes_to_globals(
+    body_text: &[u8],
+    body_range: &std::ops::Range<usize>,
+    global_names: &HashSet<String>,
+    safe_callees: &HashSet<String>,
+) -> (HashSet<String>, HashSet<String>) {
+    // Parse statements with the proper scanner.
+    let items = match scan::items(body_text, body_range.start..body_range.end) {
+        Some(items) => items,
+        None => return (HashSet::new(), HashSet::new()),
+    };
+
+    // Collect (opcode_str, operands_str) for every statement.
+    struct Stmt<'a> {
+        opcode: &'a str,
+        #[allow(dead_code)]
+        operands: &'a str,
+        /// All names (including registers) in the operands.
+        names: Vec<String>,
+        /// The names in the first (destination) operand.
+        dest_names: Vec<String>,
+        /// The names after the first comma (source operands, including the address of a load).
+        source_names: Vec<String>,
+    }
+
+    let text_str = std::str::from_utf8(body_text).unwrap_or("");
+    let mut stmts: Vec<Stmt<'_>> = Vec::new();
+
+    for item in &items {
+        let scan::Kind::Statement { opcode, operands, .. } = &item.kind else {
+            continue;
+        };
+        let op = &text_str[opcode.clone()];
+        let ops = &text_str[operands.clone()];
+        let names: Vec<String> = scan::names(ops).map(|s| s.to_string()).collect();
+        // First operand (destination): up to the first comma outside braces/brackets.
+        let first_comma = {
+            let mut depth = 0usize;
+            let mut pos = None;
+            for (i, b) in ops.bytes().enumerate() {
+                match b {
+                    b'{' | b'[' | b'(' => depth += 1,
+                    b'}' | b']' | b')' => depth = depth.saturating_sub(1),
+                    b',' if depth == 0 => {
+                        pos = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            pos
+        };
+        let dest_str = match first_comma {
+            Some(p) => &ops[..p],
+            None => ops,
+        };
+        let dest_names: Vec<String> = scan::names(dest_str).map(|s| s.to_string()).collect();
+        let source_str = match first_comma {
+            Some(p) => &ops[p + 1..],
+            None => "",
+        };
+        let source_names: Vec<String> = scan::names(source_str).map(|s| s.to_string()).collect();
+        stmts.push(Stmt {
+            opcode: op,
+            operands: ops,
+            names,
+            dest_names,
+            source_names,
+        });
+    }
+
+    // Build a map from each name (register or global) to the set of global variables it could be
+    // tainted by. Initially, each global variable name maps to itself.
+    let mut name_to_vars: HashMap<String, HashSet<String>> = HashMap::new();
+    for var in global_names {
+        name_to_vars.entry(var.clone()).or_default().insert(var.clone());
+    }
+
+    // Iterate to fixed point.
+    loop {
+        let mut changed = false;
+        for stmt in &stmts {
+            let is_load = stmt.opcode.starts_with("ld.") || stmt.opcode.starts_with("ldu.");
+            // Only stores to global or shared memory can write module-level variables.
+            // st.param and st.local are local; they do not escape to device memory.
+            let is_memory_store =
+                (stmt.opcode.starts_with("st.") && !stmt.opcode.contains(".param") && !stmt.opcode.contains(".local"))
+                    || stmt.opcode.starts_with("atom.")
+                    || stmt.opcode.starts_with("red.");
+            let is_call = stmt.opcode == "call" || stmt.opcode == "call.uni";
+
+            // Loads, stores, calls: do not propagate taint to their destination.
+            if is_load || is_memory_store || is_call {
+                continue;
+            }
+
+            // Collect all variables that any source operand is tainted by.
+            let mut tainted_by: HashSet<String> = HashSet::new();
+            for name in &stmt.names {
+                if let Some(vars) = name_to_vars.get(name) {
+                    tainted_by.extend(vars.iter().cloned());
+                }
+            }
+            if tainted_by.is_empty() {
+                continue;
+            }
+
+            // Taint each destination register with those variables.
+            for dest in &stmt.dest_names {
+                if dest.starts_with('%') {
+                    let entry = name_to_vars.entry(dest.clone()).or_default();
+                    for var in &tainted_by {
+                        if entry.insert(var.clone()) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Determine which variables are written: a store to addressable memory (not st.param, st.local),
+    // atomic, reduction, or call where any operand is tainted.
+    let mut written = HashSet::new();
+    for stmt in &stmts {
+        let is_store =
+            (stmt.opcode.starts_with("st.") && !stmt.opcode.contains(".param") && !stmt.opcode.contains(".local"))
+                || stmt.opcode.starts_with("atom.")
+                || stmt.opcode.starts_with("red.");
+        let is_call = stmt.opcode == "call" || stmt.opcode == "call.uni";
+        if !is_store && !is_call {
+            continue;
+        }
+        if is_call {
+            let target_is_safe = stmt
+                .names
+                .iter()
+                .any(|n| !n.starts_with('%') && safe_callees.contains(n));
+            if target_is_safe {
+                continue;
+            }
+        }
+        for name in &stmt.names {
+            if let Some(vars) = name_to_vars.get(name) {
+                written.extend(vars.iter().cloned());
+            }
+        }
+    }
+
+    // Determine which variables are loaded from: a load where the address operand (a source
+    // name after the first comma) is tainted by the variable.
+    let mut loaded_from = HashSet::new();
+    for stmt in &stmts {
+        let is_load = stmt.opcode.starts_with("ld.") || stmt.opcode.starts_with("ldu.");
+        if !is_load {
+            continue;
+        }
+        for name in &stmt.source_names {
+            if let Some(vars) = name_to_vars.get(name) {
+                loaded_from.extend(vars.iter().cloned());
+            }
+        }
+    }
+
+    (written, loaded_from)
+}
+
+// ---------------------------------------------------------------------------
+// Module-level parsing
+// ---------------------------------------------------------------------------
+
+/// Find the byte offset where the header ends (public entry point for other crates).
+pub fn find_header_end_pub(text: &[u8]) -> usize {
+    find_header_end(text)
+}
+
+/// Find the byte offset where the header ends: right after the last header directive (`.version`,
+/// `.target`, `.address_size`) or leading comment, before the first declaration or definition.
+fn find_header_end(text: &[u8]) -> usize {
+    let mut last_header_end = 0;
+    let mut at = 0;
+    let max_lines = 64;
+    for _ in 0..max_lines {
+        if at >= text.len() {
+            break;
+        }
+        let line_end = text[at..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(text.len(), |p| at + p);
+        let line = &text[at..line_end];
+        let indent = line.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        let trimmed = &line[indent..];
+
+        if trimmed.is_empty()
+            || trimmed.starts_with(b"//")
+            || trimmed.starts_with(b".version")
+            || trimmed.starts_with(b".target")
+            || trimmed.starts_with(b".address_size")
+        {
+            last_header_end = if line_end < text.len() {
+                line_end + 1
+            } else {
+                text.len()
+            };
+            at = last_header_end;
+            continue;
+        }
+        break;
+    }
+    last_header_end
+}
+
+/// Extract the variable name from a declaration like `.global .align 4 .b8 table[4] = {...};`.
+fn extract_variable_name(decl: &str) -> Option<String> {
+    let bytes = decl.as_bytes();
+    let mut last_name = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' || bytes[i] == b'=' || bytes[i] == b';' {
+            break;
+        }
+        if (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'$')
+            && (i == 0 || !is_name_byte(bytes[i - 1]))
+        {
+            let start = i;
+            while i < bytes.len() && is_name_byte(bytes[i]) {
+                i += 1;
+            }
+            let word = &decl[start..i];
+            // Skip known keywords and type specifiers.
+            if !word.starts_with('.')
+                && !matches!(
+                    word,
+                    "global"
+                        | "const"
+                        | "shared"
+                        | "extern"
+                        | "weak"
+                        | "common"
+                        | "visible"
+                        | "align"
+                        | "b8"
+                        | "b16"
+                        | "b32"
+                        | "b64"
+                        | "u8"
+                        | "u16"
+                        | "u32"
+                        | "u64"
+                        | "s8"
+                        | "s16"
+                        | "s32"
+                        | "s64"
+                        | "f16"
+                        | "f16x2"
+                        | "f32"
+                        | "f64"
+                        | "pred"
+                        | "texref"
+                        | "surfref"
+                        | "samplerref"
+                        | "v2"
+                        | "v4"
+                )
+            {
+                last_name = Some(word.to_string());
+            }
+            continue;
+        }
+        i += 1;
+    }
+    last_name
+}
+
+/// Scan the text between the header and the first function definition for module-level variable
+/// declarations. Also scan for `.extern .func` declarations.
+///
+/// This operates on the region between `header_end` and the first `FuncDef` range start, plus the
+/// gaps between function definitions.
+/// Result of scanning module-level items between function definitions.
+struct ModuleLevelItems {
+    vars: Vec<VarDecl>,
+    func_decls: Vec<FuncDecl>,
+    file_directives: Vec<Range<usize>>,
+    has_unrecognised: bool,
+}
+
+fn find_module_level_items(text: &[u8], header_end: usize, func_ranges: &[(Range<usize>, bool)]) -> ModuleLevelItems {
+    let mut result = ModuleLevelItems {
+        vars: Vec::new(),
+        func_decls: Vec::new(),
+        file_directives: Vec::new(),
+        has_unrecognised: false,
+    };
+
+    // Build gap ranges: regions not covered by any function definition.
+    let mut gaps = Vec::new();
+    let mut cursor = header_end;
+    for (range, _is_def) in func_ranges {
+        if range.start > cursor {
+            gaps.push(cursor..range.start);
+        }
+        cursor = range.end;
+    }
+    if cursor < text.len() {
+        gaps.push(cursor..text.len());
+    }
+
+    for gap in gaps {
+        let mut at = gap.start;
+        while at < gap.end {
+            if let Some(next) = scan::skip_comment(text, at) {
+                at = next;
+                continue;
+            }
+            if text[at].is_ascii_whitespace() {
+                at += 1;
+                continue;
+            }
+
+            // `.file` directive: keep for debug info.
+            if text[at..gap.end].starts_with(b".file ") {
+                let start = at;
+                while at < gap.end && text[at] != b'\n' {
+                    at += 1;
+                }
+                if at < gap.end {
+                    at += 1;
+                }
+                result.file_directives.push(start..at);
+                continue;
+            }
+
+            // Comments that were not caught by skip_comment (line start with `//`).
+            if text[at..gap.end].starts_with(b"//") {
+                while at < gap.end && text[at] != b'\n' {
+                    at += 1;
+                }
+                if at < gap.end {
+                    at += 1;
+                }
+                continue;
+            }
+
+            // Detect linkage prefix: `.visible`, `.weak`, `.extern`.
+            let rest = &text[at..gap.end];
+            let (has_visible, has_weak, has_extern, after_prefix) = parse_linkage(rest);
+
+            // Check if this is a variable declaration: linkage? + (.global | .const | .shared | .common).
+            let after = &rest[after_prefix..];
+            let is_var_keyword = after.starts_with(b".global")
+                || after.starts_with(b".const")
+                || after.starts_with(b".shared")
+                || after.starts_with(b".common");
+
+            // `.extern .func` or `.visible .func` or `.weak .func` or plain `.func` (declaration, no body).
+            let is_func_keyword = after.starts_with(b".func") || after.starts_with(b".entry");
+            let is_func_decl_possible = is_func_keyword && (has_extern || has_visible || has_weak || after_prefix == 0);
+
+            if is_var_keyword {
+                let start = at;
+                let mut depth = 0;
+                while at < gap.end {
+                    if text[at] == b'{' {
+                        depth += 1;
+                    } else if text[at] == b'}' {
+                        depth -= 1;
+                    } else if text[at] == b';' && depth == 0 {
+                        at += 1;
+                        break;
+                    }
+                    at += 1;
+                }
+                if at < gap.end && text[at] == b'\n' {
+                    at += 1;
+                }
+                let decl_text = std::str::from_utf8(&text[start..at]).unwrap_or("");
+                let persistent = after.starts_with(b".global") || after.starts_with(b".const");
+                if let Some(name) = extract_variable_name(decl_text) {
+                    result.vars.push(VarDecl {
+                        range: start..at,
+                        name,
+                        visible: has_visible,
+                        persistent,
+                    });
+                }
+                continue;
+            }
+
+            if is_func_decl_possible {
+                // A function declaration ended by `;` (no body) at module level.
+                let start = at;
+                while at < gap.end && text[at] != b';' && text[at] != b'{' {
+                    at += 1;
+                }
+                if at < gap.end && text[at] == b';' {
+                    at += 1; // past `;`
+                    if at < gap.end && text[at] == b'\n' {
+                        at += 1;
+                    }
+                    let decl = std::str::from_utf8(&text[start..at]).unwrap_or("");
+                    if let Some(name) = extract_func_decl_name(decl) {
+                        result.func_decls.push(FuncDecl { range: start..at, name });
+                    }
+                } else {
+                    // Has a body: this is a definition, not a declaration. Should have been found
+                    // by crate::functions(). Skip past the body.
+                    if at < gap.end && text[at] == b'{' {
+                        at = crate::matching(text, at).map_or(gap.end, |c| c + 1);
+                        if at < gap.end && text[at] == b'\n' {
+                            at += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Known directives/items that can appear at module level (or leak into gaps from function
+            // signatures when the gap covers the region between the .entry keyword and {) and are safe.
+            if text[at..gap.end].starts_with(b".section")
+                || text[at..gap.end].starts_with(b".loc ")
+                || text[at..gap.end].starts_with(b".pragma ")
+                || text[at..gap.end].starts_with(b".param ")
+                || text[at..gap.end].starts_with(b".reg ")
+                || text[at..gap.end].starts_with(b".maxntid")
+                || text[at..gap.end].starts_with(b".minnctapersm")
+                || text[at..gap.end].starts_with(b".reqntid")
+                || text[at..gap.end].starts_with(b".maxnreg")
+                || text[at] == b')'
+                || text[at] == b'{'
+                || text[at] == b'}'
+                || text[at] == b';'
+            {
+                while at < gap.end && text[at] != b'\n' {
+                    at += 1;
+                }
+                if at < gap.end {
+                    at += 1;
+                }
+                continue;
+            }
+
+            // Anything else in a gap: module-level text we do not parse. Gaps may contain pieces
+            // of function signatures that the gap calculation does not fully cover (parameter
+            // lists, function attributes, instructions). Only flag as unrecognised if the line
+            // starts with a dot that does not match any known directive -- a genuine unknown
+            // directive. Everything else (instructions, braces, parameters) is part of the
+            // surrounding code and is safe.
+            let start = at;
+            while at < gap.end && text[at] != b'\n' {
+                at += 1;
+            }
+            if at < gap.end {
+                at += 1;
+            }
+            let line = std::str::from_utf8(&text[start..at]).unwrap_or("").trim();
+            if line.starts_with('.') && !line.starts_with("//") {
+                // A dot-directive we do not recognise. Not safe to split.
+                result.has_unrecognised = true;
+            }
+        }
+    }
+
+    result
+}
+
+/// Parse optional linkage prefix at the start of `text`. Returns (has_visible, has_weak,
+/// has_extern, bytes_consumed).
+fn parse_linkage(text: &[u8]) -> (bool, bool, bool, usize) {
+    let mut vis = false;
+    let mut weak = false;
+    let mut ext = false;
+    let mut at = 0;
+    loop {
+        let rest = &text[at..];
+        if rest.starts_with(b".visible") && rest.get(8).is_some_and(|b| b.is_ascii_whitespace()) {
+            vis = true;
+            at += 8;
+        } else if rest.starts_with(b".weak") && rest.get(5).is_some_and(|b| b.is_ascii_whitespace()) {
+            weak = true;
+            at += 5;
+        } else if rest.starts_with(b".extern") && rest.get(7).is_some_and(|b| b.is_ascii_whitespace()) {
+            ext = true;
+            at += 7;
+        } else {
+            break;
+        }
+        // Skip whitespace after the keyword.
+        while at < text.len() && text[at].is_ascii_whitespace() && text[at] != b'\n' {
+            at += 1;
+        }
+    }
+    (vis, weak, ext, at)
+}
+
+/// Extract the name from a function declaration. Handles `.extern .func (rettype) name (params);`
+/// and variants with `.visible`, `.weak`. The name is the first identifier outside parens that
+/// is not a keyword.
+fn extract_func_decl_name(decl: &str) -> Option<String> {
+    let bytes = decl.as_bytes();
+    let mut i = 0;
+    let mut depth: usize = 0;
+    let mut found_keyword = false;
+    while i < bytes.len() {
+        if bytes[i] == b'(' {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b')' {
+            depth = depth.saturating_sub(1);
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b';' {
+            break;
+        }
+        let can_start = bytes[i] == b'.' || bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'$';
+        if depth == 0 && can_start && (i == 0 || !is_name_byte(bytes[i - 1])) {
+            let start = i;
+            while i < bytes.len() && is_name_byte(bytes[i]) {
+                i += 1;
+            }
+            let word = &decl[start..i];
+            if matches!(
+                word,
+                ".extern"
+                    | ".func"
+                    | ".visible"
+                    | ".weak"
+                    | ".entry"
+                    | ".param"
+                    | "extern"
+                    | "func"
+                    | "visible"
+                    | "weak"
+            ) {
+                found_keyword = true;
+                continue;
+            }
+            if word.starts_with('.') {
+                continue;
+            }
+            if found_keyword {
+                return Some(word.to_string());
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Check if an entry function (transitively) references a variable. Static version for use during
+/// construction.
+fn entry_references_var_static(
+    entry: &str,
+    var: &str,
+    func_refs: &HashMap<String, HashSet<String>>,
+    var_refs: &HashMap<String, HashSet<String>>,
+) -> bool {
+    let mut visited = HashSet::new();
+    let mut stack = vec![entry.to_string()];
+    while let Some(func) = stack.pop() {
+        if !visited.insert(func.clone()) {
+            continue;
+        }
+        if let Some(vr) = var_refs.get(&func)
+            && vr.contains(var)
+        {
+            return true;
+        }
+        if let Some(fr) = func_refs.get(&func) {
+            for callee in fr {
+                stack.push(callee.clone());
+            }
+        }
+    }
+    false
+}
+
+impl ModuleInfo {
+    /// Analyse a PTX module. The text should be the full module content (already lowered for Volta
+    /// if needed).
+    pub fn analyse(text: &[u8]) -> ModuleInfo {
+        let header_end = find_header_end(text);
+
+        // Use the existing `functions()` to find all function definitions.
+        let all_funcs = crate::functions(text);
+        let text_str = std::str::from_utf8(text).unwrap_or("");
+
+        let mut func_defs = Vec::new();
+        let mut entries = Vec::new();
+
+        let mut func_ranges = Vec::new();
+
+        for func in &all_funcs {
+            let name = text_str[func.name.clone()].to_string();
+            let body = func.body.clone();
+
+            let def_start = find_def_start(text, func.name.start);
+            let def_end = func.body.end;
+            let def_end = if def_end < text.len() && text[def_end] == b'\n' {
+                def_end + 1
+            } else {
+                def_end
+            };
+
+            let before_name = &text[def_start..func.name.start];
+            let is_entry = before_name.windows(6).any(|w| w == b".entry");
+
+            func_defs.push(FuncDef {
+                range: def_start..def_end,
+                name: name.clone(),
+                body,
+                is_entry,
+            });
+            func_ranges.push((def_start..def_end, true));
+
+            if is_entry {
+                entries.push(name);
+            }
+        }
+
+        func_ranges.sort_by_key(|r| r.0.start);
+
+        let module_items = find_module_level_items(text, header_end, &func_ranges);
+        let variables = module_items.vars;
+        let func_decls = module_items.func_decls;
+        let file_directives = module_items.file_directives;
+        let has_unrecognised_items = module_items.has_unrecognised;
+
+        // Collect all known module-level names for reference checking. Only persistent variables
+        // (.global, .const) need write analysis; .shared is per-launch and safe to duplicate.
+        let all_var_names: HashSet<String> = variables.iter().map(|v| v.name.clone()).collect();
+        let persistent_names: HashSet<String> = variables
+            .iter()
+            .filter(|v| v.persistent)
+            .map(|v| v.name.clone())
+            .collect();
+        let all_func_names: HashSet<String> = func_defs
+            .iter()
+            .map(|f| f.name.clone())
+            .chain(func_decls.iter().map(|d| d.name.clone()))
+            .collect();
+
+        let defined_funcs: HashSet<&str> = func_defs.iter().map(|f| f.name.as_str()).collect();
+        let safe_callees: HashSet<String> = func_decls
+            .iter()
+            .filter(|d| READONLY_EXTERN_CALLEES.contains(&d.name.as_str()))
+            .filter(|d| !defined_funcs.contains(d.name.as_str()))
+            .map(|d| d.name.clone())
+            .collect();
+
+        let mut func_refs_map: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut var_refs_map: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut written_vars = HashSet::new();
+        let mut loaded_vars = HashSet::new();
+
+        // The write/load taint analysis is only needed when the module has persistent variables.
+        // Modules without persistent variables have no coherence concern, and the taint analysis
+        // over an empty set of globals is a no-op anyway.
+        let need_taint = !persistent_names.is_empty();
+
+        for func in &func_defs {
+            let body_text = &text_str[func.body.clone()];
+            let all_names = find_referenced_names(body_text);
+            let fn_refs: HashSet<String> = all_names.intersection(&all_func_names).cloned().collect();
+            let vr: HashSet<String> = all_names.intersection(&all_var_names).cloned().collect();
+            if need_taint {
+                let (var_writes, var_loads) =
+                    find_writes_to_globals(text, &func.body, &persistent_names, &safe_callees);
+                written_vars.extend(var_writes);
+                loaded_vars.extend(var_loads);
+            }
+            func_refs_map.insert(func.name.clone(), fn_refs);
+            var_refs_map.insert(func.name.clone(), vr);
+        }
+
+        // A variable whose name appears in another variable's initializer has its address escaped.
+        // Treat it as written for the split rule: the address could be loaded by any kernel and
+        // stored through.
+        let mut escaped_vars = HashSet::new();
+        for var in &variables {
+            let decl_text = std::str::from_utf8(&text[var.range.clone()]).unwrap_or("");
+            let names_in_init = find_referenced_names(decl_text);
+            for other_var in &names_in_init {
+                if persistent_names.contains(other_var) && other_var != &var.name {
+                    escaped_vars.insert(other_var.clone());
+                    written_vars.insert(other_var.clone());
+                }
+            }
+        }
+
+        // Also scan variable initializers for function name references.
+        // A variable like `.global .u64 table[2] = {func_a, func_b};` references those functions.
+        // When the variable is needed, those functions are also needed.
+        let mut var_func_deps: HashMap<String, HashSet<String>> = HashMap::new();
+        for var in &variables {
+            let decl_text = std::str::from_utf8(&text[var.range.clone()]).unwrap_or("");
+            let names = find_referenced_names(decl_text);
+            let deps: HashSet<String> = names.intersection(&all_func_names).cloned().collect();
+            if !deps.is_empty() {
+                var_func_deps.insert(var.name.clone(), deps);
+            }
+        }
+
+        ModuleInfo {
+            text: text.to_vec(),
+            header: 0..header_end,
+            file_directives,
+            variables,
+            func_decls,
+            func_defs,
+            entries,
+            func_refs: func_refs_map,
+            var_refs: var_refs_map,
+            written_vars,
+            escaped_vars,
+            loaded_vars,
+            persistent_names,
+            has_unrecognised_items,
+        }
+    }
+
+    /// Whether this module has any independent entries that can be compiled on demand. With
+    /// per-entry classification, a module is "splittable" if at least one entry is independent.
+    /// Dependent entries come from the whole module (materialized once).
+    pub fn splittable(&self) -> Splittable {
+        if self.entries.len() <= 1 {
+            return Splittable::Yes;
+        }
+        if self.has_unrecognised_items {
+            return Splittable::No {
+                reason: "unrecognised module-level items".to_string(),
+            };
+        }
+        // All persistent variables are host-reachable (measured on V100 driver 580:
+        // cuModuleGetGlobal finds every .global and .const, not just .visible ones). Per-entry
+        // classification handles this: entries that reference a persistent variable are dependent
+        // and come from the materialized whole module. This method checks only module-level
+        // conditions (escaped vars, shared mutable state); the per-entry gate is
+        // `is_entry_independent`.
+        if !self.escaped_vars.is_empty() {
+            let mut escaped: Vec<&str> = self.escaped_vars.iter().map(|s| s.as_str()).collect();
+            escaped.sort();
+            return Splittable::No {
+                reason: format!("variables with address in an initializer (escaped): {escaped:?}"),
+            };
+        }
+        let mut shared_mutable = Vec::new();
+        for var in &self.written_vars {
+            let mut users = 0;
+            for entry in &self.entries {
+                if self.entry_references_var(entry, var) {
+                    users += 1;
+                }
+            }
+            if users > 1 {
+                shared_mutable.push(var.clone());
+            }
+        }
+        if shared_mutable.is_empty() {
+            Splittable::Yes
+        } else {
+            shared_mutable.sort();
+            Splittable::No {
+                reason: format!("shared mutable variables: {shared_mutable:?}"),
+            }
+        }
+    }
+
+    /// Check if an entry function (transitively through device functions) references a variable.
+    fn entry_references_var(&self, entry: &str, var: &str) -> bool {
+        entry_references_var_static(entry, var, &self.func_refs, &self.var_refs)
+    }
+
+    /// The transitive closure of device functions referenced by `entry`.
+    fn transitive_callees(&self, entry: &str) -> HashSet<String> {
+        let mut visited = HashSet::new();
+        let mut stack = vec![entry.to_string()];
+        while let Some(func) = stack.pop() {
+            if !visited.insert(func.clone()) {
+                continue;
+            }
+            if let Some(fr) = self.func_refs.get(&func) {
+                for callee in fr {
+                    stack.push(callee.clone());
+                }
+            }
+        }
+        visited.remove(entry);
+        visited
+    }
+
+    /// The transitive closure of module-level variables referenced by `entry` and its callees.
+    fn transitive_vars(&self, entry: &str) -> HashSet<String> {
+        let callees = self.transitive_callees(entry);
+        let mut vars = HashSet::new();
+        for func in std::iter::once(entry.to_string()).chain(callees) {
+            if let Some(vr) = self.var_refs.get(&func) {
+                vars.extend(vr.iter().cloned());
+            }
+        }
+        vars
+    }
+
+    /// Whether an entry is independent: it references no persistent variable (.global, .const)
+    /// transitively, except for message strings whose address flows only into vprintf/__assertfail.
+    ///
+    /// An independent entry compiles on demand in its own sub-module (with any message strings
+    /// duplicated). A dependent entry comes from the whole module (materialized once).
+    pub fn is_entry_independent(&self, entry: &str) -> bool {
+        let vars = self.transitive_vars(entry);
+        let persistent_refs: Vec<&String> = vars.iter().filter(|v| self.persistent_names.contains(*v)).collect();
+        if persistent_refs.is_empty() {
+            return true;
+        }
+        // Check if all persistent references are message strings: variables whose address flows
+        // only into safe callees (vprintf, __assertfail) and is never the address of a load or
+        // store in kernel code.
+        persistent_refs.iter().all(|v| self.is_message_string_only(v))
+    }
+
+    /// A persistent variable qualifies as a message string if its address only flows into the
+    /// arguments of vprintf/__assertfail (declared `.extern`) and is never the address operand of
+    /// a load, a store, an atomic or a reduction, never stored as data, and never passed to
+    /// another call.
+    ///
+    /// The `written_vars` set covers stores, atomics, reductions, data-as-stored, and calls to
+    /// non-safe callees. The `loaded_vars` set covers loads through the variable's address. The
+    /// `escaped_vars` set covers addresses that leak through another variable's initializer.
+    fn is_message_string_only(&self, var: &str) -> bool {
+        if self.written_vars.contains(var) {
+            return false;
+        }
+        if self.escaped_vars.contains(var) {
+            return false;
+        }
+        // The variable's address must never appear in the address operand of a load: a load
+        // means the kernel reads the variable's data, so the variable is not a mere message
+        // string whose content is irrelevant.
+        if self.loaded_vars.contains(var) {
+            return false;
+        }
+        true
+    }
+
+    /// The persistent variables that make `entry` dependent (not a message string).
+    /// Empty if the entry is independent.
+    pub fn dependent_vars(&self, entry: &str) -> Vec<String> {
+        let vars = self.transitive_vars(entry);
+        vars.iter()
+            .filter(|v| self.persistent_names.contains(*v))
+            .filter(|v| !self.is_message_string_only(v))
+            .cloned()
+            .collect()
+    }
+
+    /// The number of independent entries (those that can be compiled on demand).
+    pub fn independent_count(&self) -> usize {
+        self.entries.iter().filter(|e| self.is_entry_independent(e)).count()
+    }
+
+    /// The number of dependent entries (those that need the whole module).
+    pub fn dependent_count(&self) -> usize {
+        self.entries.len() - self.independent_count()
+    }
+
+    /// Extract a sub-module containing only the named entry function and its dependencies.
+    /// Returns `None` if the entry function is not in this module.
+    pub fn extract(&self, entry_name: &str) -> Option<Vec<u8>> {
+        if !self.entries.contains(&entry_name.to_string()) {
+            return None;
+        }
+
+        let needed_funcs = self.transitive_callees(entry_name);
+        let needed_vars = self.transitive_vars(entry_name);
+
+        let mut out = Vec::with_capacity(self.text.len() / 2);
+
+        // Emit the header.
+        out.extend_from_slice(&self.text[self.header.clone()]);
+
+        // Emit .file directives (debugging info).
+        for range in &self.file_directives {
+            out.extend_from_slice(&self.text[range.clone()]);
+        }
+
+        // Emit needed variables.
+        for var in &self.variables {
+            if needed_vars.contains(&var.name) {
+                out.extend_from_slice(&self.text[var.range.clone()]);
+            }
+        }
+
+        // Emit needed function declarations: any declared function that is in the needed set.
+        for decl in &self.func_decls {
+            if needed_funcs.contains(&decl.name) {
+                out.extend_from_slice(&self.text[decl.range.clone()]);
+            }
+        }
+
+        // Emit needed function definitions (in order).
+        for def in &self.func_defs {
+            if def.name == entry_name || needed_funcs.contains(&def.name) {
+                out.extend_from_slice(&self.text[def.range.clone()]);
+            }
+        }
+
+        Some(out)
+    }
+
+    /// Names of the entry functions in this module.
+    pub fn entry_names(&self) -> &[String] {
+        &self.entries
+    }
+
+    /// Number of entry functions.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Each kernel with the functions it reaches: itself first, then those it references, directly or
+    /// through others, in the order of their names.
+    pub fn reach(&self) -> impl Iterator<Item = (&str, Vec<String>)> + '_ {
+        self.entries.iter().map(|entry| {
+            let mut callees: Vec<String> = self.transitive_callees(entry).into_iter().collect();
+            callees.sort();
+            let mut reached = Vec::with_capacity(callees.len() + 1);
+            reached.push(entry.clone());
+            reached.extend(callees);
+            (entry.as_str(), reached)
+        })
+    }
+}
+
+/// Scan backwards from `name_start` to find the start of the function definition (the keyword
+/// `.entry`, `.func`, or a qualifier like `.visible`).
+fn find_def_start(text: &[u8], name_start: usize) -> usize {
+    // Go back to the start of the line that contains the keyword.
+    let mut at = name_start;
+    // The definition starts on or before the current line. Scan back through lines until we find
+    // one that starts with a function keyword (possibly with a qualifier).
+    loop {
+        // Find the start of the current line.
+        let line_start = text[..at].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+        let line = &text[line_start..at.min(text.len())];
+        let indent = line.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        let trimmed = &line[indent..];
+        if trimmed.starts_with(b".entry")
+            || trimmed.starts_with(b".func")
+            || trimmed.starts_with(b".visible")
+            || trimmed.starts_with(b".weak")
+        {
+            return line_start + indent;
+        }
+        // Check for `.maxntid`, `.minnctapersm`, `.reqntid`, `.maxnreg` on a line by itself
+        // (these are function attributes that come between the signature and the body).
+        if trimmed.starts_with(b".maxntid")
+            || trimmed.starts_with(b".minnctapersm")
+            || trimmed.starts_with(b".reqntid")
+            || trimmed.starts_with(b".maxnreg")
+        {
+            // Continue scanning upward.
+            if line_start == 0 {
+                return 0;
+            }
+            at = line_start - 1;
+            continue;
+        }
+        if line_start == 0 {
+            return 0;
+        }
+        at = line_start - 1;
+        // Safety: don't scan too far back.
+        if name_start - at > 4096 {
+            return line_start;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MODULE: &str = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.global .align 4 .b8 table[4] = {1, 2, 3, 4};
+.global .align 4 .b32 counter;
+
+.extern .func (.param .b32 func_retval0) helper (.param .b32 a)
+;
+.func (.reg .b32 %ret) twice (.reg .b32 %x)
+{
+\tadd.s32 %ret, %x, %x;
+\tret;
+}
+
+.func (.reg .b32 %ret) quad (.reg .b32 %x)
+{
+\tcall (%ret), twice, (%x);
+\tcall (%ret), twice, (%ret);
+\tret;
+}
+
+.visible .entry kernel_a(
+\t.param .u64 kernel_a_param_0
+)
+{
+\t.reg .b32 %r<4>;
+\tld.global.b32 %r1, [table];
+\tcall (%r2), twice, (%r1);
+\tst.global.b32 [kernel_a_param_0], %r2;
+\tret;
+}
+
+.visible .entry kernel_b(
+\t.param .u64 kernel_b_param_0
+)
+{
+\t.reg .b32 %r<4>;
+\tld.global.b32 %r1, [table];
+\tcall (%r2), quad, (%r1);
+\tst.global.b32 [kernel_b_param_0], %r2;
+\tret;
+}
+
+.visible .entry kernel_c(
+\t.param .u64 kernel_c_param_0
+)
+{
+\t.reg .b32 %r<4>;
+\tatom.global.add.s32 %r1, [counter], 1;
+\tret;
+}
+";
+
+    #[test]
+    fn analyses_module_structure() {
+        let info = ModuleInfo::analyse(MODULE.as_bytes());
+        assert_eq!(info.entries, ["kernel_a", "kernel_b", "kernel_c"]);
+        let func_names: Vec<&str> = info
+            .func_defs
+            .iter()
+            .filter(|f| !f.is_entry)
+            .map(|f| f.name.as_str())
+            .collect();
+        assert!(func_names.contains(&"twice"));
+        assert!(func_names.contains(&"quad"));
+    }
+
+    #[test]
+    fn finds_function_calls() {
+        let info = ModuleInfo::analyse(MODULE.as_bytes());
+        assert!(info.func_refs["kernel_a"].contains("twice"));
+        assert!(!info.func_refs["kernel_a"].contains("quad"));
+        assert!(info.func_refs["kernel_b"].contains("quad"));
+        assert!(info.func_refs["quad"].contains("twice"));
+    }
+
+    #[test]
+    fn finds_variable_references() {
+        let info = ModuleInfo::analyse(MODULE.as_bytes());
+        assert!(info.var_refs["kernel_a"].contains("table"));
+        assert!(info.var_refs["kernel_b"].contains("table"));
+        assert!(info.var_refs["kernel_c"].contains("counter"));
+    }
+
+    #[test]
+    fn detects_written_variables() {
+        let info = ModuleInfo::analyse(MODULE.as_bytes());
+        assert!(info.written_vars.contains("counter"));
+        assert!(!info.written_vars.contains("table"));
+    }
+
+    #[test]
+    fn splittable_when_no_persistent_vars() {
+        // A module with only .shared variables (per-launch) and no .global/.const is splittable.
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.extern .shared .align 4 .b8 smem[];
+
+.visible .entry k1() { .reg .u32 %r<2>; mov.u32 %r1, smem; ret; }
+.visible .entry k2() { .reg .u32 %r<2>; mov.u32 %r1, smem; ret; }
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert_eq!(info.splittable(), Splittable::Yes);
+    }
+
+    #[test]
+    fn module_with_persistent_vars_is_splittable_at_module_level() {
+        // MODULE has .global variables referenced by entries. splittable() allows it at the
+        // module level because per-entry classification handles the persistence constraint:
+        // entries that reference persistent vars are dependent and come from the whole module.
+        let info = ModuleInfo::analyse(MODULE.as_bytes());
+        assert_eq!(info.splittable(), Splittable::Yes);
+    }
+
+    #[test]
+    fn entries_loading_from_persistent_vars_are_dependent() {
+        // MODULE: kernel_a and kernel_b load from `table` (a .global), so they are dependent.
+        // kernel_c atomically writes `counter`, so it is also dependent (counter is written).
+        let info = ModuleInfo::analyse(MODULE.as_bytes());
+        assert!(
+            !info.is_entry_independent("kernel_a"),
+            "kernel_a loads from table, should be dependent"
+        );
+        assert!(
+            !info.is_entry_independent("kernel_b"),
+            "kernel_b loads from table, should be dependent"
+        );
+        assert!(
+            !info.is_entry_independent("kernel_c"),
+            "kernel_c writes counter, should be dependent"
+        );
+    }
+
+    #[test]
+    fn not_splittable_with_shared_mutable() {
+        let text = MODULE.replace(
+            "atom.global.add.s32 %r1, [counter], 1;",
+            "ld.global.b32 %r1, [counter];",
+        );
+        let text = text.replace(
+            "st.global.b32 [kernel_a_param_0], %r2;",
+            "st.global.b32 [kernel_a_param_0], %r2;\n\tatom.global.add.s32 %r1, [counter], 1;",
+        );
+        let info = ModuleInfo::analyse(text.as_bytes());
+        match info.splittable() {
+            Splittable::No { reason } => {
+                assert!(reason.contains("counter"), "reason: {reason}");
+            }
+            Splittable::Yes => panic!("should not be splittable"),
+        }
+    }
+
+    #[test]
+    fn taint_analysis_detects_indirect_write() {
+        // nvcc pattern: mov address, cvta, then atom through the register.
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.global .align 4 .b32 counter;
+
+.visible .entry writer(
+\t.param .u64 writer_param_0
+)
+{
+\t.reg .u64 %rd<4>;
+\t.reg .u32 %r<2>;
+\tmov.u64 %rd1, counter;
+\tcvta.to.global.u64 %rd2, %rd1;
+\tatom.global.add.u32 %r1, [%rd2], 1;
+\tret;
+}
+
+.visible .entry reader(
+\t.param .u64 reader_param_0
+)
+{
+\t.reg .u64 %rd<4>;
+\t.reg .u32 %r<2>;
+\tmov.u64 %rd1, counter;
+\tcvta.to.global.u64 %rd2, %rd1;
+\tld.global.u32 %r1, [%rd2];
+\tst.global.u32 [reader_param_0], %r1;
+\tret;
+}
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert!(
+            info.written_vars.contains("counter"),
+            "counter should be detected as written"
+        );
+        match info.splittable() {
+            Splittable::No { reason } => {
+                assert!(reason.contains("counter"), "reason: {reason}");
+            }
+            Splittable::Yes => panic!("should not be splittable: counter is written by writer and read by reader"),
+        }
+    }
+
+    #[test]
+    fn entry_loading_visible_global_is_dependent() {
+        // k1 loads from host_var (a .visible .global), so it is dependent. k2 does not
+        // reference any persistent variable, so it is independent.
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.visible .global .align 4 .b32 host_var;
+
+.visible .entry k1() { .reg .u32 %r<2>; ld.global.u32 %r1, [host_var]; ret; }
+.visible .entry k2() { ret; }
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert!(
+            !info.is_entry_independent("k1"),
+            "k1 loads from host_var, should be dependent"
+        );
+        assert!(
+            info.is_entry_independent("k2"),
+            "k2 uses no persistent var, should be independent"
+        );
+    }
+
+    #[test]
+    fn visible_global_with_linkage_prefix_is_parsed() {
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.visible .global .align 4 .b32 vis_var = 42;
+.weak .global .align 4 .b32 weak_var;
+
+.visible .entry k() { .reg .u32 %r<2>; ld.global.u32 %r1, [vis_var]; ret; }
+.visible .entry k2() { ret; }
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        let var_names: Vec<&str> = info.variables.iter().map(|v| v.name.as_str()).collect();
+        assert!(var_names.contains(&"vis_var"), "vis_var not found: {var_names:?}");
+        assert!(var_names.contains(&"weak_var"), "weak_var not found: {var_names:?}");
+        assert!(info.variables.iter().find(|v| v.name == "vis_var").unwrap().visible);
+    }
+
+    #[test]
+    fn function_address_taken_by_mov_is_a_dependency() {
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.func helper() { ret; }
+
+.visible .entry k(
+\t.param .u64 k_param_0
+)
+{
+\t.reg .u64 %rd<2>;
+\tld.param.u64 %rd0, [k_param_0];
+\tmov.u64 %rd1, helper;
+\tst.global.u64 [%rd0], %rd1;
+\tret;
+}
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        // `helper` should be found as a reference of `k` even without a direct call.
+        let sub = info.extract("k").unwrap();
+        let sub_text = std::str::from_utf8(&sub).unwrap();
+        assert!(sub_text.contains("helper"), "helper should be in the sub-module");
+    }
+
+    #[test]
+    fn unrecognised_module_level_item_prevents_splitting() {
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.some_unknown_directive 42;
+
+.visible .entry k1() { ret; }
+.visible .entry k2() { ret; }
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert!(info.has_unrecognised_items);
+        match info.splittable() {
+            Splittable::No { reason } => {
+                assert!(reason.contains("unrecognised"), "reason: {reason}");
+            }
+            Splittable::Yes => panic!("should not be splittable with unrecognised items"),
+        }
+    }
+
+    #[test]
+    fn extracts_submodule_for_kernel_a() {
+        let info = ModuleInfo::analyse(MODULE.as_bytes());
+        let sub = info.extract("kernel_a").unwrap();
+        let sub_text = std::str::from_utf8(&sub).unwrap();
+        assert!(sub_text.contains(".version 9.0"));
+        assert!(sub_text.contains(".target sm_70"));
+        assert!(sub_text.contains(".visible .entry kernel_a"));
+        assert!(sub_text.contains("twice"));
+        assert!(sub_text.contains("table[4]"));
+        assert!(!sub_text.contains("kernel_b"));
+        assert!(!sub_text.contains("kernel_c"));
+        assert!(!sub_text.contains("counter"));
+    }
+
+    #[test]
+    fn extracts_submodule_for_kernel_b() {
+        let info = ModuleInfo::analyse(MODULE.as_bytes());
+        let sub = info.extract("kernel_b").unwrap();
+        let sub_text = std::str::from_utf8(&sub).unwrap();
+        assert!(sub_text.contains(".visible .entry kernel_b"));
+        assert!(sub_text.contains("quad"));
+        assert!(sub_text.contains("twice"));
+        assert!(sub_text.contains("table[4]"));
+        assert!(!sub_text.contains("kernel_a"));
+        assert!(!sub_text.contains("kernel_c"));
+        assert!(!sub_text.contains("counter"));
+    }
+
+    #[test]
+    fn extracts_submodule_for_kernel_c() {
+        let info = ModuleInfo::analyse(MODULE.as_bytes());
+        let sub = info.extract("kernel_c").unwrap();
+        let sub_text = std::str::from_utf8(&sub).unwrap();
+        assert!(sub_text.contains(".visible .entry kernel_c"));
+        assert!(sub_text.contains("counter"));
+        assert!(!sub_text.contains("twice"));
+        assert!(!sub_text.contains("table"));
+        assert!(!sub_text.contains("kernel_a"));
+        assert!(!sub_text.contains("kernel_b"));
+    }
+
+    #[test]
+    fn extract_returns_none_for_unknown_kernel() {
+        let info = ModuleInfo::analyse(MODULE.as_bytes());
+        assert!(info.extract("nonexistent").is_none());
+    }
+
+    #[test]
+    fn single_entry_module_is_splittable() {
+        let text = b".version 9.0\n.target sm_70\n.entry only()\n{\n\tret;\n}\n";
+        let info = ModuleInfo::analyse(text);
+        assert_eq!(info.entries, ["only"]);
+        assert_eq!(info.splittable(), Splittable::Yes);
+    }
+
+    #[test]
+    fn extracted_submodule_has_valid_header() {
+        let info = ModuleInfo::analyse(MODULE.as_bytes());
+        for entry in &info.entries {
+            let sub = info.extract(entry).unwrap();
+            let header = crate::header(&sub);
+            assert!(header.is_some(), "sub-module for {entry} has no header");
+            let funcs = crate::functions(&sub);
+            assert!(
+                funcs
+                    .iter()
+                    .any(|f| { std::str::from_utf8(&sub[f.name.clone()]).unwrap() == entry }),
+                "sub-module for {entry} does not contain its entry"
+            );
+        }
+    }
+
+    #[test]
+    fn taint_through_brace_enclosed_statements() {
+        // Compiler output puts statements on one line with braces:
+        // `{ .reg .b64 %tmp; cvta.shared.u64 %rd12, %tmp; }`
+        // The scanner must handle this; a line-based parser would miss the cvta statement.
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.global .align 4 .b32 counter;
+
+.visible .entry k()
+{
+\t.reg .u64 %rd<4>;
+\t.reg .u32 %r<2>;
+\t{ .reg .u64 %tmp; mov.u64 %tmp, counter; cvta.to.global.u64 %rd2, %tmp; }
+\tatom.global.add.u32 %r1, [%rd2], 1;
+\tret;
+}
+
+.visible .entry k2() { ret; }
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert!(
+            info.written_vars.contains("counter"),
+            "counter should be detected as written through brace-enclosed statements"
+        );
+    }
+
+    #[test]
+    fn taint_two_statements_one_line() {
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.global .align 4 .b32 g;
+
+.visible .entry k()
+{
+\t.reg .u64 %rd<4>; .reg .u32 %r<2>;
+\tmov.u64 %rd1, g; cvta.to.global.u64 %rd2, %rd1;
+\tst.global.u32 [%rd2], %r1;
+\tret;
+}
+
+.visible .entry k2() { ret; }
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert!(info.written_vars.contains("g"), "g should be detected as written");
+    }
+
+    #[test]
+    fn taint_converges_on_long_reverse_chain() {
+        // A chain of 30 register copies in reverse order: %rd30 <- ... <- %rd1 <- counter.
+        // The old 20-round cap would fail to propagate taint to %rd30.
+        let mut body = String::from(
+            ".version 9.0\n.target sm_70\n.address_size 64\n\n\
+             .global .align 4 .b32 counter;\n\n\
+             .visible .entry writer()\n{\n\t.reg .u64 %rd<32>;\n\t.reg .u32 %r<2>;\n",
+        );
+        // Write the chain in reverse: %rd30 = %rd29; %rd29 = %rd28; ... %rd1 = counter.
+        for i in (1..=30).rev() {
+            if i == 1 {
+                body += "\tmov.u64 %rd1, counter;\n";
+            } else {
+                body += &format!("\tmov.u64 %rd{i}, %rd{};\n", i - 1);
+            }
+        }
+        body += "\tatom.global.add.u32 %r1, [%rd30], 1;\n\tret;\n}\n\n";
+        body += ".visible .entry reader() { ret; }\n";
+
+        let info = ModuleInfo::analyse(body.as_bytes());
+        assert!(
+            info.written_vars.contains("counter"),
+            "counter should be detected as written through a 30-register chain"
+        );
+    }
+
+    #[test]
+    fn variable_in_initializer_is_escaped() {
+        // `.global .u64 table[1] = {counter};` makes counter's address escape.
+        // A load from table and a store through the loaded pointer should mark counter as written.
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.global .align 4 .b32 counter;
+.global .align 8 .u64 table[1] = {counter};
+
+.visible .entry k1()
+{
+\t.reg .u64 %rd<4>;
+\t.reg .u32 %r<2>;
+\tld.global.u64 %rd1, [table];
+\tst.global.u32 [%rd1], %r1;
+\tret;
+}
+
+.visible .entry k2()
+{
+\t.reg .u32 %r<2>;
+\tld.global.u32 %r1, [counter];
+\tret;
+}
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert!(
+            info.written_vars.contains("counter"),
+            "counter should be marked as escaped (its name appears in table's initializer)"
+        );
+        match info.splittable() {
+            Splittable::No { reason } => {
+                assert!(reason.contains("counter"), "reason: {reason}");
+            }
+            Splittable::Yes => panic!("should not be splittable: counter escapes through table"),
+        }
+    }
+
+    #[test]
+    fn vprintf_does_not_count_as_write() {
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.global .align 1 .b8 args[8];
+.extern .func (.param .b32 retval0) vprintf (.param .b64 a);
+
+.visible .entry k()
+{
+\t.reg .b64 %rd<4>;
+\t.reg .b32 %r<2>;
+\tmov.u64 %rd1, args;
+\tcall.uni (%r1), vprintf, (%rd1);
+\tret;
+}
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert!(!info.written_vars.contains("args"), "{:?}", info.written_vars);
+    }
+
+    #[test]
+    fn module_defined_vprintf_gets_no_exception() {
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.global .align 1 .b8 args[8];
+
+.func (.param .b32 retval0) vprintf (.param .b64 a)
+{
+\tret;
+}
+
+.visible .entry k()
+{
+\t.reg .b64 %rd<4>;
+\t.reg .b32 %r<2>;
+\tmov.u64 %rd1, args;
+\tcall.uni (%r1), vprintf, (%rd1);
+\tret;
+}
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert!(info.written_vars.contains("args"), "{:?}", info.written_vars);
+    }
+
+    #[test]
+    fn tainted_arg_to_other_extern_counts_as_written() {
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.global .align 1 .b8 args[8];
+.extern .func (.param .b32 retval0) other_fn (.param .b64 a);
+
+.visible .entry k()
+{
+\t.reg .b64 %rd<4>;
+\t.reg .b32 %r<2>;
+\tmov.u64 %rd1, args;
+\tcall.uni (%r1), other_fn, (%rd1);
+\tret;
+}
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert!(info.written_vars.contains("args"), "{:?}", info.written_vars);
+    }
+
+    // ---- is_message_string_only / per-entry independence tests ----
+
+    #[test]
+    fn string_only_passed_to_vprintf_is_independent() {
+        // A format string whose address is only passed to vprintf: the entry is independent.
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.global .align 1 .b8 $str[6] = {72, 101, 108, 108, 111, 0};
+.extern .func (.param .b32 retval0) vprintf (.param .b64 fmt, .param .b64 valist);
+
+.visible .entry printer()
+{
+\t.reg .b64 %rd<4>;
+\t.reg .b32 %r<2>;
+\tmov.u64 %rd1, $str;
+\tmov.u64 %rd2, 0;
+\tcall.uni (%r1), vprintf, (%rd1, %rd2);
+\tret;
+}
+
+.visible .entry noop() { ret; }
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert!(
+            info.is_entry_independent("printer"),
+            "printer only passes $str to vprintf, should be independent"
+        );
+        assert!(
+            info.is_entry_independent("noop"),
+            "noop references nothing, should be independent"
+        );
+    }
+
+    #[test]
+    fn string_also_loaded_from_is_dependent() {
+        // The same string is passed to vprintf AND also loaded from: the entry is dependent.
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.global .align 1 .b8 $str[6] = {72, 101, 108, 108, 111, 0};
+.extern .func (.param .b32 retval0) vprintf (.param .b64 fmt, .param .b64 valist);
+
+.visible .entry loader()
+{
+\t.reg .b64 %rd<4>;
+\t.reg .b32 %r<2>;
+\tmov.u64 %rd1, $str;
+\tcall.uni (%r1), vprintf, (%rd1, %rd1);
+\tld.global.u8 %r1, [%rd1];
+\tret;
+}
+
+.visible .entry noop() { ret; }
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert!(
+            !info.is_entry_independent("loader"),
+            "loader loads from $str, should be dependent"
+        );
+    }
+
+    #[test]
+    fn lookup_table_loaded_from_is_dependent() {
+        // An entry loads from a .global lookup table: the entry is dependent.
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.global .align 4 .b8 lut[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+
+.visible .entry reader()
+{
+\t.reg .b32 %r<2>;
+\tld.global.u32 %r1, [lut];
+\tret;
+}
+
+.visible .entry noop() { ret; }
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert!(
+            !info.is_entry_independent("reader"),
+            "reader loads from lut, should be dependent"
+        );
+        assert!(
+            info.is_entry_independent("noop"),
+            "noop references nothing, should be independent"
+        );
+    }
+
+    #[test]
+    fn table_address_passed_to_function_is_dependent() {
+        // The address of a table is passed to a non-safe extern function: the entry is dependent
+        // (the write analysis marks the variable as written through the call).
+        let text = "\
+.version 9.0
+.target sm_70
+.address_size 64
+
+.global .align 4 .b8 tbl[16] = {0};
+.extern .func process (.param .b64 ptr);
+
+.visible .entry caller()
+{
+\t.reg .b64 %rd<2>;
+\tmov.u64 %rd1, tbl;
+\tcall.uni process, (%rd1);
+\tret;
+}
+
+.visible .entry noop() { ret; }
+";
+        let info = ModuleInfo::analyse(text.as_bytes());
+        assert!(
+            !info.is_entry_independent("caller"),
+            "caller passes tbl address to a non-safe call, should be dependent"
+        );
+    }
+}

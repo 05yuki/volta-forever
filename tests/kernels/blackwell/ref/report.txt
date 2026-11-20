@@ -1,0 +1,13 @@
+Truth extraction on NVIDIA GeForce RTX 5090
+
+decode_e2m1: 0/256 wrong
+decode_e2m1_relu: 0/256 wrong
+encode_e2m1: 0/585 wrong
+encode_e2m1_relu: 0/29 wrong
+decode_ue8m0: 0/65536 wrong
+encode_ue8m0_rp: 0/1638 wrong
+encode_ue8m0_rz: 0/1638 wrong
+encode_ue8m0_bf16_rp: 0/65536 wrong
+encode_ue8m0_bf16_rz: 0/65536 wrong
+
+Total wrong across all forms: 0

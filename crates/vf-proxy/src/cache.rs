@@ -1,0 +1,954 @@
+//! Proxy-side cache: skip adaptation and analysis on subsequent runs.
+//!
+//! When a module is first loaded, the proxy adapts its PTX (seconds) and analyses it for lazy
+//! compilation (seconds more). Both produce the same output for the same input. This cache stores
+//! the results, keyed by a 128-bit hash of the original image, the policy, and the build identity
+//! of the layer, so that a later run that loads the same module finds:
+//!
+//! - a **manifest**: every entry point with the flags the lazy path needs, the refusal reason when
+//!   it is refused, and the emulated-instruction counts when they are announced;
+//! - **sub-module PTX** for each independent kernel, stored when the kernel is first extracted;
+//! - for an image that has machine code only, its **translation**: the image to load in its
+//!   place, with the kernels that are refused and those that have instructions added.
+//!
+//! On a cache hit the hooks behave exactly as without a cache: the same kernels are refused with
+//! the same error at the same call, the same emulation warnings appear at the same moment, the
+//! same kernel count and enumeration are reported.
+//!
+//! When the manifest or a sub-module cannot answer a request (a kernel that was never extracted, a
+//! dependent entry, module variables, the whole-module fallback), the proxy adapts and analyses the
+//! original image at that moment, as it does without a cache.
+//!
+//! # Location
+//!
+//! `VF_PROXY_CACHE` names the directory (`0` or empty: off). Without it, `$XDG_CACHE_HOME/volta-forever/proxy`
+//! or `$HOME/.cache/volta-forever/proxy` is used. The cache is off when no directory can be formed.
+//!
+//! # Trust
+//!
+//! Directories are created with mode 0700. Before use, the cache directory must be a real directory
+//! owned by the effective uid and not writable by group or others; otherwise the cache is off.
+//! Temporary files use a random suffix and `create_new` with mode 0600. Files are read only when
+//! they are regular files owned by the effective uid. Each file carries a magic, format version,
+//! the full 128-bit key, the content length, and a checksum; anything that does not match is
+//! ignored and may be deleted.
+//!
+//! # Size limit
+//!
+//! `VF_PROXY_CACHE_MAX` (bytes, default 2 GB: the translations of all of a stock PyTorch are
+//! 0.6 GB) is enforced when writing, by deleting the files last used longest ago. Races between
+//! processes are harmless: a file that disappeared is a cache miss, not an error.
+
+use std::hash::Hasher;
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use crate::{generated, log};
+
+// ---- file format ---------------------------------------------------------------------------------
+
+/// Magic at the start of every cached file.
+const FILE_MAGIC: [u8; 4] = *b"S70C";
+/// Format version; bump to invalidate all entries when the on-disk layout changes.
+const FORMAT_VERSION: u32 = 4;
+/// File header: magic(4) + format_version(4) + key(16) + content_len(4) + checksum(8) = 36.
+const HEADER_LEN: usize = 36;
+/// Default size limit for the whole cache directory.
+const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+static CACHE_STATE: OnceLock<Option<CacheState>> = OnceLock::new();
+
+struct CacheState {
+    dir: PathBuf,
+    max_bytes: u64,
+    uid: u32,
+}
+
+fn state() -> Option<&'static CacheState> {
+    CACHE_STATE
+        .get_or_init(|| {
+            let dir = cache_dir()?;
+            let max_bytes = std::env::var("VF_PROXY_CACHE_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_MAX_BYTES);
+            let uid = unsafe { libc::geteuid() };
+            // Create the directory on first use, or verify it.
+            if let Err(reason) = ensure_dir(&dir, uid) {
+                log::warn(format_args!("proxy cache disabled: {reason}"));
+                return None;
+            }
+            Some(CacheState { dir, max_bytes, uid })
+        })
+        .as_ref()
+}
+
+/// Determine the cache directory from the environment.
+fn cache_dir() -> Option<PathBuf> {
+    if let Ok(val) = std::env::var("VF_PROXY_CACHE") {
+        if val == "0" || val.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(val));
+    }
+    // $XDG_CACHE_HOME/volta-forever/proxy, else $HOME/.cache/volta-forever/proxy
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
+        && !xdg.is_empty()
+    {
+        return Some(PathBuf::from(xdg).join("volta-forever/proxy"));
+    }
+    let home = std::env::var("HOME").ok()?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join(".cache/volta-forever/proxy"))
+}
+
+/// Create the directory (mode 0700) or verify an existing one is safe.
+fn ensure_dir(dir: &Path, uid: u32) -> Result<(), String> {
+    if dir.exists() {
+        return verify_dir(dir, uid);
+    }
+    // Create with restrictive permissions. create_dir_all does not set the mode on intermediate
+    // directories, so we set it on the leaf and accept that the parents may be wider.
+    std::fs::create_dir_all(dir).map_err(|e| format!("{dir:?}: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("{dir:?}: cannot set mode 0700: {e}"))?;
+    }
+    verify_dir(dir, uid)
+}
+
+/// The directory must be a directory (not a symlink), owned by us, and not writable by others.
+fn verify_dir(dir: &Path, uid: u32) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| format!("{dir:?}: {e}"))?;
+    if !meta.is_dir() {
+        return Err(format!("{dir:?} is not a directory"));
+    }
+    if meta.uid() != uid {
+        return Err(format!("{dir:?} is not owned by uid {uid}"));
+    }
+    let mode = meta.mode();
+    if mode & 0o022 != 0 {
+        return Err(format!("{dir:?} is writable by group or others (mode {mode:#o})"));
+    }
+    Ok(())
+}
+
+// ---- hashing -------------------------------------------------------------------------------------
+
+/// Compute a 128-bit hash of the original image bytes together with every field that affects the
+/// adapted output: the policy, any load option that matters, and the build identity of the layer.
+/// Two independent XxHash64 values (different seeds) give negligible collision probability for a
+/// local cache.
+pub fn cache_hash(image: &[u8], policy: &vf_adapt::Policy) -> u128 {
+    let hash_with_seed = |seed: u64| -> u64 {
+        let mut h = twox_hash::XxHash64::with_seed(seed);
+        h.write(image);
+        // Every field of the policy, whatever fields it comes to have.
+        h.write(format!("{policy:?}").as_bytes());
+        h.write_u64(generated::BUILD_IDENTITY);
+        h.finish()
+    };
+    let lo = hash_with_seed(0);
+    let hi = hash_with_seed(0x9e3779b97f4a7c15);
+    (hi as u128) << 64 | lo as u128
+}
+
+/// A content checksum for the file footer (not cryptographic, just corruption detection).
+fn content_checksum(data: &[u8]) -> u64 {
+    let mut h = twox_hash::XxHash64::with_seed(0xa5a5a5a5);
+    h.write(data);
+    h.finish()
+}
+
+// ---- file I/O ------------------------------------------------------------------------------------
+
+/// Build the file header for `key` and `data`.
+fn file_header(key: u128, data: &[u8]) -> [u8; HEADER_LEN] {
+    let mut hdr = [0u8; HEADER_LEN];
+    hdr[0..4].copy_from_slice(&FILE_MAGIC);
+    hdr[4..8].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    hdr[8..24].copy_from_slice(&key.to_le_bytes());
+    hdr[24..28].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    hdr[28..36].copy_from_slice(&content_checksum(data).to_le_bytes());
+    hdr
+}
+
+/// Write `data` to `path` atomically: create a temporary file with a random name and mode 0600,
+/// write header + data, sync, rename. Returns the number of bytes written (header + data).
+fn atomic_write(path: &Path, data: &[u8], key: u128) -> std::io::Result<u64> {
+    let dir = path.parent().unwrap();
+    std::fs::create_dir_all(dir)?;
+    // Random suffix: mix of pid and a counter, no external randomness needed.
+    let suffix = {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id() as u64;
+        pid ^ (n.wrapping_mul(0x517cc1b727220a95))
+    };
+    let temp = dir.join(format!(".tmp-{suffix:016x}"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)?;
+    let hdr = file_header(key, data);
+    file.write_all(&hdr)?;
+    file.write_all(data)?;
+    file.sync_data()?;
+    drop(file);
+    std::fs::rename(&temp, path)?;
+    Ok((HEADER_LEN + data.len()) as u64)
+}
+
+/// Read and verify a cached file. Returns the content (without the header) on success.
+fn checked_read(path: &Path, key: u128, uid: u32) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Opened without following a link, then examined as opened: what is read is what was checked.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.uid() != uid {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    if bytes.len() < HEADER_LEN || bytes[0..4] != FILE_MAGIC {
+        // Too short to be a cache entry, or not ours: do not delete.
+        return None;
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    if version != FORMAT_VERSION {
+        let _ = std::fs::remove_file(path); // stale
+        return None;
+    }
+    let stored_key = u128::from_le_bytes(bytes[8..24].try_into().ok()?);
+    if stored_key != key {
+        return None; // hash collision in the file name, not our entry
+    }
+    let stored_len = u32::from_le_bytes(bytes[24..28].try_into().ok()?) as usize;
+    let stored_checksum = u64::from_le_bytes(bytes[28..36].try_into().ok()?);
+    let data = bytes.get(HEADER_LEN..)?;
+    if data.len() != stored_len {
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    if content_checksum(data) != stored_checksum {
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    // Touch the file so LRU eviction sees it as recently used.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let times = [
+        libc::timespec {
+            tv_sec: now.as_secs() as _,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: now.as_secs() as _,
+            tv_nsec: 0,
+        },
+    ];
+    if let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+        unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0) };
+    }
+    Some(data.to_vec())
+}
+
+// ---- size limit ----------------------------------------------------------------------------------
+
+/// Enforce the size limit by deleting the least recently modified files. Races are harmless:
+/// a file that another process deleted while we enumerate is simply gone.
+fn enforce_limit(cs: &CacheState) {
+    let mut entries: Vec<(PathBuf, u64, i64)> = Vec::new(); // (path, size, mtime)
+    let mut total: u64 = 0;
+    let Ok(readdir) = std::fs::read_dir(&cs.dir) else {
+        return;
+    };
+    for entry in readdir.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let size = meta.len();
+        total += size;
+        entries.push((entry.path(), size, meta.mtime()));
+    }
+    if total <= cs.max_bytes {
+        return;
+    }
+    // Oldest first.
+    entries.sort_by_key(|e| e.2);
+    for (path, size, _) in &entries {
+        if total <= cs.max_bytes {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(*size);
+        }
+    }
+}
+
+// ---- manifest ------------------------------------------------------------------------------------
+
+/// A cached manifest for one module: every entry point with the flags the lazy path needs and the
+/// information the kernel tracker needs to refuse and announce kernels exactly as without a cache.
+#[derive(Clone)]
+pub struct CachedManifest {
+    pub entries: Vec<ManifestEntry>,
+}
+
+/// One entry in the manifest.
+#[derive(Clone)]
+pub struct ManifestEntry {
+    pub name: String,
+    pub independent: bool,
+    /// When the entry is refused: `(function, reason)`.
+    pub refused: Option<(String, String)>,
+    /// When the entry has emulated instructions.
+    pub emulated: Option<vf_ptx::EmulatedCounts>,
+}
+
+/// Encode the manifest to bytes.
+fn encode_manifest(m: &CachedManifest) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(m.entries.len() as u32).to_le_bytes());
+    for e in &m.entries {
+        // name
+        buf.extend_from_slice(&(e.name.len() as u32).to_le_bytes());
+        buf.extend_from_slice(e.name.as_bytes());
+        // flags
+        let mut flags: u8 = 0;
+        if e.independent {
+            flags |= 1;
+        }
+        if e.refused.is_some() {
+            flags |= 2;
+        }
+        if e.emulated.is_some() {
+            flags |= 4;
+        }
+        buf.push(flags);
+        // refused
+        if let Some((ref func, ref reason)) = e.refused {
+            buf.extend_from_slice(&(func.len() as u32).to_le_bytes());
+            buf.extend_from_slice(func.as_bytes());
+            buf.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+            buf.extend_from_slice(reason.as_bytes());
+        }
+        // emulated counts (13 fields, each u32)
+        if let Some(ref c) = e.emulated {
+            for v in [
+                c.fp16_tensor,
+                c.integer_tensor,
+                c.fp8_tensor,
+                c.fp4_tensor,
+                c.thread_tensor,
+                c.ldmatrix,
+                c.movmatrix,
+                c.cp_async,
+                c.tanh,
+                c.cvt_packed,
+                c.fp8_cvt,
+                c.nan_minmax,
+                c.other,
+            ] {
+                buf.extend_from_slice(&(v as u32).to_le_bytes());
+            }
+        }
+    }
+    buf
+}
+
+/// Decode the manifest from bytes.
+fn decode_manifest(data: &[u8]) -> Option<CachedManifest> {
+    let mut pos = 0;
+    let read_u32 = |pos: &mut usize| -> Option<u32> {
+        if *pos + 4 > data.len() {
+            return None;
+        }
+        let v = u32::from_le_bytes(data[*pos..*pos + 4].try_into().ok()?);
+        *pos += 4;
+        Some(v)
+    };
+    let read_str = |pos: &mut usize| -> Option<String> {
+        let len = read_u32(pos)? as usize;
+        if *pos + len > data.len() {
+            return None;
+        }
+        let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+        *pos += len;
+        Some(s)
+    };
+    let count = read_u32(&mut pos)? as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = read_str(&mut pos)?;
+        if pos >= data.len() {
+            return None;
+        }
+        let flags = data[pos];
+        pos += 1;
+        let independent = flags & 1 != 0;
+        let refused = if flags & 2 != 0 {
+            let func = read_str(&mut pos)?;
+            let reason = read_str(&mut pos)?;
+            Some((func, reason))
+        } else {
+            None
+        };
+        let emulated = if flags & 4 != 0 {
+            let mut vals = [0u32; 13];
+            for v in &mut vals {
+                *v = read_u32(&mut pos)?;
+            }
+            Some(vf_ptx::EmulatedCounts {
+                fp16_tensor: vals[0] as usize,
+                integer_tensor: vals[1] as usize,
+                fp8_tensor: vals[2] as usize,
+                fp4_tensor: vals[3] as usize,
+                thread_tensor: vals[4] as usize,
+                ldmatrix: vals[5] as usize,
+                movmatrix: vals[6] as usize,
+                cp_async: vals[7] as usize,
+                tanh: vals[8] as usize,
+                cvt_packed: vals[9] as usize,
+                fp8_cvt: vals[10] as usize,
+                nan_minmax: vals[11] as usize,
+                other: vals[12] as usize,
+                // Counted in translated machine code, which is not cached.
+                machine_code: 0,
+            })
+        } else {
+            None
+        };
+        entries.push(ManifestEntry {
+            name,
+            independent,
+            refused,
+            emulated,
+        });
+    }
+    Some(CachedManifest { entries })
+}
+
+// ---- public API ----------------------------------------------------------------------------------
+
+/// A cache key for a module, computed from the original image and the current policy.
+pub struct CacheKey {
+    pub key: u128,
+}
+
+/// Compute the cache key for the given original image bytes.
+pub fn key_for(image: &[u8]) -> CacheKey {
+    let policy = &crate::config().policy;
+    CacheKey {
+        key: cache_hash(image, policy),
+    }
+}
+
+/// File path for the manifest of a module.
+fn manifest_path(cs: &CacheState, key: u128) -> PathBuf {
+    cs.dir.join(format!("{key:032x}.manifest"))
+}
+
+/// File path for a sub-module.
+fn submodule_path(cs: &CacheState, key: u128, kernel_name: &str) -> PathBuf {
+    let name_hash = {
+        let mut h = twox_hash::XxHash64::with_seed(0xdeadbeef);
+        h.write(kernel_name.as_bytes());
+        h.finish()
+    };
+    cs.dir.join(format!("{key:032x}.s{name_hash:016x}"))
+}
+
+/// Try to load the manifest for a module.
+pub fn load_manifest(ck: &CacheKey) -> Option<CachedManifest> {
+    let cs = state()?;
+    let data = checked_read(&manifest_path(cs, ck.key), ck.key, cs.uid)?;
+    decode_manifest(&data)
+}
+
+/// Try to load a cached sub-module PTX for a kernel.
+pub fn load_submodule(ck: &CacheKey, kernel_name: &str) -> Option<Vec<u8>> {
+    let cs = state()?;
+    let data = checked_read(&submodule_path(cs, ck.key, kernel_name), ck.key, cs.uid)?;
+    // The file is named by a hash of the kernel's name: the name itself is in it.
+    let length = u32::from_le_bytes(data.get(..4)?.try_into().ok()?) as usize;
+    (data.get(4..4 + length)? == kernel_name.as_bytes()).then(|| data[4 + length..].to_vec())
+}
+
+/// Whether the cache is in use.
+pub fn enabled() -> bool {
+    state().is_some()
+}
+
+/// Save the manifest for a module. Enforces the size limit afterwards.
+pub fn save_manifest(ck: &CacheKey, manifest: &CachedManifest) {
+    let Some(cs) = state() else { return };
+    let data = encode_manifest(manifest);
+    if let Err(e) = atomic_write(&manifest_path(cs, ck.key), &data, ck.key) {
+        log::trace(format_args!("cache: failed to write manifest: {e}"));
+    }
+    enforce_limit(cs);
+}
+
+/// Save a sub-module PTX to the cache. Enforces the size limit afterwards.
+pub fn save_submodule(ck: &CacheKey, kernel_name: &str, ptx: &[u8]) {
+    let Some(cs) = state() else { return };
+    let mut data = Vec::with_capacity(4 + kernel_name.len() + ptx.len());
+    data.extend_from_slice(&(kernel_name.len() as u32).to_le_bytes());
+    data.extend_from_slice(kernel_name.as_bytes());
+    data.extend_from_slice(ptx);
+    if let Err(e) = atomic_write(&submodule_path(cs, ck.key, kernel_name), &data, ck.key) {
+        log::trace(format_args!("cache: failed to write sub-module for {kernel_name}: {e}"));
+    }
+    enforce_limit(cs);
+}
+
+// ---- translations --------------------------------------------------------------------------------
+
+/// The counts of emulated instructions, in the order they are written in a cached translation.
+fn counts_of(c: &vf_ptx::EmulatedCounts) -> [usize; 14] {
+    [
+        c.fp16_tensor,
+        c.integer_tensor,
+        c.fp8_tensor,
+        c.fp4_tensor,
+        c.thread_tensor,
+        c.ldmatrix,
+        c.movmatrix,
+        c.cp_async,
+        c.tanh,
+        c.cvt_packed,
+        c.fp8_cvt,
+        c.nan_minmax,
+        c.other,
+        c.machine_code,
+    ]
+}
+
+/// A translation as it is kept: what `vf_adapt` said of the image (how many modules and
+/// functions, from which architecture, the kernels refused and those with instructions added),
+/// then the image to load. `None` for anything that is not a translation with an image.
+fn encode_translation(adapted: &vf_adapt::Adapted) -> Option<Vec<u8>> {
+    let vf_adapt::Outcome::Translated {
+        entries,
+        from_sm,
+        functions,
+        refused,
+        emulated,
+        over_budget,
+    } = &adapted.outcome
+    else {
+        return None;
+    };
+    let image = adapted.image.as_ref()?;
+    let mut buf = Vec::with_capacity(image.len() + 256);
+    let put = |buf: &mut Vec<u8>, v: usize| buf.extend_from_slice(&(v as u32).to_le_bytes());
+    let put_str = |buf: &mut Vec<u8>, s: &str| {
+        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    };
+    put(&mut buf, *entries);
+    put(&mut buf, *from_sm as usize);
+    put(&mut buf, *functions);
+    put(&mut buf, *over_budget as usize);
+    put(&mut buf, refused.len());
+    for r in refused {
+        put_str(&mut buf, &r.kernel);
+        put_str(&mut buf, &r.function);
+        put_str(&mut buf, &r.reason);
+    }
+    put(&mut buf, emulated.len());
+    for e in emulated {
+        put_str(&mut buf, &e.kernel);
+        for v in counts_of(&e.counts) {
+            put(&mut buf, v);
+        }
+    }
+    buf.extend_from_slice(image);
+    Some(buf)
+}
+
+fn decode_translation(data: &[u8]) -> Option<vf_adapt::Adapted> {
+    let mut pos = 0;
+    let read = |pos: &mut usize| -> Option<usize> {
+        let v = u32::from_le_bytes(data.get(*pos..*pos + 4)?.try_into().ok()?);
+        *pos += 4;
+        Some(v as usize)
+    };
+    let read_str = |pos: &mut usize| -> Option<String> {
+        let len = read(pos)?;
+        let s = std::str::from_utf8(data.get(*pos..pos.checked_add(len)?)?)
+            .ok()?
+            .to_string();
+        *pos += len;
+        Some(s)
+    };
+    let entries = read(&mut pos)?;
+    let from_sm = read(&mut pos)? as u32;
+    let functions = read(&mut pos)?;
+    let over_budget = read(&mut pos)? != 0;
+    let mut refused = Vec::new();
+    for _ in 0..read(&mut pos)? {
+        refused.push(vf_adapt::Refused {
+            kernel: read_str(&mut pos)?,
+            function: read_str(&mut pos)?,
+            reason: read_str(&mut pos)?,
+        });
+    }
+    let mut emulated = Vec::new();
+    for _ in 0..read(&mut pos)? {
+        let kernel = read_str(&mut pos)?;
+        let mut v = [0usize; 14];
+        for x in &mut v {
+            *x = read(&mut pos)?;
+        }
+        emulated.push(vf_adapt::Emulated {
+            kernel,
+            counts: vf_ptx::EmulatedCounts {
+                fp16_tensor: v[0],
+                integer_tensor: v[1],
+                fp8_tensor: v[2],
+                fp4_tensor: v[3],
+                thread_tensor: v[4],
+                ldmatrix: v[5],
+                movmatrix: v[6],
+                cp_async: v[7],
+                tanh: v[8],
+                cvt_packed: v[9],
+                fp8_cvt: v[10],
+                nan_minmax: v[11],
+                other: v[12],
+                machine_code: v[13],
+            },
+        });
+    }
+    Some(vf_adapt::Adapted {
+        outcome: vf_adapt::Outcome::Translated {
+            entries,
+            from_sm,
+            functions,
+            refused,
+            emulated,
+            over_budget,
+        },
+        image: Some(data.get(pos..)?.to_vec()),
+    })
+}
+
+/// File path for the translation of a module.
+fn translation_path(cs: &CacheState, key: u128) -> PathBuf {
+    cs.dir.join(format!("{key:032x}.t"))
+}
+
+/// The translation of the image of this key, if an earlier run kept it.
+pub fn load_translation(ck: &CacheKey) -> Option<vf_adapt::Adapted> {
+    let cs = state()?;
+    decode_translation(&checked_read(&translation_path(cs, ck.key), ck.key, cs.uid)?)
+}
+
+/// Keep a translation for later runs (anything else is not kept). Enforces the size limit afterwards.
+pub fn save_translation(ck: &CacheKey, adapted: &vf_adapt::Adapted) {
+    let Some(cs) = state() else { return };
+    let Some(data) = encode_translation(adapted) else {
+        return;
+    };
+    // (The length of a file is written in 32 bits.)
+    if data.len() > u32::MAX as usize {
+        return;
+    }
+    if let Err(e) = atomic_write(&translation_path(cs, ck.key), &data, ck.key) {
+        log::trace(format_args!("cache: failed to write a translation: {e}"));
+    }
+    enforce_limit(cs);
+}
+
+// ---- tests ---------------------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
+mod tests {
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let base = std::env::var("VF_TEST_DIR").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
+        let dir = PathBuf::from(base).join(format!("cache-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Set mode 0700 so verify_dir passes.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        dir
+    }
+
+    fn make_manifest() -> CachedManifest {
+        CachedManifest {
+            entries: vec![
+                ManifestEntry {
+                    name: "kernel_a".to_string(),
+                    independent: true,
+                    refused: None,
+                    emulated: Some({
+                        let mut c = vf_ptx::EmulatedCounts::default();
+                        c.tanh = 3;
+                        c.fp16_tensor = 10;
+                        c
+                    }),
+                },
+                ManifestEntry {
+                    name: "kernel_b".to_string(),
+                    independent: false,
+                    refused: Some(("bad_func".to_string(), "unknown instruction".to_string())),
+                    emulated: None,
+                },
+                ManifestEntry {
+                    name: "kernel_c".to_string(),
+                    independent: true,
+                    refused: None,
+                    emulated: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn manifest_round_trip() {
+        let manifest = make_manifest();
+        let encoded = encode_manifest(&manifest);
+        let decoded = decode_manifest(&encoded).unwrap();
+        assert_eq!(decoded.entries.len(), 3);
+        assert_eq!(decoded.entries[0].name, "kernel_a");
+        assert!(decoded.entries[0].independent);
+        assert!(decoded.entries[0].refused.is_none());
+        let emu = decoded.entries[0].emulated.as_ref().unwrap();
+        assert_eq!(emu.tanh, 3);
+        assert_eq!(emu.fp16_tensor, 10);
+        assert_eq!(emu.ldmatrix, 0);
+        assert_eq!(decoded.entries[1].name, "kernel_b");
+        assert!(!decoded.entries[1].independent);
+        let (func, reason) = decoded.entries[1].refused.as_ref().unwrap();
+        assert_eq!(func, "bad_func");
+        assert_eq!(reason, "unknown instruction");
+        assert!(decoded.entries[1].emulated.is_none());
+        assert_eq!(decoded.entries[2].name, "kernel_c");
+        assert!(decoded.entries[2].independent);
+    }
+
+    #[test]
+    fn translation_round_trip() {
+        let mut counts = vf_ptx::EmulatedCounts::default();
+        counts.machine_code = 3;
+        counts.fp4_tensor = 5;
+        let adapted = vf_adapt::Adapted {
+            outcome: vf_adapt::Outcome::Translated {
+                entries: 1,
+                from_sm: 75,
+                functions: 7,
+                refused: vec![vf_adapt::Refused {
+                    kernel: "warp_sum".to_string(),
+                    function: "warp_sum".to_string(),
+                    reason: "its machine code for sm_75 is not translated (why)".to_string(),
+                }],
+                emulated: vec![vf_adapt::Emulated {
+                    kernel: "block_sum".to_string(),
+                    counts,
+                }],
+                over_budget: true,
+            },
+            image: Some(vec![0x7f, b'E', b'L', b'F', 1, 2, 3]),
+        };
+        let data = encode_translation(&adapted).unwrap();
+        let back = decode_translation(&data).unwrap();
+        assert_eq!(back.outcome, adapted.outcome);
+        assert_eq!(back.image, adapted.image);
+        match &back.outcome {
+            vf_adapt::Outcome::Translated {
+                emulated, over_budget, ..
+            } => {
+                assert!(over_budget);
+                assert_eq!(emulated[0].counts.fp4_tensor, 5);
+                assert_eq!(emulated[0].counts.machine_code, 3);
+            }
+            _ => panic!("not a translation"),
+        }
+        // Cut short anywhere before the image, it is nothing.
+        for cut in 0..data.len() - 7 {
+            assert!(decode_translation(&data[..cut]).is_none(), "{cut}");
+        }
+        // Only a translation with an image is kept.
+        let native = vf_adapt::Adapted {
+            outcome: vf_adapt::Outcome::Native,
+            image: None,
+        };
+        assert!(encode_translation(&native).is_none());
+    }
+
+    #[test]
+    fn file_round_trip() {
+        let dir = test_dir("roundtrip");
+        let key: u128 = 0x1234_5678_9abc_def0_1234_5678_9abc_def0;
+        let uid = unsafe { libc::geteuid() };
+        let path = dir.join("test.bin");
+        let data = b"hello world";
+        atomic_write(&path, data, key).unwrap();
+        let read = checked_read(&path, key, uid).unwrap();
+        assert_eq!(read, data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn older_format_version_refused() {
+        // A record written by version 2 had one field fewer (no `fp4_tensor`): the version is the
+        // only thing that keeps it from being read with its fields shifted.
+        let dir = test_dir("oldversion");
+        let key: u128 = 7;
+        let uid = unsafe { libc::geteuid() };
+        let path = dir.join("old.bin");
+        atomic_write(&path, b"payload", key).unwrap();
+        assert_eq!(checked_read(&path, key, uid).unwrap(), b"payload");
+        let mut full = std::fs::read(&path).unwrap();
+        full[4..8].copy_from_slice(&2u32.to_le_bytes());
+        std::fs::write(&path, &full).unwrap();
+        assert!(checked_read(&path, key, uid).is_none());
+        // A stale entry is deleted.
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_file_rejected() {
+        let dir = test_dir("truncated");
+        let key: u128 = 42;
+        let uid = unsafe { libc::geteuid() };
+        let path = dir.join("trunc.bin");
+        let data = b"some content";
+        atomic_write(&path, data, key).unwrap();
+        // Truncate the file.
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &full[..HEADER_LEN + 2]).unwrap();
+        assert!(checked_read(&path, key, uid).is_none());
+        // File should have been deleted.
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_checksum_rejected() {
+        let dir = test_dir("corrupt");
+        let key: u128 = 99;
+        let uid = unsafe { libc::geteuid() };
+        let path = dir.join("bad.bin");
+        let data = b"payload";
+        atomic_write(&path, data, key).unwrap();
+        // Flip a byte in the payload.
+        let mut full = std::fs::read(&path).unwrap();
+        full[HEADER_LEN] ^= 0xff;
+        std::fs::write(&path, &full).unwrap();
+        assert!(checked_read(&path, key, uid).is_none());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrong_key_rejected() {
+        let dir = test_dir("wrongkey");
+        let uid = unsafe { libc::geteuid() };
+        let path = dir.join("wk.bin");
+        atomic_write(&path, b"data", 100).unwrap();
+        assert!(checked_read(&path, 200, uid).is_none());
+        // Not deleted: different key, might belong to another module.
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreign_file_not_deleted() {
+        let dir = test_dir("foreign");
+        let uid = unsafe { libc::geteuid() };
+        let path = dir.join("foreign.txt");
+        std::fs::write(&path, b"not a cache file").unwrap();
+        assert!(checked_read(&path, 0, uid).is_none());
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dir_writable_by_others_refused() {
+        let dir = test_dir("perms");
+        let uid = unsafe { libc::geteuid() };
+        // Make world-writable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        assert!(verify_dir(&dir, uid).is_err());
+        // Restore and verify passes.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(verify_dir(&dir, uid).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn size_limit_evicts_old_files() {
+        let dir = test_dir("sizelimit");
+        let uid = unsafe { libc::geteuid() };
+        let cs = CacheState {
+            dir: dir.clone(),
+            max_bytes: 200, // very small
+            uid,
+        };
+        // Write several files.
+        for i in 0u128..10 {
+            let path = dir.join(format!("f{i}.bin"));
+            atomic_write(&path, &[0u8; 50], i).unwrap();
+        }
+        enforce_limit(&cs);
+        // After eviction, total should be <= 200 bytes.
+        let total: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum();
+        assert!(total <= 200, "total {total} > 200");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hash_includes_policy_and_build() {
+        let img = b"test image";
+        let p1 = vf_adapt::Policy::default();
+        let mut p2 = vf_adapt::Policy::default();
+        p2.told_sm = Some(80);
+        let h1 = cache_hash(img, &p1);
+        let h2 = cache_hash(img, &p2);
+        assert_ne!(h1, h2, "different policy must give different hash");
+        // Same policy, same image: same hash.
+        let h1b = cache_hash(img, &p1);
+        assert_eq!(h1, h1b);
+    }
+}

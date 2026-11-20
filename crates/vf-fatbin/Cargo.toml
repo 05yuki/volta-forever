@@ -1,0 +1,11 @@
+[package]
+name = "vf-fatbin"
+description = "Fat binaries (the multi-architecture containers of CUDA GPU code) and cubin headers"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lz4_flex.workspace = true
+ruzstd.workspace = true

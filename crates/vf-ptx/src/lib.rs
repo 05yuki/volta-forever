@@ -1,0 +1,867 @@
+//! PTX text: the two header lines that decide whether the driver's JIT accepts a module, and the
+//! instructions that only exist from Turing (sm_75) on.
+//!
+//! A module starts with `.version MAJOR.MINOR` and `.target sm_NN[, option...]`. The JIT of a driver
+//! refuses a version newer than its own and a target above the GPU it compiles for, even when the body
+//! uses nothing new. Lowering both lines is enough for such code (`retarget`). Code that uses the
+//! instructions Turing added is rewritten with what Volta has (`lower_to_volta`).
+
+pub mod deps;
+pub mod emulated;
+pub mod lower;
+pub mod refused;
+pub mod scan;
+
+pub use emulated::{Emulated, EmulatedCounts, count_emulated};
+pub use refused::{
+    CompilerError, Refused, RefusedFunction, Removal, parse_error_lines, trap_functions_at_lines, without_refused,
+};
+
+/// The header of a PTX module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header {
+    /// PTX ISA version (major, minor).
+    pub version: (u32, u32),
+    /// The `NN` of `.target sm_NN`.
+    pub target: u32,
+}
+
+/// How far the header is searched: the directives follow the compiler's comment block.
+const HEADER_LINES: usize = 64;
+
+/// Byte range of the argument of directive `name` (e.g. `.version`) when it starts one of the first
+/// lines of the text.
+fn directive(text: &[u8], name: &[u8]) -> Option<std::ops::Range<usize>> {
+    let mut line_start = 0;
+    for _ in 0..HEADER_LINES {
+        if line_start >= text.len() {
+            break;
+        }
+        let line_end = text[line_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(text.len(), |p| line_start + p);
+        let line = &text[line_start..line_end];
+        let indent = line.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        if line.iter().any(|&b| b == 0 || (b < 0x20 && !b.is_ascii_whitespace())) {
+            return None; // not text
+        }
+        if line[indent..].starts_with(name) && line.get(indent + name.len()).is_some_and(|b| b.is_ascii_whitespace()) {
+            return Some(line_start + indent + name.len()..line_end);
+        }
+        // Directives come before any code: stop at the first function or variable.
+        if line[indent..].starts_with(b".entry")
+            || line[indent..].starts_with(b".func")
+            || line[indent..].starts_with(b".global")
+        {
+            return None;
+        }
+        line_start = line_end + 1;
+    }
+    None
+}
+
+fn number(bytes: &[u8]) -> Option<(u32, usize)> {
+    let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    let value = std::str::from_utf8(&bytes[..digits]).ok()?.parse().ok()?;
+    Some((value, digits))
+}
+
+/// Range of the `MAJOR.MINOR` text and its value.
+fn version(text: &[u8]) -> Option<(std::ops::Range<usize>, (u32, u32))> {
+    let arg = directive(text, b".version")?;
+    let start = arg.start + text[arg.clone()].iter().take_while(|b| b.is_ascii_whitespace()).count();
+    let (major, major_len) = number(&text[start..arg.end])?;
+    if text.get(start + major_len) != Some(&b'.') {
+        return None;
+    }
+    let (minor, minor_len) = number(&text[start + major_len + 1..arg.end])?;
+    Some((start..start + major_len + 1 + minor_len, (major, minor)))
+}
+
+/// Range of the digits (and variant letter) after `sm_`, and the architecture number.
+fn target(text: &[u8]) -> Option<(std::ops::Range<usize>, u32)> {
+    let arg = directive(text, b".target")?;
+    let at = text[arg.clone()].windows(3).position(|w| w == b"sm_")? + arg.start + 3;
+    let (sm, digits) = number(&text[at..arg.end])?;
+    let suffix = text[at + digits..arg.end]
+        .iter()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .count();
+    Some((at..at + digits + suffix, sm))
+}
+
+/// The header of `text`, if it has one.
+pub fn header(text: &[u8]) -> Option<Header> {
+    Some(Header {
+        version: version(text)?.1,
+        target: target(text)?.1,
+    })
+}
+
+/// Lower `.version` to `max_version` and `.target` to `sm_<sm>` where they are above, in place: the
+/// text keeps its length (spaces replace what is removed). Returns the number of lines changed.
+pub fn retarget(text: &mut [u8], max_version: (u32, u32), sm: u32) -> usize {
+    let mut changed = 0;
+    if let Some((range, found)) = version(text) {
+        let wanted = format!("{}.{}", max_version.0, max_version.1);
+        if found > max_version && wanted.len() <= range.len() {
+            text[range.clone()].fill(b' ');
+            text[range.start..range.start + wanted.len()].copy_from_slice(wanted.as_bytes());
+            changed += 1;
+        }
+    }
+    if let Some((range, found)) = target(text) {
+        let wanted = sm.to_string();
+        if found > sm && wanted.len() <= range.len() {
+            text[range.clone()].fill(b' ');
+            text[range.start..range.start + wanted.len()].copy_from_slice(wanted.as_bytes());
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// PTX instructions that need sm_75 or later (PTX ISA documentation) and that `lower_to_volta`
+/// rewrites or refuses, with the text that reveals them. `tanh` is not in this list:
+/// `lower_to_volta` expands it. The first six need sm_75; the others sm_80 or later. The list is not
+/// all that later targets have: a module can pass it and still be refused by the compiler.
+const TURING_ONLY: &[(&str, &str)] = &[
+    ("ldmatrix", "ldmatrix"),
+    ("movmatrix", "movmatrix"),
+    ("mma m16n8k8", ".m16n8k8."),
+    ("integer mma m8n8k16", ".m8n8k16."),
+    ("integer mma m8n8k32", ".m8n8k32."),
+    ("bit mma m8n8k128", ".m8n8k128."),
+    ("mma m16n8k16", ".m16n8k16."),
+    ("mma m16n8k32", ".m16n8k32."),
+    ("mma m16n8k64", ".m16n8k64."),
+    ("mma m16n8k4", ".m16n8k4."),
+    ("stmatrix", "stmatrix"),
+    ("asynchronous copy", "cp.async"),
+    ("conversion to packed floats", "x2.f32"),
+    ("min or max that returns NaN", ".NaN."),
+    ("bf16", ".bf16"),
+    ("tf32", ".tf32"),
+    ("redux", "redux.sync"),
+];
+
+fn contains(text: &[u8], needle: &[u8]) -> bool {
+    text.windows(needle.len()).any(|w| w == needle)
+}
+
+/// `text` holds something `lower_to_volta` rewrites or refuses: its header alone is not enough.
+pub fn needs_lowering(text: &[u8]) -> bool {
+    lower::REWRITTEN.iter().any(|needle| contains(text, needle.as_bytes()))
+}
+
+/// Names of the Turing-only instructions that `text` uses: such a module cannot be compiled for Volta
+/// by lowering its header alone (see `lower_to_volta`).
+pub fn turing_only_features(text: &[u8]) -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = TURING_ONLY
+        .iter()
+        .filter(|(_, needle)| contains(text, needle.as_bytes()))
+        .map(|(name, _)| *name)
+        .collect();
+    if contains(text, TANH) {
+        found.push("tanh");
+    }
+    found
+}
+
+/// A function definition: where its name and its body (braces included) are in the text. Its
+/// parameters and its directives are between the two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Function {
+    pub name: std::ops::Range<usize>,
+    pub body: std::ops::Range<usize>,
+    /// A kernel (`.entry`), not a device function (`.func`).
+    pub entry: bool,
+}
+
+/// The body that stands for one the GPU cannot run.
+pub(crate) const TRAP_BODY: &[u8] = b"{\n\ttrap;\n\tret;\n}";
+
+/// Directives that ask for a cluster of blocks, which GPUs have from sm_90 on.
+const CLUSTER_DIRECTIVES: &[&[u8]] = &[b".explicitcluster", b".reqnctapercluster", b".maxclusterrank"];
+
+/// The whole lines between the name of `function` and its body whose first word is one of `words`.
+fn directive_lines(text: &[u8], function: &Function, words: &[&[u8]]) -> Vec<std::ops::Range<usize>> {
+    let to = function.body.start;
+    let mut lines = Vec::new();
+    let mut start = function.name.end;
+    while let Some(length) = text[start..to].iter().position(|&byte| byte == b'\n') {
+        let line = text[start..start + length].trim_ascii();
+        let word = &line[..line.iter().take_while(|byte| !byte.is_ascii_whitespace()).count()];
+        if words.contains(&word) {
+            lines.push(start..start + length + 1);
+        }
+        start += length + 1;
+    }
+    lines
+}
+
+use scan::{skip_comment, skip_string};
+
+/// Position of the bracket that closes the one at `open` (`(`/`)` or `{`/`}`), comments and
+/// string literals skipped.
+fn matching(text: &[u8], open: usize) -> Option<usize> {
+    let (opening, closing) = if text[open] == b'(' { (b'(', b')') } else { (b'{', b'}') };
+    let mut depth = 0usize;
+    let mut at = open;
+    while at < text.len() {
+        if let Some(next) = skip_comment(text, at) {
+            at = next;
+            continue;
+        }
+        if text[at] == b'"' {
+            at = skip_string(text, at);
+            continue;
+        }
+        if text[at] == opening {
+            depth += 1;
+        } else if text[at] == closing {
+            depth -= 1;
+            if depth == 0 {
+                return Some(at);
+            }
+        }
+        at += 1;
+    }
+    None
+}
+
+fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.' | b'@')
+}
+
+/// The function definitions of a module (`.entry` and `.func` with a body), in order. Declarations
+/// (ended by `;`) are skipped, and so is anything else in braces at module level (initialisers).
+pub fn functions(text: &[u8]) -> Vec<Function> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        if let Some(next) = skip_comment(text, at) {
+            at = next;
+            continue;
+        }
+        if text[at] == b'"' {
+            at = skip_string(text, at);
+            continue;
+        }
+        if text[at] == b'{' {
+            at = matching(text, at).map_or(text.len(), |close| close + 1);
+            continue;
+        }
+        let keyword = [&b".entry"[..], b".func"].into_iter().find(|k| {
+            text[at..].starts_with(k)
+                && (at == 0 || !is_name_byte(text[at - 1]))
+                && text.get(at + k.len()).is_some_and(|b| b.is_ascii_whitespace())
+        });
+        let Some(keyword) = keyword else {
+            at += 1;
+            continue;
+        };
+        // `.func (return value) name (parameters)`: the name is the first word outside parentheses.
+        let mut cursor = at + keyword.len();
+        let mut name = None;
+        let mut body = None;
+        while cursor < text.len() {
+            if let Some(next) = skip_comment(text, cursor) {
+                cursor = next;
+            } else if text[cursor] == b'"' {
+                cursor = skip_string(text, cursor);
+            } else if text[cursor] == b'(' {
+                cursor = matching(text, cursor).map_or(text.len(), |close| close + 1);
+            } else if text[cursor] == b';' {
+                break; // a declaration
+            } else if text[cursor] == b'{' {
+                body = matching(text, cursor).map(|close| cursor..close + 1);
+                break;
+            } else if name.is_none() && is_name_byte(text[cursor]) && text[cursor] != b'.' {
+                let end = cursor + text[cursor..].iter().take_while(|&&b| is_name_byte(b)).count();
+                name = Some(cursor..end);
+                cursor = end;
+            } else {
+                cursor += 1;
+            }
+        }
+        match (name, body) {
+            (Some(name), Some(body)) => {
+                at = body.end;
+                found.push(Function {
+                    name,
+                    body,
+                    entry: keyword == b".entry",
+                });
+            }
+            _ => at = cursor.max(at + 1),
+        }
+    }
+    found
+}
+
+const TANH: &[u8] = b"tanh.approx.f32";
+
+/// Width of the addresses of a module, from its `.address_size` directive (32 without one).
+fn address_bits(text: &[u8]) -> u32 {
+    directive(text, b".address_size")
+        .and_then(|arg| {
+            let start = arg.start + text[arg.clone()].iter().take_while(|b| b.is_ascii_whitespace()).count();
+            number(&text[start..arg.end])
+        })
+        .map_or(32, |(bits, _)| bits)
+}
+
+/// A function that could not be rewritten and whose body was replaced by a trap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trapped {
+    pub function: String,
+    /// The instruction that has no Volta sequence, and why.
+    pub reason: String,
+}
+
+/// What `lower_to_volta` changed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Lowering {
+    /// Functions whose body was replaced by a trap.
+    pub trapped: Vec<Trapped>,
+    /// Number of `tanh` instructions expanded.
+    pub tanh_expanded: usize,
+    /// Number of tensor-core instructions replaced by Volta sequences.
+    pub tensor_rewritten: usize,
+    /// Number of other instructions replaced (asynchronous copies, conversions to packed floats).
+    pub other_rewritten: usize,
+    /// Kernels that must not be given to the program: they are, or call, a function made to trap.
+    pub refused: Vec<Refused>,
+    /// Kernels that run emulated instructions, in their own body or in the functions they call. A
+    /// refused kernel is not among them.
+    pub emulated: Vec<Emulated>,
+}
+
+/// What became of a function that `lower_to_volta` changed.
+struct Changed {
+    name: String,
+    entry: bool,
+    /// Why it traps, if it does.
+    trapped: Option<String>,
+    counts: EmulatedCounts,
+}
+
+/// Fill the lists by kernel of `lowering` from what became of the functions. The call graph of the
+/// module is only looked at when a device function is among them: most programs have everything inlined
+/// in their kernels.
+fn by_kernel(text: &[u8], changed: &[Changed], lowering: &mut Lowering) {
+    let mut kernel = |name: &str, reached: &[&Changed]| {
+        if let Some((function, reason)) = reached
+            .iter()
+            .find_map(|function| Some((function, function.trapped.as_ref()?)))
+        {
+            lowering.refused.push(Refused {
+                kernel: name.to_string(),
+                function: function.name.clone(),
+                reason: reason.clone(),
+            });
+            return;
+        }
+        let mut counts = EmulatedCounts::default();
+        for function in reached {
+            counts.add(&function.counts);
+        }
+        if counts.any() {
+            lowering.emulated.push(Emulated {
+                kernel: name.to_string(),
+                counts,
+            });
+        }
+    };
+    if changed.iter().all(|function| function.entry) {
+        for function in changed {
+            kernel(&function.name, &[function]);
+        }
+        return;
+    }
+    let by_name: std::collections::HashMap<&str, &Changed> = changed
+        .iter()
+        .map(|function| (function.name.as_str(), function))
+        .collect();
+    for (name, reached) in deps::ModuleInfo::analyse(text).reach() {
+        let reached: Vec<&Changed> = reached
+            .iter()
+            .filter_map(|function| by_name.get(function.as_str()).copied())
+            .collect();
+        kernel(name, &reached);
+    }
+}
+
+/// The names beginning with `%` that the module has outside the bodies of its functions,
+/// comments and strings apart.
+fn outside_names(text: &[u8], functions: &[Function]) -> Vec<String> {
+    let mut between = Vec::new();
+    let mut at = 0;
+    for function in functions {
+        between.extend(scan::without_comments(&text[at..function.body.start]));
+        between.push(b' ');
+        at = function.body.end;
+    }
+    between.extend(scan::without_comments(&text[at..]));
+    lower::outside_names(&String::from_utf8_lossy(&between))
+}
+
+/// Make a module that uses Turing-only instructions compilable for Volta.
+///
+/// - `tanh.approx.f32` is replaced by an equivalent sequence.
+/// - The tensor-core instructions Volta lacks (`ldmatrix`, `movmatrix`, the Turing `mma` shapes) are
+///   replaced by sequences built on Volta's `mma.m8n8k4`, `dp4a` and warp shuffles (see `lower`).
+/// - A function that uses a form without such a sequence keeps its signature and gets a body that
+///   traps: launched, it stops with an error instead of computing something else. So does a kernel
+///   that asks for a cluster of blocks; the directives that ask for it are removed.
+/// - The kernels that are, or call, a function made to trap are listed (`Lowering::refused`): they are
+///   not to be given to the program.
+///
+/// The header is not touched (`retarget` does that).
+pub fn lower_to_volta(text: &[u8]) -> (Vec<u8>, Lowering) {
+    lower_to_volta_with(text, lower::Options::default())
+}
+
+/// `lower_to_volta` with what the rewriting may take for granted about the program.
+pub fn lower_to_volta_with(text: &[u8], options: lower::Options) -> (Vec<u8>, Lowering) {
+    let mut out = Vec::with_capacity(text.len() + text.len() / 2);
+    let mut lowering = Lowering::default();
+    let address_bits = address_bits(text);
+    let mut copied = 0;
+    let mut changed = Vec::new();
+    let functions = functions(text);
+    // What the module names outside the bodies (`lower::body_in`), looked for at the first
+    // function that is lowered.
+    let mut outside: Option<Vec<String>> = None;
+    for function in &functions {
+        let body = &text[function.body.clone()];
+        let cluster = directive_lines(text, function, CLUSTER_DIRECTIVES);
+        if cluster.is_empty() && !needs_lowering(body) {
+            continue;
+        }
+        for line in &cluster {
+            out.extend_from_slice(&text[copied..line.start]);
+            copied = line.end;
+        }
+        out.extend_from_slice(&text[copied..function.body.start]);
+        copied = function.body.end;
+        let name = String::from_utf8_lossy(&text[function.name.clone()]).into_owned();
+        let lowered = if cluster.is_empty() {
+            let outside = outside.get_or_insert_with(|| outside_names(text, &functions));
+            std::str::from_utf8(body)
+                .map_err(|_| lower::Unsupported("not text".to_string()))
+                .and_then(|body| lower::body_in(body, outside, address_bits, options))
+        } else {
+            Err(lower::Unsupported(
+                "the kernel asks for a cluster of blocks, which this GPU does not have".to_string(),
+            ))
+        };
+        match lowered {
+            Ok((new_body, counts)) => {
+                out.extend_from_slice(new_body.as_bytes());
+                lowering.tanh_expanded += counts.tanh;
+                lowering.tensor_rewritten += counts.tensor;
+                lowering.other_rewritten += counts.other;
+                changed.push(Changed {
+                    name,
+                    entry: function.entry,
+                    trapped: None,
+                    counts: count_emulated(body),
+                });
+            }
+            Err(lower::Unsupported(reason)) => {
+                out.extend_from_slice(TRAP_BODY);
+                lowering.trapped.push(Trapped {
+                    function: name.clone(),
+                    reason: reason.clone(),
+                });
+                changed.push(Changed {
+                    name,
+                    entry: function.entry,
+                    trapped: Some(reason),
+                    counts: EmulatedCounts::default(),
+                });
+            }
+        }
+    }
+    out.extend_from_slice(&text[copied..]);
+    changed.retain(|function| function.trapped.is_some() || function.counts.any());
+    if !changed.is_empty() {
+        by_kernel(text, &changed, &mut lowering);
+    }
+    (out, lowering)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NVCC_13_5: &str = "//\n// Generated by NVIDIA NVVM Compiler\n//\n\n.version 9.5\n.target sm_75\n.address_size 64\n\n.visible .entry saxpy(\n";
+
+    #[test]
+    fn reads_the_header() {
+        assert_eq!(
+            header(NVCC_13_5.as_bytes()),
+            Some(Header {
+                version: (9, 5),
+                target: 75
+            })
+        );
+        assert_eq!(
+            header(b".version 8.8\n.target sm_100a, debug\n"),
+            Some(Header {
+                version: (8, 8),
+                target: 100
+            })
+        );
+        assert_eq!(header(b"int main() { return 0; }\n"), None);
+    }
+
+    #[test]
+    fn lowers_version_and_target_in_place() {
+        let mut text = NVCC_13_5.as_bytes().to_vec();
+        assert_eq!(retarget(&mut text, (9, 0), 70), 2);
+        assert_eq!(text.len(), NVCC_13_5.len());
+        assert_eq!(
+            header(&text),
+            Some(Header {
+                version: (9, 0),
+                target: 70
+            })
+        );
+        assert!(
+            String::from_utf8(text)
+                .unwrap()
+                .contains(".version 9.0\n.target sm_70\n.address_size 64")
+        );
+    }
+
+    #[test]
+    fn keeps_what_is_already_low_enough() {
+        let original = b".version 8.7\n.target sm_70\n.address_size 64\n";
+        let mut text = original.to_vec();
+        assert_eq!(retarget(&mut text, (9, 0), 70), 0);
+        assert_eq!(text, original);
+    }
+
+    #[test]
+    fn pads_longer_fields_with_spaces() {
+        let mut text = b".version 10.12\n.target sm_100a, debug\n.address_size 64\n".to_vec();
+        assert_eq!(retarget(&mut text, (9, 0), 70), 2);
+        assert_eq!(text, b".version 9.0  \n.target sm_70  , debug\n.address_size 64\n");
+    }
+
+    #[test]
+    fn binary_data_has_no_header() {
+        let mut bytes = vec![0x50, 0xed, 0x55, 0xba, 1, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        bytes.extend_from_slice(b"\n.version 9.0\n.target sm_75\n");
+        assert_eq!(header(&bytes), None);
+    }
+
+    #[test]
+    fn ignores_directives_inside_the_body() {
+        let text = b".address_size 64\n.visible .entry k()\n{\n.version 9.9\n}\n";
+        assert_eq!(header(text), None);
+    }
+
+    #[test]
+    fn spots_turing_only_instructions() {
+        assert!(turing_only_features(NVCC_13_5.as_bytes()).is_empty());
+        let text = b"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r1}, [%r2];\nmma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 ...\n";
+        assert_eq!(turing_only_features(text), ["ldmatrix", "mma m16n8k8"]);
+        assert_eq!(turing_only_features(b"tanh.approx.f32 %f1, %f2;"), ["tanh"]);
+    }
+
+    const MODULE: &str = "\
+.version 9.5
+.target sm_75
+.address_size 64
+
+.extern .func (.param .b32 func_retval0) helper (.param .b32 a)
+;
+.global .align 4 .b8 table[4] = {1, 2, 3, 4};
+
+.entry plain(
+\t.param .u64 plain_param_0
+)
+{
+\t.reg .f32 %f<3>;
+\t{ cvt.rn.f16.f32 %rs1, %f1;}
+\ttanh.approx.f32 %f2, %f1;
+\tret;
+}
+// a comment with a brace {
+.visible .entry tensor(
+\t.param .u64 tensor_param_0
+)
+.maxntid 256, 1, 1
+{
+\tldmatrix.sync.aligned.m8n8.x4.b16 {%r1, %r2, %r3, %r4}, [%rd1];
+\tmma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%r5, %r6, %r7, %r8}, {%r1, %r2}, {%r3}, {%r5, %r6, %r7, %r8};
+\tret;
+}
+.func (.reg .b32 %ret) twice (.reg .b32 %x)
+{
+\tadd.s32 %ret, %x, %x;
+\tret;
+}
+";
+
+    #[test]
+    fn finds_function_definitions() {
+        let text = MODULE.as_bytes();
+        let names: Vec<&str> = functions(text)
+            .iter()
+            .map(|f| std::str::from_utf8(&text[f.name.clone()]).unwrap())
+            .collect();
+        assert_eq!(names, ["plain", "tensor", "twice"]);
+        for function in functions(text) {
+            let body = &text[function.body];
+            assert!(body.starts_with(b"{") && body.ends_with(b"}"));
+        }
+    }
+
+    #[test]
+    fn lowering_rewrites_tensor_functions_and_expands_tanh() {
+        let (lowered, lowering) = lower_to_volta(MODULE.as_bytes());
+        let lowered = String::from_utf8(lowered).unwrap();
+        assert_eq!(lowering.trapped, vec![]);
+        assert_eq!(lowering.tanh_expanded, 1);
+        assert_eq!(lowering.tensor_rewritten, 2);
+        assert_eq!(lowering.other_rewritten, 0);
+        // What the kernels have of emulated instructions.
+        let emulated: Vec<(&str, usize)> = lowering
+            .emulated
+            .iter()
+            .map(|kernel| (kernel.kernel.as_str(), kernel.counts.total()))
+            .collect();
+        assert_eq!(emulated, [("plain", 1), ("tensor", 2)]);
+        assert_eq!(lowering.refused, []);
+        assert!(turing_only_features(lowered.as_bytes()).is_empty());
+        // The rewritten function keeps its signature and directives, and computes with Volta's mma.
+        assert!(lowered.contains(".visible .entry tensor(\n\t.param .u64 tensor_param_0\n)\n.maxntid 256, 1, 1\n{\n"));
+        assert_eq!(
+            lowered
+                .matches("mma.sync.aligned.m8n8k4.col.row.f32.f16.f16.f32 ")
+                .count(),
+            2
+        );
+        assert_eq!(lowered.matches("ld.shared.u32 ").count(), 4);
+        // The other functions and the module-level statements are unchanged, apart from tanh.
+        assert!(lowered.contains("selp.f32 %f2, %f1, %vf_e, %vf_p;"));
+        assert!(lowered.contains("\t{ cvt.rn.f16.f32 %rs1, %f1;}\n"));
+        assert!(lowered.contains(".func (.reg .b32 %ret) twice (.reg .b32 %x)\n{\n\tadd.s32 %ret, %x, %x;\n\tret;\n}"));
+        assert!(lowered.contains(".global .align 4 .b8 table[4] = {1, 2, 3, 4};"));
+        // Functions are found again in the result.
+        assert_eq!(functions(lowered.as_bytes()).len(), 3);
+    }
+
+    #[test]
+    fn lowering_traps_functions_it_cannot_rewrite() {
+        let text = MODULE.replace(
+            "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%r5, %r6, %r7, %r8}, {%r1, %r2}, {%r3}, {%r5, %r6, %r7, %r8};",
+            "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%r5, %r6}, {%r1}, {%r3}, {%r5, %r6};",
+        );
+        let (lowered, lowering) = lower_to_volta(text.as_bytes());
+        let lowered = String::from_utf8(lowered).unwrap();
+        assert_eq!(lowering.tanh_expanded, 1);
+        assert_eq!(lowering.tensor_rewritten, 0);
+        assert_eq!(
+            lowering.trapped,
+            [Trapped {
+                function: "tensor".to_string(),
+                reason: "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32: no Volta sequence for this form".to_string()
+            }]
+        );
+        assert!(turing_only_features(lowered.as_bytes()).is_empty());
+        // The trapped function keeps its signature and directives.
+        assert!(lowered.contains(
+            ".visible .entry tensor(\n\t.param .u64 tensor_param_0\n)\n.maxntid 256, 1, 1\n{\n\ttrap;\n\tret;\n}"
+        ));
+        assert_eq!(functions(lowered.as_bytes()).len(), 3);
+    }
+
+    #[test]
+    fn a_brace_in_a_string_is_not_a_brace() {
+        // The path of a `.file` directive may hold a brace or two slashes: they open no block
+        // and start no comment, and the function after it is still found and rewritten.
+        let text = b".version 8.8\n.target sm_75\n.address_size 64\n.file 1 \"/tmp/{build//a.cu\"\n\
+                     .visible .entry k()\n{\n\t.reg .f32 %y;\n\ttanh.approx.f32 %y, 0f00000000;\n\tret;\n}\n";
+        let found = functions(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(&text[found[0].name.clone()], b"k");
+        let (out, lowering) = lower_to_volta(text);
+        assert_eq!(lowering.tanh_expanded, 1);
+        assert!(String::from_utf8_lossy(&out).contains(".file 1 \"/tmp/{build//a.cu\""));
+    }
+
+    #[test]
+    fn a_parameter_named_like_a_register_written_with_zeros_is_not_taken_for_it() {
+        // `[%d00]` is the parameter (the assembler looks for the address of `ld.param` among
+        // the parameters): written `[%d0]` it would not be. The function is trapped.
+        let text = "\
+.version 8.8
+.target sm_75
+.address_size 64
+
+.visible .entry k(
+\t.param .u64 out,
+\t.param .u32 %d00
+)
+{
+\t.reg .b32 %d<4>;
+\t.reg .f32 %y;
+\tld.param.u32 %d1, [%d00];
+\ttanh.approx.f32 %y, 0f00000000;
+\tret;
+}
+";
+        let (_, lowering) = lower_to_volta(text.as_bytes());
+        assert_eq!(lowering.trapped.len(), 1, "{lowering:?}");
+        assert!(
+            lowering.trapped[0]
+                .reason
+                .ends_with("where %d00 is named in another declaration too (a variable, a parameter or a label)"),
+            "{}",
+            lowering.trapped[0].reason
+        );
+        // (A comment or a string that has the name declares nothing.)
+        let commented = text
+            .replace(".param .u32 %d00", ".param .u32 n")
+            .replace(
+                "ld.param.u32 %d1, [%d00];",
+                "ld.param.u32 %d1, [n];\n\tadd.u32 %d1, %d1, %d00;",
+            )
+            .replace(
+                ".version 8.8",
+                "// %d00 is %d0 of the family\n/* and %d01 is %d1 */\n.version 8.8\n.file 1 \"%d02\"",
+            );
+        let (lowered, lowering) = lower_to_volta(commented.as_bytes());
+        assert!(lowering.trapped.is_empty(), "{lowering:?}");
+        assert!(String::from_utf8(lowered).unwrap().contains("add.u32 %d1, %d1, %d0;"));
+        // With the parameter under another name, `%d00` in the body can only be the register.
+        let text = text.replace(".param .u32 %d00", ".param .u32 n").replace(
+            "ld.param.u32 %d1, [%d00];",
+            "ld.param.u32 %d1, [n];\n\tadd.u32 %d1, %d1, %d00;",
+        );
+        let (lowered, lowering) = lower_to_volta(text.as_bytes());
+        assert!(lowering.trapped.is_empty(), "{lowering:?}");
+        assert!(String::from_utf8(lowered).unwrap().contains("add.u32 %d1, %d1, %d0;"));
+    }
+
+    #[test]
+    fn a_kernel_that_asks_for_a_cluster_of_blocks_is_trapped_without_its_directives() {
+        let text = "\
+.version 9.0
+.target sm_90
+.address_size 64
+
+.visible .entry alone(
+\t.param .u64 alone_param_0
+)
+.maxntid 256, 1, 1
+.minnctapersm 1
+.explicitcluster
+.reqnctapercluster 2, 1, 1
+{
+\tret;
+}
+.visible .entry plain()
+.maxntid 256, 1, 1
+{
+\tret;
+}
+";
+        let (lowered, lowering) = lower_to_volta(text.as_bytes());
+        let lowered = String::from_utf8(lowered).unwrap();
+        assert!(lowered.contains(
+            ".visible .entry alone(\n\t.param .u64 alone_param_0\n)\n.maxntid 256, 1, 1\n.minnctapersm 1\n{\n\ttrap;\n\tret;\n}"
+        ));
+        assert!(lowered.contains(".visible .entry plain()\n.maxntid 256, 1, 1\n{\n\tret;\n}"));
+        assert_eq!(lowering.trapped.len(), 1);
+        assert_eq!(
+            lowering.refused,
+            [Refused {
+                kernel: "alone".to_string(),
+                function: "alone".to_string(),
+                reason: "the kernel asks for a cluster of blocks, which this GPU does not have".to_string()
+            }]
+        );
+        assert_eq!(lowering.emulated, []);
+    }
+
+    #[test]
+    fn kernels_answer_for_the_functions_they_call() {
+        let text = "\
+.version 9.5
+.target sm_80
+.address_size 64
+
+.func (.reg .f32 %out) soft (.reg .f32 %x)
+{
+\ttanh.approx.f32 %out, %x;
+\tret;
+}
+.func hard ()
+{
+\tbarrier.cluster.arrive;
+\tret;
+}
+.func through ()
+{
+\tcall hard, ();
+\tret;
+}
+.entry uses_soft()
+{
+\t.reg .f32 %f<3>;
+\tmax.NaN.f32 %f1, %f1, %f2;
+\tcall (%f2), soft, (%f1);
+\tret;
+}
+.entry uses_hard()
+{
+\tcall through, ();
+\tret;
+}
+.entry uses_nothing()
+{
+\tret;
+}
+";
+        let (lowered, lowering) = lower_to_volta(text.as_bytes());
+        let lowered = String::from_utf8(lowered).unwrap();
+        assert!(lowered.contains(".func hard ()\n{\n\ttrap;\n\tret;\n}"));
+        // The kernel that reaches the trap keeps its body: it is the lookup that refuses it.
+        assert!(lowered.contains(".entry uses_hard()\n{\n\tcall through, ();\n\tret;\n}"));
+        assert_eq!(
+            lowering.refused,
+            [Refused {
+                kernel: "uses_hard".to_string(),
+                function: "hard".to_string(),
+                reason: "barrier.cluster.arrive: no Volta sequence for this form".to_string()
+            }]
+        );
+        assert_eq!(
+            lowering.emulated,
+            [Emulated {
+                kernel: "uses_soft".to_string(),
+                counts: EmulatedCounts {
+                    tanh: 1,
+                    nan_minmax: 1,
+                    ..EmulatedCounts::default()
+                }
+            }]
+        );
+    }
+
+    #[test]
+    fn lowering_leaves_plain_modules_alone() {
+        let text = b".version 9.5\n.target sm_75\n.entry k()\n{\n\tret;\n}\n";
+        let (lowered, lowering) = lower_to_volta(text);
+        assert_eq!(lowered, text);
+        assert_eq!(lowering, Lowering::default());
+    }
+}

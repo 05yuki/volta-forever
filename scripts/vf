@@ -1,0 +1,802 @@
+#!/bin/sh
+# vf (also installed as volta-forever): run CUDA 13 programs on a Tesla V100
+#
+#   vf [OPTIONS] [--] COMMAND [ARGS...]   run COMMAND through the layer (also: vf run ...)
+#   vf env [OPTIONS]                      print the environment as export lines, for
+#                                         eval "$(vf env)" in sh, bash or zsh
+#   vf venv [--python PYTHON] DIR [-- OPTIONS-OF-VENV]
+#                                         make DIR a virtual environment of Python (or take
+#                                         one that is there) whose Pythons all run through
+#                                         the layer by themselves: pip, python, its scripts
+#   vf venv --off DIR                     take that out of DIR again
+#   vf fetch [--all | --only REGEX] [--to DIR]
+#                                         download the CUDA 12.9.2 libraries from NVIDIA
+#   vf doctor                             say what is there and what is missing
+#   vf version | help
+#
+#   vf inspect FILE...                    which GPU code a file carries
+#   vf extract FILE DIR [SM]              take the code out of its fat binaries
+#   vf adapt IN OUT                       what the layer gives the driver in place of IN
+#   vf translate IN OUT [MAP [REPORT]]    sm_75 machine code translated to sm_70
+#                                         (these four are the program vf-translate)
+#
+# Options of run, the prefix form and env:
+#   --cuda12 DIR   the directory of the CUDA 12.9.2 libraries (else $VF_CUDA12, then
+#                  cuda-12.9.2/lib of the installation, then /usr/local/cuda-12.9/lib64)
+#   --map FILE     substitutions of libraries of your own, which come before the launcher's
+#   --no-audit     do not set LD_AUDIT (the program finds all its libraries by the path)
+#
+# Environment:
+#   VF_CUDA12      the directory of the CUDA 12.9.2 libraries (--cuda12 comes first)
+#   VF_QUIET=1     no line when the CUDA 12.9.2 libraries are not found
+#   VF_VENV=0      a Python of an environment made by vf venv starts as it is, not through
+#                  the layer
+#   VF_AUDIT_MAP, VF_AUDIT_MAP_FILE
+#                  substitutions of your own: the first stay before the launcher's, the
+#                  file is read after them (--map gives a file priority)
+# A command named like one of these words: vf run COMMAND, or vf -- COMMAND.
+set -eu
+
+# --- find the installation directory, following symlinks ---------------------------
+
+resolve_self() {
+    _self=$1
+    # Follow symlinks portably (POSIX sh, no readlink -f).
+    while [ -L "$_self" ] 2>/dev/null; do
+        _dir=$(cd "$(dirname "$_self")" && pwd)
+        _target=$(ls -l "$_self")
+        # Extract the target after " -> ".
+        _target=${_target#*" -> "}
+        case $_target in
+            /*) _self=$_target ;;
+            *)  _self=$_dir/$_target ;;
+        esac
+    done
+    cd "$(dirname "$_self")" && pwd
+}
+
+self_dir=$(resolve_self "$0")
+
+# Detect layout: archive (bin/vf with lib/ beside bin/) or source tree
+# (scripts/vf with dist/lib and dist/forward).
+case $(basename "$self_dir") in
+    bin)
+        # Archive layout: home is the parent of bin/.
+        home=$(cd "$self_dir/.." && pwd)
+        lib_dir=$home/lib
+        fwd_dir=$home/forward
+        report=$home/forward/REPORT.txt
+        version_file=$home/VERSION
+        scripts_dir=$home/scripts
+        tool=$home/bin/vf-translate
+        ;;
+    scripts)
+        # Source tree layout: home is the parent of scripts/.
+        home=$(cd "$self_dir/.." && pwd)
+        lib_dir=$home/dist/lib
+        fwd_dir=$home/dist/forward
+        report=$home/dist/forward/REPORT.txt
+        version_file=
+        scripts_dir=$home/scripts
+        tool=$home/dist/bin/vf-translate
+        ;;
+    *)
+        echo "vf: cannot determine installation layout from $self_dir" >&2
+        exit 2
+        ;;
+esac
+
+# --- version ---------------------------------------------------------------------
+
+get_version() {
+    if [ -n "$version_file" ] && [ -f "$version_file" ]; then
+        cat "$version_file"
+    elif [ -f "$home/Cargo.toml" ]; then
+        sed -n 's/^version = "\(.*\)"/\1/p' "$home/Cargo.toml" | head -1
+    else
+        echo "unknown"
+    fi
+}
+
+# --- find the CUDA 12.9.2 libraries, in order ----------------------------------
+
+find_cuda12() {
+    _cuda12_dir=${opt_cuda12:-${VF_CUDA12:-}}
+    if [ -n "$_cuda12_dir" ]; then
+        echo "$_cuda12_dir"
+        return
+    fi
+    # In the installation directory.
+    if [ -d "$home/cuda-12.9.2/lib" ]; then
+        echo "$home/cuda-12.9.2/lib"
+        return
+    fi
+    # In a source tree: where scripts/fetch-all.sh puts NVIDIA's toolkits.
+    if [ -f "$home/toolkits/cuda-12.9.2/lib/libcublas.so.12" ]; then
+        echo "$home/toolkits/cuda-12.9.2/lib"
+        return
+    fi
+    # System-installed CUDA 12.9.
+    if [ -f "/usr/local/cuda-12.9/lib64/libcublas.so.12" ]; then
+        echo "/usr/local/cuda-12.9/lib64"
+        return
+    fi
+    return 1
+}
+
+# --- build the audit map -------------------------------------------------------
+# For every forwarding library that has something to forward to, two entries:
+#   name=forwarder           (CUDA 13 name -> the forwarding library)
+#   target=cuda12/target     (CUDA 12 original -> the file in the cuda12 directory)
+# A forwarding library whose CUDA 12.9.2 library is not in the directory that was found
+# (`vf fetch` downloads cuBLAS alone unless it is told --all) is left out, and its name goes
+# to $_unserved: the program then keeps its own library of that name, whose kernels the layer
+# translates. In the map, a forwarding library with nothing behind it would stop the program
+# at its first call. When no directory was found at all, every forwarding library is in the
+# map (the loader may know where the CUDA 12.9.2 libraries are), and setup_env says so.
+# The map is passed inline (VF_AUDIT_MAP) because:
+#   - no temporary file needed (no writable directory required);
+#   - the audit library reads VF_AUDIT_MAP before the map file, so user entries
+#     in VF_AUDIT_MAP keep priority;
+#   - the user's VF_AUDIT_MAP_FILE is kept as-is and read after.
+# Reads $_cuda12 (the directory, or empty). Sets $_launcher_map and $_unserved.
+
+build_map() {
+    _launcher_map=
+    _unserved=
+    [ -f "$report" ] || return 0
+    # Parse REPORT.txt: skip the first two header lines, then each line's
+    # first field is the forwarder name, last field is the target (serves).
+    # Stop at the "total" summary line.
+    _lno=0
+    while IFS= read -r _line; do
+        _lno=$((_lno + 1))
+        [ "$_lno" -le 2 ] && continue
+        # First word.
+        _fwd=
+        _target=
+        set -f
+        # shellcheck disable=SC2086
+        set -- $_line
+        set +f
+        _fwd=$1
+        case $_fwd in
+            total|'('*) break ;;
+        esac
+        # Last word.
+        eval '_target=${'$#'}'
+        # The forwarder must exist.
+        [ -f "$fwd_dir/$_fwd" ] || continue
+        if [ -n "$_cuda12" ] && [ ! -f "$_cuda12/$_target" ]; then
+            _unserved="$_unserved $_fwd"
+            continue
+        fi
+        # Entry: CUDA 13 name -> forwarder.
+        _entry="$_fwd=$fwd_dir/$_fwd"
+        if [ -n "$_launcher_map" ]; then _launcher_map="$_launcher_map:$_entry"; else _launcher_map=$_entry; fi
+        # Entry: CUDA 12 target -> the file in the cuda12 directory.
+        if [ -n "$_cuda12" ]; then
+            _launcher_map="$_launcher_map:$_target=$_cuda12/$_target"
+        fi
+    done < "$report"
+}
+
+# --- prepend to a colon-separated list without duplicating entries ---------------
+
+path_prepend() {
+    # $1 = new components (colon-separated), $2 = old value.
+    _new_parts=$1 _old=$2 _result=
+    # Build the result from new parts, then add old parts not already present.
+    _oifs=$IFS; IFS=:
+    # shellcheck disable=SC2086
+    set -- $_new_parts
+    IFS=$_oifs
+    for _p do
+        case ":${_result}:" in
+            *":$_p:"*) ;;
+            *) if [ -n "$_result" ]; then _result=$_result:$_p; else _result=$_p; fi ;;
+        esac
+    done
+    _oifs=$IFS; IFS=:
+    # shellcheck disable=SC2086
+    set -- $_old
+    IFS=$_oifs
+    for _p do
+        [ -z "$_p" ] && continue
+        case ":${_result}:" in
+            *":$_p:"*) ;;
+            *) _result=$_result:$_p ;;
+        esac
+    done
+    echo "$_result"
+}
+
+# --- build environment for run/env, as variable assignments ---------------------
+
+setup_env() {
+    _cuda12=$(find_cuda12 2>/dev/null) || _cuda12=
+    build_map
+
+    _audit=$lib_dir/libvf_audit.so
+    _with_audit=0
+    if [ "$opt_no_audit" = 0 ] && [ -f "$_audit" ]; then
+        _with_audit=1
+    fi
+
+    # The library path: the layer's own libraries, the forwarding libraries, the CUDA 12.9.2
+    # libraries, then what was there. The directory of the forwarding libraries is left out
+    # when some of them have nothing to forward to and the audit library is there to give
+    # the program the others by their names (the map has them): on the path, one with nothing
+    # behind it would be found by its name in place of the program's own library.
+    _ldpath_new=$lib_dir
+    if [ -z "$_unserved" ] || [ "$_with_audit" = 0 ]; then
+        _ldpath_new=$_ldpath_new:$fwd_dir
+    fi
+    [ -n "$_cuda12" ] && _ldpath_new=$_ldpath_new:$_cuda12
+    _ldpath=$(path_prepend "$_ldpath_new" "${LD_LIBRARY_PATH:-}")
+
+    # (The marker is the version alone, as the library's volta_forever_version() gives it.)
+    _version=$(get_version)
+    _version=${_version%% *}
+
+    # The map: launcher entries, then user's existing VF_AUDIT_MAP (the audit
+    # library reads VF_AUDIT_MAP first, so the user's entries that are already
+    # in it keep priority; we also read a user --map file, which goes before ours).
+    _user_map=
+    if [ -n "$opt_map_file" ]; then
+        if [ ! -f "$opt_map_file" ] || [ ! -r "$opt_map_file" ]; then
+            echo "vf: --map: $opt_map_file is not a file that can be read" >&2
+            exit 2
+        fi
+        # The entries of the file, read as the audit library reads a file of its own (they go
+        # into VF_AUDIT_MAP, because the library reads its file after the variable, and these
+        # come before the launcher's): a line is name=replacement, with the white space around
+        # each taken off; an empty line, or one that starts with #, is none; a replacement that
+        # is not an absolute path is in the directory of the file; an empty one stays empty
+        # (the library is then not found). The last line counts without its end of line.
+        _map_dir=$(cd "$(dirname "$opt_map_file")" && pwd) || exit 2
+        while IFS= read -r _mline || [ -n "$_mline" ]; do
+            _mline=$(printf '%s\n' "$_mline" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            case $_mline in
+                ''|'#'*) continue ;;
+                *=*) ;;
+                *) continue ;;
+            esac
+            _mname=$(printf '%s\n' "${_mline%%=*}" | sed 's/[[:space:]]*$//')
+            _mrepl=$(printf '%s\n' "${_mline#*=}" | sed 's/^[[:space:]]*//')
+            case $_mrepl in
+                ''|/*) ;;
+                *) _mrepl=$_map_dir/$_mrepl ;;
+            esac
+            case $_mname$_mrepl in
+                *:*)
+                    echo "vf: --map: $opt_map_file has a ':' in the entry of $_mname, which the launcher cannot pass on; name the file in VF_AUDIT_MAP_FILE instead" >&2
+                    exit 2 ;;
+            esac
+            _mline=$_mname=$_mrepl
+            if [ -n "$_user_map" ]; then _user_map="$_user_map:$_mline"; else _user_map=$_mline; fi
+        done < "$opt_map_file"
+    fi
+    # Priority: user's VF_AUDIT_MAP (already in the env), then --map file, then launcher's.
+    _full_map=
+    if [ -n "${VF_AUDIT_MAP:-}" ]; then
+        _full_map=${VF_AUDIT_MAP}
+    fi
+    if [ -n "$_user_map" ]; then
+        if [ -n "$_full_map" ]; then _full_map="$_full_map:$_user_map"; else _full_map=$_user_map; fi
+    fi
+    if [ -n "$_launcher_map" ]; then
+        if [ -n "$_full_map" ]; then _full_map="$_full_map:$_launcher_map"; else _full_map=$_launcher_map; fi
+    fi
+
+    if [ "${VF_QUIET:-0}" != 1 ]; then
+        if [ -z "$_cuda12" ]; then
+            echo "vf: CUDA 12.9.2 libraries not found; programs that use cuBLAS and the like will not find them. Run vf fetch to download them." >&2
+        elif [ -n "$_unserved" ] && [ "$_with_audit" = 0 ]; then
+            echo "vf: without the audit library the forwarding libraries are found by their names, and these have no CUDA 12.9.2 library in $_cuda12 to forward to:$_unserved. A program that calls one of them stops there; vf fetch --all downloads what they need." >&2
+        fi
+    fi
+}
+
+# --- subcommand: env ------------------------------------------------------------
+
+# A value as a word that eval reads back as it is, whatever it holds: in single quotes, a
+# single quote inside written '\''.
+quoted() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+cmd_env() {
+    setup_env
+    # Only what the launcher sets: VF_* passes through untouched.
+    printf 'export LD_LIBRARY_PATH=%s\n' "$(quoted "$_ldpath")"
+    if [ "$_with_audit" = 1 ]; then
+        printf 'export LD_AUDIT=%s\n' "$(quoted "$_audit")"
+        [ -n "$_full_map" ] && printf 'export VF_AUDIT_MAP=%s\n' "$(quoted "$_full_map")"
+    fi
+    printf 'export VOLTA_FOREVER=%s\n' "$(quoted "$_version")"
+    printf 'export VOLTA_FOREVER_HOME=%s\n' "$(quoted "$home")"
+}
+
+# --- subcommand: run (prefix form) ---------------------------------------------
+
+cmd_run() {
+    setup_env
+    export LD_LIBRARY_PATH="$_ldpath"
+    if [ "$_with_audit" = 1 ]; then
+        export LD_AUDIT="$_audit"
+        [ -n "$_full_map" ] && export VF_AUDIT_MAP="$_full_map"
+    fi
+    export VOLTA_FOREVER="$_version"
+    export VOLTA_FOREVER_HOME="$home"
+    exec "$@"
+}
+
+# --- subcommand: fetch ----------------------------------------------------------
+
+cmd_fetch() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "vf: fetch needs python3, which is not in PATH" >&2
+        exit 2
+    fi
+    _fetch_script=$scripts_dir/fetch-redist.py
+    if [ ! -f "$_fetch_script" ]; then
+        echo "vf: $scripts_dir/fetch-redist.py not found" >&2
+        exit 2
+    fi
+    _base_url=https://developer.download.nvidia.com/compute/cuda/redist
+    _manifest=https://developer.download.nvidia.com/compute/cuda/redist/redistrib_12.9.2.json
+    _dl_dir=${opt_fetch_to:-$home/cuda-12.9.2}/dl
+    _tree_dir=${opt_fetch_to:-$home/cuda-12.9.2}
+
+    if [ "$opt_fetch_all" = 1 ]; then
+        _only='^(libcublas|libcufft|libcusolver|libcusparse|libcurand|libnpp|libnvjpeg|cuda_nvrtc|libnvjitlink)$'
+    else
+        # Default: what PyTorch and llama.cpp need (the other libraries of a program are its
+        # own, translated, until their CUDA 12.9.2 builds are there).
+        _only='^(libcublas|libnvjitlink)$'
+    fi
+    if [ -n "$opt_fetch_only" ]; then
+        _only=$opt_fetch_only
+    fi
+    # The shared libraries and NVIDIA's licence alone (no headers, no static libraries), and
+    # each archive removed once it is unpacked.
+    exec python3 "$_fetch_script" "$_base_url" "$_manifest" "$_dl_dir" "$_tree_dir" \
+        --runtime --discard --only "$_only"
+}
+
+# --- subcommand: doctor ---------------------------------------------------------
+
+cmd_doctor() {
+    _ok=1
+
+    # Layer files.
+    for _f in "$lib_dir/libcuda.so.1" "$lib_dir/libnvJitLink.so.13" "$lib_dir/libvf_audit.so"; do
+        if [ -f "$_f" ]; then
+            echo "ok    $(basename "$_f")"
+        else
+            echo "MISSING $(basename "$_f") ($lib_dir)"
+            _ok=0
+        fi
+    done
+
+    # Forwarding libraries.
+    _fwd_count=0
+    if [ -d "$fwd_dir" ]; then
+        for _f in "$fwd_dir"/*.so.*; do
+            [ -f "$_f" ] || continue
+            case $(basename "$_f") in
+                REPORT.txt) continue ;;
+            esac
+            _fwd_count=$((_fwd_count + 1))
+        done
+    fi
+    if [ "$_fwd_count" -gt 0 ]; then
+        echo "ok    $_fwd_count forwarding libraries in $fwd_dir"
+    else
+        echo "MISSING forwarding libraries ($fwd_dir)"
+        _ok=0
+    fi
+
+    # GPUs.
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        _smi=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null) || _smi=
+        if [ -n "$_smi" ]; then
+            echo "$_smi" | while IFS= read -r _name; do
+                echo "ok    GPU: $_name"
+            done
+            # (The Volta cards: Tesla V100 and V100S, Titan V, Quadro GV100. Run on the first.)
+            case $_smi in
+                *V100*) ;;
+                *"TITAN V"*|*"Titan V"*) echo "NOTICE a Volta card other than the Tesla V100: not tried" ;;
+                *) echo "NOTICE no Volta GPU found" ;;
+            esac
+        else
+            echo "NOTICE nvidia-smi found but returned no GPU"
+        fi
+    else
+        echo "NOTICE nvidia-smi not found (cannot check GPUs)"
+    fi
+
+    # Driver version.
+    if [ -f /sys/module/nvidia/version ]; then
+        _drv=$(cat /sys/module/nvidia/version)
+        if [ "$_drv" = "580.178.04" ]; then
+            echo "ok    driver $_drv (tested)"
+        else
+            echo "NOTICE driver $_drv (tested: 580.178.04)"
+        fi
+    elif command -v nvidia-smi >/dev/null 2>&1; then
+        _drv=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+        if [ -n "$_drv" ]; then
+            if [ "$_drv" = "580.178.04" ]; then
+                echo "ok    driver $_drv (tested)"
+            else
+                echo "NOTICE driver $_drv (tested: 580.178.04)"
+            fi
+        else
+            echo "NOTICE cannot determine driver version"
+        fi
+    else
+        echo "NOTICE cannot determine driver version"
+    fi
+
+    # glibc.
+    _glibc=
+    if command -v ldd >/dev/null 2>&1; then
+        _glibc=$(ldd --version 2>&1 | head -1 | sed -n 's/.* \([0-9][0-9]*\.[0-9][0-9]*\)$/\1/p')
+    fi
+    if [ -n "$_glibc" ]; then
+        _major=$(echo "$_glibc" | cut -d. -f1)
+        _minor=$(echo "$_glibc" | cut -d. -f2)
+        if [ "$_major" -gt 2 ] 2>/dev/null || { [ "$_major" -eq 2 ] && [ "$_minor" -ge 34 ]; }; then
+            echo "ok    glibc $_glibc"
+        else
+            echo "MISSING glibc >= 2.34 (found $_glibc)"
+            _ok=0
+        fi
+    else
+        echo "NOTICE cannot determine glibc version"
+    fi
+
+    # CUDA 12.9.2 libraries.
+    opt_no_audit=0
+    opt_map_file=
+    setup_env 2>/dev/null
+    if [ -n "$_cuda12" ]; then
+        echo "ok    CUDA 12.9.2 libraries in $_cuda12"
+        # The forwarding libraries that have their CUDA 12.9.2 library there.
+        _oifs=$IFS; IFS=:
+        # shellcheck disable=SC2086
+        set -- $_launcher_map
+        IFS=$_oifs
+        for _entry do
+            case $_entry in
+                *"=$fwd_dir/"*) _fwd=${_entry%%=*} ;;
+                *) echo "ok    $_fwd forwards to ${_entry%%=*} (found)" ;;
+            esac
+        done
+        # Those that have not. cuBLAS is the one that a program cannot do without: not all
+        # the kernels of CUDA 13's own cuBLAS can be translated. The others are the program's
+        # own libraries, translated, until their CUDA 12.9.2 builds are there.
+        _others=
+        _others_count=0
+        for _fwd in $_unserved; do
+            case $_fwd in
+                libcublas.so.*|libcublasLt.so.*)
+                    echo "MISSING the CUDA 12.9.2 library that $_fwd forwards to (not in $_cuda12; run vf fetch)"
+                    _ok=0 ;;
+                *)
+                    _others="$_others $_fwd"
+                    _others_count=$((_others_count + 1)) ;;
+            esac
+        done
+        if [ "$_others_count" -gt 0 ]; then
+            echo "NOTICE $_others_count forwarding libraries have no CUDA 12.9.2 library there to forward to:$_others"
+            echo "       a program keeps its own libraries of these names, and the layer translates their kernels; vf fetch --all downloads the CUDA 12.9.2 builds"
+        fi
+    else
+        echo "MISSING CUDA 12.9.2 libraries (run vf fetch)"
+        _ok=0
+    fi
+
+    # Environment that run would set.
+    echo "ok    LD_LIBRARY_PATH would be: $_ldpath"
+    if [ -f "$_audit" ]; then
+        echo "ok    LD_AUDIT would be: $_audit"
+    fi
+
+    if [ "$_ok" = 0 ]; then
+        exit 1
+    fi
+    exit 0
+}
+
+# --- subcommand: venv -----------------------------------------------------------
+# A virtual environment whose Pythons run through the layer by themselves: pip (and what it
+# compiles: a build that asks the GPU what to compile for is told what the program will be
+# told), python, the scripts of bin/, whether the environment is activated or not. Two files
+# in its site-packages do it: a .pth that Python reads when it starts, and the module that it
+# imports, which starts Python again through this launcher when the environment is not set
+# yet (the launcher's path is in a third file, read as it is: no quoting). Python 3.10 or
+# later: an earlier one cannot say how it was started.
+
+venv_files="volta_forever.pth volta_forever_venv.py volta_forever_venv.path"
+
+cmd_venv() {
+    _dir=$1
+    shift
+    if [ ! -x "$_dir/bin/python" ]; then
+        if [ "$opt_venv_off" = 1 ]; then
+            echo "vf: $_dir is not a virtual environment (no bin/python)" >&2
+            exit 2
+        fi
+        if ! command -v "$opt_venv_python" >/dev/null 2>&1; then
+            echo "vf: venv needs $opt_venv_python, which is not in PATH (--python names another)" >&2
+            exit 2
+        fi
+        if [ -d "$_dir" ] && [ -n "$(ls -A "$_dir" 2>/dev/null)" ]; then
+            echo "vf: $_dir is there, is not empty and is not a virtual environment: nothing is changed" >&2
+            exit 2
+        fi
+        "$opt_venv_python" -m venv "$@" "$_dir" || exit $?
+    elif [ $# -gt 0 ]; then
+        echo "vf: $_dir is a virtual environment already: the options after -- are for making one" >&2
+        exit 2
+    fi
+    # (Not the Python of the system, nor any other that is not a virtual environment: every
+    # program in Python of the machine would go through the layer.)
+    if [ ! -f "$_dir/pyvenv.cfg" ]; then
+        echo "vf: $_dir is not a virtual environment (no pyvenv.cfg): nothing is changed" >&2
+        exit 2
+    fi
+    # (Asked of the environment's own Python, with the hook off if it is there already. And
+    # nothing is written outside the environment, whatever that Python answers.)
+    _site=$(VF_VENV=0 "$_dir/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))') || exit 2
+    _inside=$(cd "$_dir" 2>/dev/null && pwd -P) || _inside=
+    _there=$(cd "$_site" 2>/dev/null && pwd -P) || _there=
+    case $_there/ in
+        "$_inside"/?*) ;;
+        *)  echo "vf: the site-packages of $_dir was not found inside it (${_site:-nothing}): nothing is changed" >&2
+            exit 2 ;;
+    esac
+    if [ -z "$_inside" ]; then
+        echo "vf: $_dir cannot be entered" >&2
+        exit 2
+    fi
+    if [ "$opt_venv_off" = 1 ]; then
+        for _f in $venv_files; do rm -f "$_site/$_f"; done
+        rm -f "$_site"/__pycache__/volta_forever_venv.*.pyc
+        echo "vf: the Pythons of $_dir no longer run through the layer" >&2
+        return 0
+    fi
+    if ! VF_VENV=0 "$_dir/bin/python" -c 'import sys; sys.exit(0 if hasattr(sys, "orig_argv") else 3)'; then
+        echo "vf: the Python of $_dir is older than 3.10: it cannot be started again through the layer. Put vf in front of its commands." >&2
+        exit 2
+    fi
+    printf '%s\n' "$self_dir/vf" >"$_site/volta_forever_venv.path"
+    cat >"$_site/volta_forever_venv.py" <<'HOOK'
+"""Put here by `vf venv`: every Python of this environment runs through the
+launcher of volta-forever, which sets the environment (the libraries of the layer) and starts
+Python again as it was started. Nothing is done when that environment is set already, when
+VF_VENV=0, or when the launcher is no longer where the file beside this one says.
+`vf venv --off DIR` takes this out."""
+import os
+import sys
+
+
+def _through_the_launcher():
+    if "VOLTA_FOREVER" in os.environ or os.environ.get("VF_VENV") == "0":
+        return
+    started = getattr(sys, "orig_argv", None)
+    if not started or not sys.executable:
+        return
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "volta_forever_venv.path")) as f:
+            launcher = f.readline().rstrip("\n")
+    except OSError:
+        return
+    if not launcher or not os.access(launcher, os.X_OK):
+        return
+    # (Once: whatever the launcher does, this is not tried a second time.)
+    os.environ["VF_VENV"] = "0"
+    os.execv(launcher, [launcher, "--", sys.executable] + started[1:])
+
+
+_through_the_launcher()
+HOOK
+    printf '%s\n' 'import volta_forever_venv' >"$_site/volta_forever.pth"
+    echo "vf: the Pythons of $_dir run through the layer: $_dir/bin/python, $_dir/bin/pip and what pip installs there (VF_VENV=0 in front of a command for one that does not)" >&2
+}
+
+# --- help -----------------------------------------------------------------------
+
+usage() {
+    cat <<'USAGE'
+vf (also installed as volta-forever): run CUDA 13 programs on a Tesla V100
+
+  vf [OPTIONS] [--] COMMAND [ARGS...]   run COMMAND through the layer (also: vf run ...)
+  vf env [OPTIONS]                      print the environment as export lines, for
+                                        eval "$(vf env)" in sh, bash or zsh
+  vf venv [--python PYTHON] DIR [-- OPTIONS-OF-VENV]
+                                        make DIR a virtual environment of Python (or take
+                                        one that is there) whose Pythons all run through
+                                        the layer by themselves: pip, python, its scripts
+  vf venv --off DIR                     take that out of DIR again
+  vf fetch [--all | --only REGEX] [--to DIR]
+                                        download the CUDA 12.9.2 libraries from NVIDIA
+  vf doctor                             say what is there and what is missing
+  vf version | help
+
+  vf inspect FILE...                    which GPU code a file carries
+  vf extract FILE DIR [SM]              take the code out of its fat binaries
+  vf adapt IN OUT                       what the layer gives the driver in place of IN
+  vf translate IN OUT [MAP [REPORT]]    sm_75 machine code translated to sm_70
+                                        (these four are the program vf-translate)
+
+Options of run, the prefix form and env:
+  --cuda12 DIR   the directory of the CUDA 12.9.2 libraries (else $VF_CUDA12, then
+                 cuda-12.9.2/lib of the installation, then /usr/local/cuda-12.9/lib64)
+  --map FILE     substitutions of libraries of your own, which come before the launcher's
+  --no-audit     do not set LD_AUDIT (the program finds all its libraries by the path)
+
+Environment:
+  VF_CUDA12      the directory of the CUDA 12.9.2 libraries (--cuda12 comes first)
+  VF_QUIET=1     no line when the CUDA 12.9.2 libraries are not found
+  VF_VENV=0      a Python of an environment made by vf venv starts as it is, not through
+                 the layer
+  VF_AUDIT_MAP, VF_AUDIT_MAP_FILE
+                 substitutions of your own: the first stay before the launcher's, the
+                 file is read after them (--map gives a file priority)
+A command named like one of these words: vf run COMMAND, or vf -- COMMAND.
+USAGE
+}
+
+# --- argument parsing ------------------------------------------------------------
+
+opt_no_audit=0
+opt_map_file=
+opt_cuda12=
+opt_fetch_all=0
+opt_fetch_only=
+opt_fetch_to=
+opt_venv_python=python3
+opt_venv_off=0
+subcmd=
+
+# No arguments: help on stderr, exit 2.
+if [ $# -eq 0 ]; then
+    usage >&2
+    exit 2
+fi
+
+# First pass: detect the subcommand and options before it.
+while [ $# -gt 0 ]; do
+    case $1 in
+        run)
+            subcmd=run; shift; break ;;
+        env)
+            subcmd=env; shift; break ;;
+        venv)
+            subcmd=venv; shift; break ;;
+        inspect|extract|adapt|translate)
+            # The offline tool, which needs nothing of the environment.
+            if [ ! -x "$tool" ]; then
+                echo "vf: $1 is done by $tool, which is not there" >&2
+                exit 2
+            fi
+            exec "$tool" "$@" ;;
+        fetch)
+            subcmd=fetch; shift; break ;;
+        doctor)
+            subcmd=doctor; shift; break ;;
+        version)
+            subcmd=version; shift; break ;;
+        help|-h|--help)
+            usage; exit 0 ;;
+        --no-audit)
+            opt_no_audit=1; shift ;;
+        --map)
+            [ $# -ge 2 ] || { echo "vf: --map requires an argument" >&2; exit 2; }
+            opt_map_file=$2; shift 2 ;;
+        --cuda12)
+            [ $# -ge 2 ] || { echo "vf: --cuda12 requires an argument" >&2; exit 2; }
+            opt_cuda12=$2; shift 2 ;;
+        --)
+            # Prefix form: everything after -- is the command.
+            subcmd=run; shift; break ;;
+        -*)
+            echo "vf: unknown option: $1" >&2
+            echo "Try 'vf help'." >&2
+            exit 2
+            ;;
+        *)
+            # Prefix form: this is the command.
+            subcmd=run; break ;;
+    esac
+done
+
+# Parse subcommand-specific options.
+case $subcmd in
+    run)
+        while [ $# -gt 0 ]; do
+            case $1 in
+                --no-audit)  opt_no_audit=1; shift ;;
+                --map)       [ $# -ge 2 ] || { echo "vf: --map requires an argument" >&2; exit 2; }
+                             opt_map_file=$2; shift 2 ;;
+                --cuda12)    [ $# -ge 2 ] || { echo "vf: --cuda12 requires an argument" >&2; exit 2; }
+                             opt_cuda12=$2; shift 2 ;;
+                --)          shift; break ;;
+                *)           break ;;
+            esac
+        done
+        if [ $# -eq 0 ]; then
+            echo "vf: no command given" >&2
+            usage >&2
+            exit 2
+        fi
+        cmd_run "$@"
+        ;;
+    env)
+        while [ $# -gt 0 ]; do
+            case $1 in
+                --no-audit)  opt_no_audit=1; shift ;;
+                --map)       [ $# -ge 2 ] || { echo "vf: --map requires an argument" >&2; exit 2; }
+                             opt_map_file=$2; shift 2 ;;
+                --cuda12)    [ $# -ge 2 ] || { echo "vf: --cuda12 requires an argument" >&2; exit 2; }
+                             opt_cuda12=$2; shift 2 ;;
+                *)           echo "vf: env takes no positional arguments" >&2; exit 2 ;;
+            esac
+        done
+        cmd_env
+        ;;
+    fetch)
+        while [ $# -gt 0 ]; do
+            case $1 in
+                --all)       opt_fetch_all=1; shift ;;
+                --only)      [ $# -ge 2 ] || { echo "vf: --only requires an argument" >&2; exit 2; }
+                             opt_fetch_only=$2; shift 2 ;;
+                --to)        [ $# -ge 2 ] || { echo "vf: --to requires an argument" >&2; exit 2; }
+                             opt_fetch_to=$2; shift 2 ;;
+                *)           echo "vf: fetch: unknown option: $1" >&2; exit 2 ;;
+            esac
+        done
+        cmd_fetch
+        ;;
+    venv)
+        while [ $# -gt 0 ]; do
+            case $1 in
+                --python)    [ $# -ge 2 ] || { echo "vf: --python requires an argument" >&2; exit 2; }
+                             opt_venv_python=$2; shift 2 ;;
+                --off)       opt_venv_off=1; shift ;;
+                -*)          echo "vf: venv: unknown option: $1 (the options of python -m venv go after DIR and --)" >&2; exit 2 ;;
+                *)           break ;;
+            esac
+        done
+        if [ $# -eq 0 ]; then
+            echo "vf: venv: no directory given" >&2
+            exit 2
+        fi
+        _venv_dir=$1
+        shift
+        if [ $# -gt 0 ]; then
+            if [ "$1" != -- ]; then
+                echo "vf: venv: the options of python -m venv go after --" >&2
+                exit 2
+            fi
+            shift
+        fi
+        cmd_venv "$_venv_dir" "$@"
+        ;;
+    doctor)
+        cmd_doctor
+        ;;
+    version)
+        get_version
+        ;;
+    *)
+        echo "vf: unknown subcommand: $subcmd" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

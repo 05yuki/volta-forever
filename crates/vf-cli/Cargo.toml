@@ -1,0 +1,17 @@
+[package]
+name = "vf-cli"
+description = "Command-line tool: inspect and adapt GPU code images offline"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "vf-translate"
+path = "src/main.rs"
+
+[dependencies]
+vf-fatbin.workspace = true
+vf-ptx.workspace = true
+vf-adapt.workspace = true
+vf-sass = { path = "../vf-sass" }

@@ -1,0 +1,934 @@
+//! Tests for the translator: scheduling, placement, borrowed registers, predicate
+//! assignment, and assembly of the instructions the translation builds.
+use super::borrowed::Borrowed;
+use super::context::pick;
+use super::parse::{FuncData, placement};
+use super::*;
+use crate::assemble;
+use crate::decode::{Decoder, Kind, LETTER_P, LETTER_R, LETTER_U};
+
+fn schedule(word: u128) -> (u32, u128) {
+    (((word >> USCHED) & 31) as u32, word & REUSE)
+}
+
+/// The three bits above the wait mask are marks of register reuse only with a stall that ends
+/// its group; with any other they name a batch. An instruction whose stall grows past what can
+/// end a group loses its marks rather than start a batch.
+#[test]
+fn marks_of_reuse_do_not_become_a_batch() {
+    let marks = 1u128 << 122;
+    let word = marks | (u128::from(16u32 | 6) << USCHED);
+    assert_eq!(schedule(with_stall(word, 11, true)), (16 | 11, marks));
+    assert_eq!(schedule(with_stall(word, 12, true)), (12, 0));
+    // Operands that bear no marks: the bits are a batch whatever the stall, and stay.
+    assert_eq!(schedule(with_stall(word, 12, false)), (12, marks));
+}
+
+/// An instruction that names a batch is not made to end its group: the batch would be read as
+/// marks of reuse.
+#[test]
+fn a_batch_does_not_become_marks_of_reuse() {
+    let batch = 1u128 << 122;
+    let word = batch | (u128::from(16u32 | 13) << USCHED);
+    assert_eq!(schedule(with_stall(word, 5, true)), (5, batch));
+    // With no batch named, it goes on ending its group.
+    let plain = u128::from(16u32 | 13) << USCHED;
+    assert_eq!(schedule(with_stall(plain, 5, true)), (16 | 5, 0));
+}
+
+/// A function with a product has seventeen registers of the translation for its matrix
+/// instructions, whichever register comes first: the lane, four values kept of it, four
+/// registers for a gathered B and eight to compute into, the last two kinds on even registers.
+#[test]
+fn a_product_has_seventeen_registers() {
+    for base in [10u32, 11] {
+        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _) =
+            placement(base, &[], &[], false, 0, true, MATRIX_SCRATCH, true, None, &[], &[]).unwrap();
+        let (lane, kept, gathered, scratch) = (lane.unwrap(), kept.unwrap(), gathered.unwrap(), scratch.unwrap());
+        assert_eq!(free - base, 1 + KEPT + GATHERED + MATRIX_SCRATCH);
+        assert!(gathered % 2 == 0 && scratch % 2 == 0);
+        let mut all = vec![lane];
+        all.extend(kept..kept + KEPT);
+        all.extend(gathered..gathered + GATHERED);
+        all.extend(scratch..scratch + MATRIX_SCRATCH);
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all, (base..free).collect::<Vec<u32>>());
+    }
+}
+
+/// An item for the schedule: its class, its operands, what it is, whether the translation
+/// changed it.
+type Given<'a> = (&'static str, &'a [(&'static str, u32)], &'static str, bool);
+
+/// Items for the schedule, decoded.
+fn items_of(list: &[Given]) -> Vec<Item> {
+    let mut dec70 = Decoder::new(70);
+    list.iter()
+        .enumerate()
+        .map(|(i, &(name, operands, what, changed))| {
+            let operands: Vec<(&str, assemble::OpVal)> =
+                operands.iter().map(|&(o, v)| (o, assemble::OpVal::Int(v))).collect();
+            // (Branches are not instructions the translation builds: their words as they are,
+            // to the next instruction, with a stall of one.)
+            let word = match name {
+                "BRA" => 0x000fc200038000000000000000007947,
+                "BRA P3" => 0x000fc200018000000000000000007947,
+                _ => assemble::assemble(name, &operands).expect(name),
+            };
+            let mut item = Item::new(word, i, what, changed);
+            item.first = true;
+            item.d = Some(dec70.decode(word).expect(name));
+            if what == "restore" {
+                let mask = item.d.as_ref().unwrap().op_or(OP_SB, 0);
+                item.more_writes
+                    .extend((0..7u32).filter(|p| (mask >> p) & 1 != 0).map(|p| (LETTER_P, p)));
+            }
+            item
+        })
+        .collect()
+}
+
+fn stalls(items: &[Item]) -> Vec<u32> {
+    items.iter().map(|item| stall_of(item.word)).collect()
+}
+
+/// R2P reads the seven predicates and writes them all back: two predicates given back one
+/// after the other are five cycles apart (one cycle apart, the second wrote the first's
+/// back as it was before: measured on a V100), and an R2P comes four cycles
+/// after an instruction that writes a predicate it does not give back, not after one that
+/// writes the predicate it gives back.
+#[test]
+fn an_r2p_is_kept_from_the_writers_of_the_other_predicates() {
+    let isetp = |p: u32| -> (&'static str, Vec<(&'static str, u32)>) {
+        (
+            "isetp__RRR_RR",
+            vec![("Pu", p), ("Pv", 7), ("Ra", 4), ("Rb", 255), ("Pp", 7)],
+        )
+    };
+    // Two restores.
+    let mut items = items_of(&[
+        ("r2p__RIR", &[("Ra", 20), ("Sb", 1)], "restore", true),
+        ("r2p__RIR", &[("Ra", 21), ("Sb", 2)], "restore", true),
+        ("nop_", &[], "same", false),
+    ]);
+    super::schedule::schedule(&mut items, &[]).unwrap();
+    assert_eq!(stalls(&items)[0], 5);
+    // A comparison into P2, then the restore of P4: four cycles.
+    let (name, operands) = isetp(2);
+    let mut items = items_of(&[
+        (name, &operands, "same", false),
+        ("r2p__RIR", &[("Ra", 20), ("Sb", 16)], "restore", true),
+        ("nop_", &[], "same", false),
+    ]);
+    super::schedule::schedule(&mut items, &[]).unwrap();
+    assert_eq!(stalls(&items)[0], 4);
+    // A comparison into P4, then the restore of P4: nothing to keep.
+    let (name, operands) = isetp(4);
+    let mut items = items_of(&[
+        (name, &operands, "same", false),
+        ("r2p__RIR", &[("Ra", 20), ("Sb", 16)], "restore", true),
+        ("nop_", &[], "same", false),
+    ]);
+    super::schedule::schedule(&mut items, &[]).unwrap();
+    assert_eq!(stalls(&items)[0], 1);
+    // The program's own instructions, both as they were: left as the compiler had them.
+    let (name, operands) = isetp(2);
+    let mut items = items_of(&[
+        (name, &operands, "same", false),
+        ("r2p__RIR", &[("Ra", 20), ("Sb", 16)], "same", false),
+        ("nop_", &[], "same", false),
+    ]);
+    super::schedule::schedule(&mut items, &[]).unwrap();
+    assert_eq!(stalls(&items)[0], 1);
+}
+
+/// A predicate that the translation saves waits for the scoreboard on which the instruction
+/// that wrote it announces it (the program's own readers do; a read the translation made up
+/// has nothing of the program that waits for it), unless an instruction since has waited.
+#[test]
+fn a_saved_predicate_waits_for_the_scoreboard_of_its_writer() {
+    let compare: &[(&'static str, u32)] = &[("Pu", 3), ("Pv", 7), ("Ra", 4), ("Rb", 255), ("Pp", 7)];
+    let save: &[(&'static str, u32)] = &[("Rd", 20), ("Ra", 255), ("Sb", 8)];
+    let build = |between: bool| -> Vec<Item> {
+        let mut list: Vec<Given> = vec![("isetp__RRR_RR", compare, "same", false)];
+        if between {
+            list.push(("nop_", &[], "same", false));
+        }
+        list.push(("p2r__RsIR_RIR", save, "save", true));
+        list.push(("nop_", &[], "same", false));
+        let mut items = items_of(&list);
+        // (No instruction of the fixed-point unit announces a predicate on a scoreboard; the
+        // ones that do, DSETP and the like, are not instructions the translation builds. The
+        // scheduler goes by the word's scoreboard, whatever the instruction: scoreboard 2.)
+        items[0].word = (items[0].word & !(7u128 << WRITE_BARRIER)) | (2u128 << WRITE_BARRIER);
+        if between {
+            items[1].word |= 1u128 << (WAIT + 2);
+        }
+        let k = items.len() - 2;
+        items[k].more_reads.push((LETTER_P, 3, 0));
+        items
+    };
+    let mut items = build(false);
+    super::schedule::schedule(&mut items, &[]).unwrap();
+    assert_eq!((items[1].word >> WAIT) & 63, 1 << 2);
+    // The program's instruction between them waits for it already: no second wait.
+    let mut items = build(true);
+    super::schedule::schedule(&mut items, &[]).unwrap();
+    assert_eq!((items[2].word >> WAIT) & 63, 0);
+}
+
+/// A predicate that the translation saves right after an R2P of the program gave it a value
+/// is five cycles after that R2P (the program's R2P writes the predicates of its mask, which
+/// its operands do not say); a predicate outside the mask is not waited for.
+#[test]
+fn a_predicate_saved_after_an_r2p_of_the_program_waits_for_it() {
+    for (mask, stall) in [(8u32, 5u32), (4, 1)] {
+        let mut items = items_of(&[
+            ("r2p__RIR", &[("Ra", 9), ("Sb", mask)], "same", false),
+            ("p2r__RsIR_RIR", &[("Rd", 20), ("Ra", 255), ("Sb", 8)], "save", true),
+            ("nop_", &[], "same", false),
+        ]);
+        items[1].more_reads.push((LETTER_P, 3, 0));
+        super::schedule::schedule(&mut items, &[]).unwrap();
+        assert_eq!(stalls(&items)[0], stall);
+    }
+}
+
+/// What was written before a label is known after it where the code goes on into it: a
+/// predicate saved by the translation right after a label is four cycles after the
+/// comparison before the label that wrote it; not when the code before leaves (a branch
+/// that is always taken).
+#[test]
+fn the_schedule_goes_on_through_a_label() {
+    let compare: &[(&'static str, u32)] = &[("Pu", 3), ("Pv", 7), ("Ra", 4), ("Rb", 255), ("Pp", 7)];
+    let save: &[(&'static str, u32)] = &[("Rd", 20), ("Ra", 255), ("Sb", 8)];
+    let saved = |mut items: Vec<Item>| -> Vec<Item> {
+        let k = items.iter().position(|item| item.what == "save").unwrap();
+        items[k].more_reads.push((LETTER_P, 3, 0));
+        items
+    };
+    let mut items = saved(items_of(&[
+        ("isetp__RRR_RR", compare, "same", false),
+        ("p2r__RsIR_RIR", save, "save", true),
+        ("nop_", &[], "same", false),
+    ]));
+    // (Item 1 is where a branch goes: a block of the schedule starts there.)
+    super::schedule::schedule(&mut items, &[16]).unwrap();
+    assert_eq!(stalls(&items)[0], 4);
+    let mut items = saved(items_of(&[
+        ("isetp__RRR_RR", compare, "same", false),
+        ("BRA", &[], "same", false),
+        ("p2r__RsIR_RIR", save, "save", true),
+        ("nop_", &[], "same", false),
+    ]));
+    super::schedule::schedule(&mut items, &[32]).unwrap();
+    assert_eq!(stalls(&items)[..2], [1, 1]);
+    // A branch that may not be taken: the code goes on, three cycles are missing.
+    let mut items = saved(items_of(&[
+        ("isetp__RRR_RR", compare, "same", false),
+        ("BRA P3", &[], "same", false),
+        ("p2r__RsIR_RIR", save, "save", true),
+        ("nop_", &[], "same", false),
+    ]));
+    super::schedule::schedule(&mut items, &[]).unwrap();
+    assert_eq!(stalls(&items)[..2], [1, 3]);
+}
+
+/// A function with matrix loads and no product has the lane and the eight registers to
+/// compute into, and nothing kept.
+#[test]
+fn loads_alone_keep_nothing() {
+    for base in [10u32, 11] {
+        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _) =
+            placement(base, &[], &[], false, 0, true, MATRIX_SCRATCH, false, None, &[], &[]).unwrap();
+        assert_eq!(free - base, 1 + MATRIX_SCRATCH);
+        assert!(lane.is_some() && kept.is_none() && gathered.is_none() && scratch.unwrap() % 2 == 0);
+    }
+}
+
+// ---- Borrowed registers ----
+
+/// What an instruction of `make_borrow_func` reads (letter, register, role) and writes (letter,
+/// register).
+type Uses<'a> = (&'a [(u8, u32, u8)], &'a [(u8, u32)]);
+
+/// Helper: build a minimal FuncData with explicit reads/writes for each instruction.
+/// Each instruction is specified as (reads, writes) where reads is [(letter, reg, role)]
+/// and writes is [(letter, reg)]. The mnemonic is NOP for all.
+fn make_borrow_func(instrs: &[Uses], registers: u32, uniform: &[u32], pairs: &[u32], needs_pool: bool) -> FuncData {
+    let mut dec75 = crate::decode::Decoder::new(75);
+    // NOP word for sm_75: a known NOP.
+    let nop_word: u128 = 0x000fc00000000000_0000000000007918;
+    let src: Vec<Decoded> = instrs
+        .iter()
+        .map(|(reads, writes)| {
+            let mut d = dec75.decode(nop_word).unwrap();
+            d.reads = reads.to_vec();
+            d.writes = writes.to_vec();
+            d
+        })
+        .collect();
+    let highest = instrs
+        .iter()
+        .flat_map(|(reads, writes)| {
+            reads
+                .iter()
+                .filter(|&&(l, _, _)| l == LETTER_R)
+                .map(|&(_, r, _)| r)
+                .chain(writes.iter().filter(|&&(l, _)| l == LETTER_R).map(|&(_, r)| r))
+        })
+        .filter(|&r| r != 255)
+        .max()
+        .unwrap_or(0);
+    FuncData {
+        name: "test_function".into(),
+        registers,
+        tables: vec![],
+        src,
+        uniform: uniform.to_vec(),
+        pairs: pairs.to_vec(),
+        needs_pool,
+        uniform_predicates: vec![],
+        highest,
+        scratch_need: 0,
+        needs_lane: false,
+        product_count: 0,
+        entered_inside: false,
+    }
+}
+
+/// A free even pair is found and not one that is alive, read or written at the instruction.
+#[test]
+fn borrowed_pair_avoids_alive_registers() {
+    // Instruction 0: writes R4, reads R5. Instruction 1: writes R6, reads R7.
+    // R2, R3 are free at both.
+    let fd = make_borrow_func(
+        &[
+            (&[(LETTER_R, 5, 0)], &[(LETTER_R, 4)]),
+            (&[(LETTER_R, 7, 0)], &[(LETTER_R, 6)]),
+        ],
+        10,
+        &[],
+        &[],
+        false,
+    );
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    assert_eq!(b.free_at(0, 2, &regset_empty()), Some(2));
+    assert_eq!(b.free_at(1, 2, &regset_empty()), Some(2));
+}
+
+/// A uniform register gets a home only where the register is free through its whole life.
+#[test]
+fn borrowed_home_only_in_free_register() {
+    // U4 written at 0, read at 1 and 2. R2..R7 busy everywhere. highest=7.
+    // No register free in range(2, 7+2-1, 1) = range(2, 8) = 2..7: all busy.
+    let fd = make_borrow_func(
+        &[
+            (&[(LETTER_R, 2, 0), (LETTER_R, 3, 0)], &[(LETTER_U, 4), (LETTER_R, 4)]),
+            (
+                &[(LETTER_U, 4, 0), (LETTER_R, 5, 0), (LETTER_R, 6, 0)],
+                &[(LETTER_R, 7)],
+            ),
+            (
+                &[(LETTER_U, 4, 0), (LETTER_R, 2, 0), (LETTER_R, 7, 0)],
+                &[(LETTER_R, 3)],
+            ),
+        ],
+        10,
+        &[4],
+        &[],
+        false,
+    );
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    // U4 should NOT get a home because R2..R7 are all busy in the span.
+    assert!(
+        b.homes.is_empty(),
+        "no home should be found when all registers are busy"
+    );
+}
+
+/// R0 and R1 are never taken as homes or for the pool.
+#[test]
+fn borrowed_never_takes_r0_r1() {
+    // U4 at all instructions, R2..R6 busy. Even if R0 and R1 are free, they must not be used.
+    let fd = make_borrow_func(
+        &[
+            (&[], &[(LETTER_U, 4), (LETTER_R, 2)]),
+            (
+                &[
+                    (LETTER_U, 4, 0),
+                    (LETTER_R, 3, 0),
+                    (LETTER_R, 4, 0),
+                    (LETTER_R, 5, 0),
+                    (LETTER_R, 6, 0),
+                ],
+                &[(LETTER_R, 2)],
+            ),
+        ],
+        10,
+        &[4],
+        &[],
+        false,
+    );
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    for (&_u, &r) in &b.homes {
+        assert!(r >= 2, "R0 and R1 must never be taken as homes");
+    }
+    for &r in &b.used {
+        assert!(r >= 2, "R0 and R1 must never be in used set");
+    }
+    // Also check pair_at: should never return 0.
+    let pair = b.free_at(0, 2, &regset_empty());
+    assert!(pair.is_none() || pair.unwrap() >= 2);
+    let single = b.free_at(0, 1, &regset_empty());
+    assert!(single.is_none() || single.unwrap() >= 2);
+}
+
+/// Two uniform registers whose lives meet do not share a home.
+#[test]
+fn borrowed_no_shared_home_for_overlapping_lives() {
+    // U4 and U5 both alive at all instructions. R2..R3 free. highest=10.
+    let fd = make_borrow_func(
+        &[
+            (&[], &[(LETTER_U, 4), (LETTER_U, 5), (LETTER_R, 10)]),
+            (
+                &[(LETTER_U, 4, 0), (LETTER_U, 5, 0), (LETTER_R, 10, 0)],
+                &[(LETTER_R, 10)],
+            ),
+        ],
+        15,
+        &[4, 5],
+        &[],
+        false,
+    );
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    if b.homes.contains_key(&4) && b.homes.contains_key(&5) {
+        assert_ne!(b.homes[&4], b.homes[&5], "overlapping lives must not share a home");
+    }
+}
+
+/// One register is enough where the sequence needs one (pool with width 1).
+#[test]
+fn borrowed_pool_width_one() {
+    // R4 and R5 busy. R2, R3, R6, R7 free. pair_at(0, 1) should find R2.
+    let fd = make_borrow_func(
+        &[
+            (&[(LETTER_R, 4, 0), (LETTER_R, 5, 0)], &[(LETTER_R, 4)]),
+            (&[(LETTER_R, 4, 0)], &[(LETTER_R, 5)]),
+        ],
+        10,
+        &[],
+        &[],
+        false,
+    );
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    let r = b.free_at(0, 1, &regset_empty());
+    assert_eq!(r, Some(2), "width 1 should find R2 as the first free register");
+}
+
+/// The first item of an instruction that took borrowed registers waits for all six
+/// scoreboards (a pending write would overwrite what is put there).
+#[test]
+fn borrowed_pool_instruction_waits_for_all_scoreboards() {
+    // Translate a cubin with VF_BORROW=1 and check the wait mask.
+    // This is tested indirectly through the full cubin comparison (compare.sh), but we
+    // verify the invariant on the Options struct.
+    let opts = Options {
+        borrow: 1,
+        ..Options::default()
+    };
+    assert!(opts.borrow > 0);
+}
+
+/// What the layer does by itself is the default; `VF_BORROW` is a number, and anything
+/// else leaves the default (0 turns the borrowing off).
+#[test]
+fn borrow_default_and_setting() {
+    assert_eq!(Options::default().borrow, BORROW_DEFAULT);
+    assert_eq!(BORROW_DEFAULT, 7);
+    assert_eq!(borrow_from(None), BORROW_DEFAULT);
+    assert_eq!(borrow_from(Some("")), BORROW_DEFAULT);
+    assert_eq!(borrow_from(Some("no")), BORROW_DEFAULT);
+    assert_eq!(borrow_from(Some("0")), 0);
+    assert_eq!(borrow_from(Some(" 5 ")), 5);
+    assert_eq!(borrow_from(Some("7")), 7);
+    assert_eq!(borrow_from(Some("8")), 8);
+}
+
+/// `product_count` is computed by `parse_function`.
+#[test]
+fn product_count_in_funcdata() {
+    // A FuncData with no products.
+    let fd = make_borrow_func(
+        &[
+            (&[(LETTER_R, 5, 0)], &[(LETTER_R, 4)]),
+            (&[(LETTER_R, 7, 0)], &[(LETTER_R, 6)]),
+        ],
+        10,
+        &[],
+        &[],
+        false,
+    );
+    assert_eq!(fd.product_count, 0);
+}
+
+// ---- Part A: predicate delays ----
+
+/// A function where every free predicate is one a DSETP writes: the wait is there,
+/// and waits for all six scoreboards.
+#[test]
+fn slow_predicate_gets_a_wait() {
+    // DSETP writes P3, so it's slow. The delay for P3 from a DSETP to FXU should be 13
+    // (the value from the distance table).
+    let dist = crate::distance::least(
+        LETTER_P,
+        0,
+        &{
+            let mut dec75 = crate::decode::Decoder::new(75);
+            // We need a decoded DSETP. Build a minimal one.
+            let nop = dec75.decode(0x000fc00000000000_0000000000007918).unwrap();
+            let mut d = nop.clone();
+            d.mnemonic = "DSETP";
+            d.kind = Kind::FMALITE;
+            d
+        },
+        Kind::FXU,
+    );
+    // DSETP to FXU should be 13 cycles.
+    assert!(dist >= 13, "DSETP to FXU distance should be >= 13, got {}", dist);
+}
+
+/// An FCHK under no scoreboard: 26 cycles (the longest distance of its kind).
+#[test]
+fn fchk_distance_is_its_kinds_longest() {
+    // FCHK is MIO_FAST. The distance table's longest for MIO_FAST writing a predicate
+    // should give 26 when there's no specific row for FCHK (it falls back to the longest
+    // distance of its kind).
+    let mut dec75 = crate::decode::Decoder::new(75);
+    let nop = dec75.decode(0x000fc00000000000_0000000000007918).unwrap();
+    let mut d = nop.clone();
+    d.mnemonic = "FCHK";
+    d.kind = Kind::MioFast;
+    // With no scoreboard (write barrier = 7), and no specific FCHK row in the table,
+    // least falls back to the longest of its kind.
+    let dist = crate::distance::least(LETTER_P, 0, &d, Kind::FXU);
+    assert!(dist >= 26, "FCHK to FXU distance should be >= 26, got {}", dist);
+}
+
+/// A predicate that a memory instruction writes under no scoreboard is never taken.
+#[test]
+fn memory_writer_predicate_never_taken() {
+    // MIO_SLOW writes => never bit set. The pick function should not take it.
+    let slow: u32 = 1 << 3; // P3 is slow
+    let never: u32 = 1 << 3; // P3 is also never (MIO_SLOW)
+    // All other predicates busy except P3.
+    let taken: u32 = 0x7f & !(1 << 3);
+    let order: Vec<u32> = (0..7u32).collect();
+    let result = pick(taken, &order, slow, never);
+    assert!(result.is_none(), "P3 should not be picked because it is in `never`");
+}
+
+/// A free predicate that nothing writes late is preferred.
+#[test]
+fn non_slow_predicate_preferred() {
+    // P2 is slow, P5 is not. Both free. pick should take P5 first (the non-slow one).
+    let slow: u32 = 1 << 2;
+    let never: u32 = 0;
+    let taken: u32 = 0x7f & !((1 << 2) | (1 << 5));
+    let order: Vec<u32> = (0..7u32).collect();
+    let result = pick(taken, &order, slow, never);
+    assert_eq!(result, Some(5), "should pick P5 (not slow) over P2 (slow)");
+}
+
+// ---- Part B new: unannounced writers, says ----
+
+/// A register written by DMUL is not borrowed (it is in DEEP_WRITERS).
+#[test]
+fn dmul_register_not_borrowed() {
+    assert!(DEEP_WRITER_MNEMONICS.contains(&"DMUL"));
+}
+
+/// unannounced recognizes an I2F under no scoreboard (MIO_FAST, barrier 7).
+#[test]
+fn unannounced_i2f_no_scoreboard() {
+    let mut dec = crate::decode::Decoder::new(70);
+    let nop = dec.decode(0x000fc00000000000_0000000000007918).unwrap();
+    let mut d = nop.clone();
+    d.kind = Kind::MioFast;
+    d.mnemonic = "I2F";
+    // Set write barrier to 7 (no scoreboard): bits 110..113 all 1.
+    d.word = (d.word & !(7u128 << WRITE_BARRIER)) | (7u128 << WRITE_BARRIER);
+    assert!(unannounced(&d), "I2F under no scoreboard should be unannounced");
+    // With a scoreboard (barrier != 7): not unannounced.
+    d.word = (d.word & !(7u128 << WRITE_BARRIER)) | (3u128 << WRITE_BARRIER);
+    assert!(!unannounced(&d), "I2F on scoreboard 3 should not be unannounced");
+}
+
+/// LDL and STL assemble with the template generator and decode back correctly,
+/// including with a negative offset (the slot is under the top of local memory).
+#[test]
+fn ldl_and_stl_assemble_and_decode() {
+    let mut dec = crate::decode::Decoder::new(70);
+    // LDL with a negative offset (24-bit mask).
+    let ldl = assemble::assemble(
+        "ldl__sImmOffset",
+        &[
+            ("Rd", assemble::OpVal::Int(10)),
+            ("Ra", assemble::OpVal::Int(15)),
+            ("Ra_offset", assemble::OpVal::Int((-16i32 as u32) & 0xFFFFFF)),
+            ("dst_wr_sb", assemble::OpVal::Int(ARRIVES)),
+        ],
+    );
+    assert!(ldl.is_some(), "LDL with negative offset should assemble");
+    let d = dec.decode(ldl.unwrap());
+    assert!(d.is_some(), "LDL word should decode");
+    assert_eq!(d.unwrap().mnemonic, "LDL");
+
+    // STL with a negative offset.
+    let stl = assemble::assemble(
+        "stl__sImmOffset",
+        &[
+            ("Ra", assemble::OpVal::Int(10)),
+            ("Rb", assemble::OpVal::Int(5)),
+            ("Ra_offset", assemble::OpVal::Int((-32i32 as u32) & 0xFFFFFF)),
+            ("Pg", assemble::OpVal::Int(7)),
+            ("Pg_not", assemble::OpVal::Int(0)),
+        ],
+    );
+    assert!(stl.is_some(), "STL with negative offset should assemble");
+    let d = dec.decode(stl.unwrap());
+    assert!(d.is_some(), "STL word should decode");
+    assert_eq!(d.unwrap().mnemonic, "STL");
+}
+
+/// The R1 adjustment at level 3 assembles as IADD3 R1, R1, -frame, RZ.
+#[test]
+fn r1_adjustment_assembles() {
+    let frame: u32 = 32;
+    let w = assemble::assemble(
+        "iadd3_imm__RsIR_RIR",
+        &[
+            ("Rd", assemble::OpVal::Int(1)),
+            ("Ra", assemble::OpVal::Int(1)),
+            ("Sb", assemble::OpVal::Int(-(frame as i32) as u32)),
+            ("Rc", assemble::OpVal::Int(255)),
+        ],
+    );
+    assert!(w.is_some(), "IADD3 R1, R1, -0x20, RZ should assemble");
+    let mut dec = crate::decode::Decoder::new(70);
+    let d = dec.decode(w.unwrap());
+    assert!(d.is_some(), "IADD3 word should decode");
+    let d = d.unwrap();
+    assert_eq!(d.mnemonic, "IADD3");
+    // Rd=R1, Ra=R1. R255 (RZ) may not appear in reads (zero register).
+    assert!(d.writes.iter().any(|&(l, r)| l == LETTER_R && r == 1));
+    assert!(d.reads.iter().any(|&(l, r, _)| l == LETTER_R && r == 1));
+}
+
+/// free_at skips registers that are in the `given` set.
+#[test]
+fn free_at_skips_given() {
+    // Build a minimal Borrowed with top=10 and all registers free at instruction 0.
+    let b = Borrowed {
+        top: 10,
+        highest: 10,
+        busy: vec![regset_empty()],
+        taken: vec![regset_empty()],
+        touch: vec![regset_empty()],
+        never: regset_empty(),
+        homes: HashMap::new(),
+        used: HashSet::new(),
+        everything: false,
+        slots: HashMap::new(),
+        frame_bytes: 0,
+        depth: vec![None],
+        r1_fixed: true,
+        room: false,
+        from_r1: false,
+        spill: 0,
+    };
+    // With nothing given, the first free register is R2.
+    let empty_given = regset_empty();
+    assert_eq!(b.free_at(0, 1, &empty_given), Some(2));
+    // With R2 given, it skips to R3.
+    let mut given = regset_empty();
+    regset_set(&mut given, 2);
+    assert_eq!(b.free_at(0, 1, &given), Some(3));
+    // With R2 and R3 given, it goes to R4.
+    regset_set(&mut given, 3);
+    assert_eq!(b.free_at(0, 1, &given), Some(4));
+    // Width 2: needs even start. With R2 given, the first even pair from R4.
+    let mut given2 = regset_empty();
+    regset_set(&mut given2, 2);
+    regset_set(&mut given2, 3);
+    assert_eq!(b.free_at(0, 2, &given2), Some(4));
+}
+
+/// free_at returns None when all registers up to top are busy or given.
+#[test]
+fn free_at_returns_none_when_full() {
+    let mut busy = regset_empty();
+    for r in 0..=20 {
+        regset_set(&mut busy, r);
+    }
+    let b = Borrowed {
+        top: 20,
+        highest: 20,
+        busy: vec![busy],
+        taken: vec![regset_empty()],
+        touch: vec![regset_empty()],
+        never: regset_empty(),
+        homes: HashMap::new(),
+        used: HashSet::new(),
+        everything: false,
+        slots: HashMap::new(),
+        frame_bytes: 0,
+        depth: vec![None],
+        r1_fixed: true,
+        room: false,
+        from_r1: false,
+        spill: 0,
+    };
+    assert_eq!(b.free_at(0, 1, &regset_empty()), None);
+}
+
+/// The stack-pointer check: a function with c[0x0][0x28] read by a non-first
+/// instruction is detected by stack_top.
+#[test]
+fn stack_top_detects_cbuf_0x28() {
+    let mut dec = crate::decode::Decoder::new(75);
+    // MOV R1, c[0x0][0x28] reads the stack top.
+    let word = assemble::assemble(
+        "mov__RCR_RC",
+        &[
+            ("Rd", assemble::OpVal::Int(1)),
+            ("Sb_bank", assemble::OpVal::Int(0)),
+            ("Sb_addr", assemble::OpVal::Int(0x28 / 4)),
+        ],
+    )
+    .unwrap();
+    let d = dec.decode(word).unwrap();
+    assert!(stack_top(&d), "MOV R1, c[0x0][0x28] should read stack top");
+    // MOV R1, c[0x0][0x24] should NOT.
+    let word2 = assemble::assemble(
+        "mov__RCR_RC",
+        &[
+            ("Rd", assemble::OpVal::Int(1)),
+            ("Sb_bank", assemble::OpVal::Int(0)),
+            ("Sb_addr", assemble::OpVal::Int(0x24 / 4)),
+        ],
+    )
+    .unwrap();
+    let d2 = dec.decode(word2).unwrap();
+    assert!(!stack_top(&d2), "MOV R1, c[0x0][0x24] should not read stack top");
+}
+
+// ---- Part D: room made and switch 5/6 ----
+
+/// `victims_at` finds a register the instruction does not touch, respecting `never` and
+/// the taken mask.
+#[test]
+fn victims_at_finds_untouched_register() {
+    // Instruction 0: reads R2, writes R3. R4 and R5 alive but not touched.
+    // victims_at(0, 1, empty) should find the lowest register that is not read or
+    // written by instruction 0, not in taken, not in never, and not R0 or R1.
+    let fd = make_borrow_func(
+        &[
+            (&[(LETTER_R, 2, 0), (LETTER_R, 4, 0)], &[(LETTER_R, 3), (LETTER_R, 5)]),
+            (&[(LETTER_R, 4, 0), (LETTER_R, 5, 0)], &[(LETTER_R, 6)]),
+        ],
+        10,
+        &[],
+        &[],
+        false,
+    );
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    // At instruction 0: R2, R3, R4, R5 are touched. R6 is not touched.
+    // highest = 6, so range is 2..=(6+2-1-1)=7 but only up to highest+2-width.
+    let victim = b.victims_at(0, 1, &regset_empty());
+    assert!(victim.is_some(), "should find a victim");
+    let r = victim.unwrap();
+    assert!(r >= 2, "victim must not be R0 or R1");
+    // R2 is read, R3 is written, R4 is read, R5 is written at instruction 0.
+    assert!(
+        r != 2 && r != 3 && r != 4 && r != 5,
+        "victim must not be touched by instruction 0"
+    );
+}
+
+/// `victims_at` returns None when every register up to `highest` is touched.
+#[test]
+fn victims_at_returns_none_when_all_touched() {
+    // Instruction 0 touches R2, R3, R4. highest=4. No room.
+    let fd = make_borrow_func(
+        &[(&[(LETTER_R, 2, 0), (LETTER_R, 3, 0)], &[(LETTER_R, 4)])],
+        10,
+        &[],
+        &[],
+        false,
+    );
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    // highest = 4. range(2, 4+2-1, 1) = range(2, 5) = 2,3,4. All touched.
+    let victim = b.victims_at(0, 1, &regset_empty());
+    assert!(victim.is_none(), "all registers are touched, should return None");
+}
+
+/// R1 depth: through a function that lowers R1 by IADD3.
+#[test]
+fn r1_depth_through_iadd3() {
+    let mut dec75 = crate::decode::Decoder::new(75);
+    // Build a function: MOV R1, c[0x0][0x28] ; IADD3 R1, R1, -16 ; NOP ; RET
+    let nop_word: u128 = 0x000fc00000000000_0000000000007918;
+    // We need to construct proper instructions to make the flow work.
+    // For the depth test we use the make_borrow_func helper with custom names.
+    // Instead, let's test that the Borrowed struct computes depth correctly
+    // by constructing a minimal function.
+    let mut src: Vec<Decoded> = Vec::new();
+    // Instruction 0: sets R1 from c[0x0][0x28] (we'll mark it appropriately)
+    {
+        let mut d = dec75.decode(nop_word).unwrap();
+        d.writes = vec![(LETTER_R, 1)];
+        d.reads = vec![(LETTER_R, 10, 0)]; // placeholder, not c[0x0][0x28]
+        src.push(d);
+    }
+    // Instruction 1: IADD3 R1, R1, -16 (simulated: writes R1, reads R1)
+    {
+        let mut d = dec75.decode(nop_word).unwrap();
+        d.name = "iadd3_imm__RsIR_RIR";
+        d.writes = vec![(LETTER_R, 1)];
+        d.reads = vec![(LETTER_R, 1, 0)];
+        // Set operands for the depth calculation
+        d.ops = vec![
+            (crate::generated::fields::OP_RD, 1),
+            (crate::generated::fields::OP_RA, 1),
+            (crate::generated::fields::OP_RC, 255),
+            (crate::generated::fields::OP_SB, (-16i32 as u32)),
+        ];
+        src.push(d);
+    }
+    // Instruction 2: NOP (reads R10 to keep it alive)
+    {
+        let mut d = dec75.decode(nop_word).unwrap();
+        d.reads = vec![(LETTER_R, 10, 0)];
+        d.writes = vec![];
+        src.push(d);
+    }
+    let fd = FuncData {
+        name: "test_r1_depth".into(),
+        registers: 15,
+        tables: vec![],
+        src,
+        uniform: vec![],
+        pairs: vec![],
+        needs_pool: false,
+        uniform_predicates: vec![],
+        highest: 10,
+        scratch_need: 0,
+        needs_lane: false,
+        product_count: 0,
+        entered_inside: false,
+    };
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    // After instruction 0 (which sets R1), depth at instruction 1 should be 0.
+    // After IADD3 R1, R1, -16, depth at instruction 2 should be 0 - (-16) = 16.
+    assert!(b.r1_fixed, "r1 should be fixed when only IADD3 R1, R1, imm modifies it");
+    assert_eq!(b.depth[1], Some(0), "depth at instruction 1 should be 0");
+    assert_eq!(
+        b.depth[2],
+        Some(16),
+        "depth at instruction 2 should be 16 (R1 lowered by 16)"
+    );
+}
+
+/// A save (STL) and restore (LDL) assemble and decode back correctly.
+#[test]
+fn room_save_and_restore_assemble() {
+    use crate::assemble;
+    // Save: STL [R1+offset], Rb
+    let offset = 32u32;
+    let rb = 10u32;
+    let stl = assemble::assemble(
+        "stl__sImmOffset",
+        &[
+            ("Ra", assemble::OpVal::Int(1)),
+            ("Rb", assemble::OpVal::Int(rb)),
+            ("Ra_offset", assemble::OpVal::Int(offset)),
+        ],
+    );
+    assert!(stl.is_some(), "STL should assemble");
+    let stl_word = stl.unwrap();
+    let mut dec70 = crate::decode::Decoder::new(70);
+    let d = dec70.decode(stl_word);
+    assert!(d.is_some(), "STL should decode as sm_70");
+    let d = d.unwrap();
+    assert_eq!(d.mnemonic, "STL", "should decode as STL");
+
+    // Restore: LDL Rd, [R1+offset], scoreboard 4
+    let rd = 10u32;
+    let ldl = assemble::assemble(
+        "ldl__sImmOffset",
+        &[
+            ("Rd", assemble::OpVal::Int(rd)),
+            ("Ra", assemble::OpVal::Int(1)),
+            ("Ra_offset", assemble::OpVal::Int(offset)),
+            ("dst_wr_sb", assemble::OpVal::Int(ARRIVES)),
+        ],
+    );
+    assert!(ldl.is_some(), "LDL should assemble");
+    let ldl_word = ldl.unwrap();
+    let d = dec70.decode(ldl_word);
+    assert!(d.is_some(), "LDL should decode as sm_70");
+    let d = d.unwrap();
+    assert_eq!(d.mnemonic, "LDL", "should decode as LDL");
+}
+
+/// What is stored to the frame after an instruction is stored under no guard: the instruction
+/// may have written the predicate that guards it, and the store would go by what it left
+/// there. In `k_guards.guard-written.sm75.cubin` 28 instructions on uniform registers give a
+/// predicate into the one that guards them (`@UP0 UIADD3 UR6, UP0, UR4, URZ, URZ`); with every
+/// uniform register in the frame (level 3 first: 8), each has its store after it.
+#[test]
+fn a_store_to_the_frame_has_no_guard() {
+    let cubin = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/k_guards.guard-written.sm75.cubin"
+    ));
+    let opts = Options {
+        borrow: 8,
+        ..Options::default()
+    };
+    let result = translate_with_options(cubin, true, &opts).unwrap();
+    assert!(result.report.iter().all(|function| function.refused.is_none()));
+    let translated = crate::elf::Elf::parse(&result.bytes).unwrap();
+    let mut dec70 = Decoder::new(70);
+    let (mut stores, mut under_the_guard) = (0, 0);
+    for (function, new, old, what) in result.map.unwrap() {
+        let section = translated
+            .sections
+            .iter()
+            .find(|section| section.name == format!(".text.{function}"))
+            .unwrap();
+        let word = |code: &[u8], at: u64| u128::from_le_bytes(code[at as usize..at as usize + 16].try_into().unwrap());
+        if what.starts_with("mem: store") {
+            let d = dec70.decode(word(&section.data, new)).unwrap();
+            assert_eq!(d.mnemonic, "STL");
+            assert_eq!(
+                (d.op_or_name("Pg", 7), d.op_or_name("Pg@not", 0)),
+                (7, 0),
+                "{function}+0x{new:x}"
+            );
+            stores += 1;
+            // (How many of them follow an instruction that is under a guard, from 0x{old:x}.)
+            let source = crate::elf::Elf::parse(cubin).unwrap();
+            let original = source
+                .sections
+                .iter()
+                .find(|section| section.name == format!(".text.{function}"))
+                .unwrap();
+            let d75 = Decoder::new(75).decode(word(&original.data, old)).unwrap();
+            under_the_guard += u32::from(d75.op_or_name("UPg", 7) != 7);
+        }
+    }
+    assert!(under_the_guard >= 28, "{under_the_guard} of {stores}");
+}

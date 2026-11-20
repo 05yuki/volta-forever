@@ -1,0 +1,12 @@
+[package]
+name = "vf-adapt"
+description = "What to hand the driver of a Volta GPU in place of an image built for newer architectures"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+vf-fatbin.workspace = true
+vf-ptx.workspace = true
+vf-sass.workspace = true

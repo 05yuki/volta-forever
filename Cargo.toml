@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0-preview"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+vf-fatbin = { path = "crates/vf-fatbin" }
+vf-ptx = { path = "crates/vf-ptx" }
+vf-adapt = { path = "crates/vf-adapt" }
+vf-sass = { path = "crates/vf-sass" }
+vf-tables = { path = "crates/vf-tables" }
+libc = "0.2"
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-decode"] }
+ruzstd = "0.9"
+
+[profile.release]
+opt-level = 2
+debug = "line-tables-only"
