@@ -8,7 +8,7 @@
 #   bin/vf            the launcher (sets the environment and runs a program), with a link
 #                     bin/volta-forever to it
 #   bin/vf-translate  the offline tool (inspect, extract, adapt, translate)
-#   scripts/        fetch-redist.py (to download the CUDA 12.9 libraries the user needs)
+#   scripts/        helpers for downloading CUDA libraries and retaining Triton PTX
 #   INSTALL.md      installation and usage
 #   LIMITS.md       known limits and measurements
 #   docs/           how the layer works, what it computes, how it is checked, what it costs
@@ -107,9 +107,9 @@ for lib in "${forwarders[@]}"; do
 done
 cp "$out/forward/REPORT.txt" "$pkg/forward/"
 
-# scripts/: what a user needs to fetch the CUDA 12.9 libraries
-cp "$root/scripts/fetch-redist.py" "$pkg/scripts/"
-chmod +x "$pkg/scripts/fetch-redist.py"
+# Runtime helpers for fetching the CUDA libraries and assembling Triton kernels.
+cp "$root/scripts/fetch-redist.py" "$root/scripts/triton-ptxas.py" "$pkg/scripts/"
+chmod +x "$pkg/scripts/fetch-redist.py" "$pkg/scripts/triton-ptxas.py"
 
 # Documentation
 for doc in INSTALL.md LIMITS.md; do

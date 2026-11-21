@@ -27,6 +27,7 @@
 #   --no-audit     do not set LD_AUDIT (the program finds all its libraries by the path)
 #
 # Environment:
+#   VF_TRITON_PTXAS path to the NVIDIA assembler to use when retaining Triton PTX
 #   VF_CUDA12      the directory of the CUDA 12.9.2 libraries (--cuda12 comes first)
 #   VF_QUIET=1     no line when the CUDA 12.9.2 libraries are not found
 #   VF_VENV=0      a Python of an environment made by vf venv starts as it is, not through
@@ -325,6 +326,12 @@ cmd_env() {
     fi
     printf 'export VOLTA_FOREVER=%s\n' "$(quoted "$_version")"
     printf 'export VOLTA_FOREVER_HOME=%s\n' "$(quoted "$home")"
+    if [ -n "${VF_TRITON_PTXAS:-}" ]; then
+        printf 'export VF_TRITON_PTXAS=%s\n' "$(quoted "$VF_TRITON_PTXAS")"
+        _triton_helper=$(quoted "$scripts_dir/triton-ptxas.py")
+        printf 'export TRITON_PTXAS_PATH=%s\n' "$_triton_helper"
+        printf 'export TRITON_PTXAS_BLACKWELL_PATH=%s\n' "$_triton_helper"
+    fi
 }
 
 # --- subcommand: run (prefix form) ---------------------------------------------
@@ -338,6 +345,10 @@ cmd_run() {
     fi
     export VOLTA_FOREVER="$_version"
     export VOLTA_FOREVER_HOME="$home"
+    if [ -n "${VF_TRITON_PTXAS:-}" ]; then
+        export TRITON_PTXAS_PATH="$scripts_dir/triton-ptxas.py"
+        export TRITON_PTXAS_BLACKWELL_PATH="$TRITON_PTXAS_PATH"
+    fi
     exec "$@"
 }
 

@@ -28,7 +28,7 @@ for file in bin/vf-translate lib/libcuda.so.1 lib/libnvJitLink.so.13 lib/libvf_a
 done
 cp "$root/scripts/vf" "$pkg/bin/vf"
 ln -s vf "$pkg/bin/volta-forever"
-cp "$root/scripts/fetch-redist.py" "$pkg/scripts/"
+cp "$root/scripts/fetch-redist.py" "$root/scripts/triton-ptxas.py" "$pkg/scripts/"
 printf '%s %s\n' "$version" "$commit" > "$pkg/VERSION"
 
 cd "$stage"
