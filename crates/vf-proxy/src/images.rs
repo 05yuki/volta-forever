@@ -140,6 +140,9 @@ static KEPT: LazyLock<Mutex<HashMap<usize, Replacement>>> = LazyLock::new(|| Mut
 
 /// The driver loaded `replacement` as `handle`: keep it, and what is known of its kernels.
 pub fn keep(handle: usize, mut replacement: Replacement) {
+    // Context destruction can retire a CUmodule without an explicit unload.
+    // The driver's next load starts a new lifetime at the same address.
+    kernels::forget(handle);
     if config().profile
         && let Some(origin) = replacement.origin
     {
@@ -246,15 +249,17 @@ thread_local! {
     static IMAGE_WAS_NATIVE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Profiler only: after the program's own image was loaded as it is (`adapt` returned `None`),
-/// record that the module `*handle` is native when `adapt` found code for this GPU in it.
+/// Reset metadata after the program's own image was loaded. Also label native
+/// images when profiling is enabled.
 ///
 /// # Safety
 /// `handle` must be null or point to the handle the driver stored.
 pub unsafe fn loaded_as_is(result: c_int, handle: *mut *mut c_void) {
     if result == 0 && !handle.is_null() {
         // (Nothing of a module that is gone may be left under a handle that the driver gives again.)
-        crate::fit::forget(unsafe { *handle } as usize);
+        let fresh = unsafe { *handle } as usize;
+        release(fresh);
+        crate::fit::forget(fresh);
     }
     if !config().profile {
         return;

@@ -19,6 +19,8 @@ Needs: Python 3, GNU tar. Uses aria2c when available; falls back to Python's own
 urllib (slower, single-threaded). Re-runnable: verified archives are not downloaded again.
 """
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -41,14 +43,14 @@ def _has_aria2c():
     return shutil.which("aria2c") is not None
 
 
-def download(url, dest_dir, dest_name, expected_sha256):
+def download(url, dest_dir, dest_name, expected_sha256, lock_fds):
     """Download url to dest_dir/dest_name, verify SHA-256. Returns the path."""
     dest = os.path.join(dest_dir, dest_name)
     if _has_aria2c():
         subprocess.run(
             ["aria2c", "-q", "-x", "8", "-s", "8", "--allow-overwrite=true",
              "--auto-file-renaming=false", "-d", dest_dir, "-o", dest_name, url],
-            check=True,
+            check=True, pass_fds=lock_fds,
         )
     else:
         # Fall back to Python's urllib: download to a temporary file, rename on success.
@@ -117,47 +119,87 @@ def main():
             entry = entry[a.variant]
         rows.append((name, comp.get("version", "?"), entry))
 
-    # What an earlier run unpacked here (the archive's SHA-256 by component): with --discard
-    # the archive is no longer there to say so.
-    record = os.path.join(a.tree_dir, "COMPONENTS.tsv")
-    unpacked = {}
-    if a.discard and os.path.exists(record):
-        for line in open(record):
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) >= 4:
-                unpacked[fields[0]] = fields[3]
+    # Both the merged install tree and the archive cache may be shared by fetches.
+    # Lock them in a consistent order, including when two installs share just their cache.
+    with contextlib.ExitStack() as locks:
+        directories = sorted({os.path.realpath(a.tree_dir), os.path.realpath(a.dl_dir)})
+        lock_fds = []
+        for directory in directories:
+            lock = locks.enter_context(open(os.path.join(directory, ".vf-fetch.lock"), "a"))
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            lock_fds.append(lock.fileno())
+        # The active child keeps the locks if the parent is killed mid-download or extraction.
+        install_components(a, rows, lock_fds)
+    print(f"done: {len(rows)} components -> {a.tree_dir}")
 
+
+def read_receipts(path):
+    receipts = {}
+    try:
+        with open(path) as record:
+            for line in record:
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) == 4:
+                    # Older receipts guarantee the runtime subset only.
+                    fields.append("runtime")
+                if len(fields) == 5:
+                    receipts[fields[0]] = fields
+    except FileNotFoundError:
+        pass
+    return receipts
+
+
+def write_receipts(path, receipts):
+    # Writers hold the tree lock. Publish a complete snapshot so a killed fetch
+    # leaves either the previous receipts or the new ones available to its retry.
+    tmp = path + ".tmp"
+    with open(tmp, "w") as record:
+        for fields in receipts.values():
+            record.write("\t".join(fields) + "\n")
+        record.flush()
+        os.fsync(record.fileno())
+    os.replace(tmp, path)
+
+
+def install_components(a, rows, lock_fds):
+    record = os.path.join(a.tree_dir, "COMPONENTS.tsv")
+    receipts = read_receipts(record)
+    requested = "runtime" if a.runtime else "full"
     extract = ["--strip-components=1", "-C", a.tree_dir]
     if a.runtime:
         extract += ["--wildcards", "--exclude=*/lib/stubs/*", "*/lib/*.so*", "*/LICENSE"]
 
-    new = []
+    # (Said before anything is downloaded: tar starts xz for these archives.)
+    if any(entry["relative_path"].endswith(".xz") for _, _, entry in rows) and shutil.which("xz") is None:
+        sys.exit("xz is needed to unpack NVIDIA's archives and was not found "
+                 "(Debian and Ubuntu: the package xz-utils; Fedora and RHEL: xz)")
+
     for name, version, entry in rows:
         url = f"{a.base_url}/{entry['relative_path']}"
         dest = os.path.join(a.dl_dir, os.path.basename(entry["relative_path"]))
-        if unpacked.get(name) == entry["sha256"]:
+        expected = entry["sha256"]
+        prior = receipts.get(name)
+        same_archive = prior and prior[3] == expected
+        if a.discard and same_archive and prior[4] in (requested, "full"):
             print(f"have {name} {version} (unpacked before)", flush=True)
             continue
         if not (os.path.exists(dest) and sha256(dest) == entry["sha256"]):
             print(f"get  {name} {version} ({int(entry['size']) / 1e6:.1f} MB)", flush=True)
-            download(url, a.dl_dir, os.path.basename(dest), entry["sha256"])
+            download(url, a.dl_dir, os.path.basename(dest), expected, lock_fds)
         else:
             print(f"have {name} {version}", flush=True)
-        if subprocess.run(["tar", "-xf", dest] + extract).returncode != 0:
+        # A failed extraction may already have overwritten files of the previous
+        # version. Invalidate its receipt before tar starts modifying the tree.
+        if prior:
+            del receipts[name]
+            write_receipts(record, receipts)
+        if subprocess.run(["tar", "-xf", dest] + extract, pass_fds=lock_fds).returncode != 0:
             sys.exit(f"cannot unpack {dest} into {a.tree_dir}")
+        installed = "full" if same_archive and prior[4] == "full" else requested
+        receipts[name] = [name, version, os.path.basename(dest), expected, installed]
+        write_receipts(record, receipts)
         if a.discard:
             os.remove(dest)
-        new.append((name, version, entry))
-
-    with open(record, "a") as f:
-        for name, version, entry in new:
-            f.write(f"{name}\t{version}\t{os.path.basename(entry['relative_path'])}\t{entry['sha256']}\n")
-    if a.discard:
-        try:
-            os.rmdir(a.dl_dir)
-        except OSError:
-            pass
-    print(f"done: {len(rows)} components -> {a.tree_dir}")
 
 
 if __name__ == "__main__":

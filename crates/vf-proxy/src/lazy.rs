@@ -51,6 +51,8 @@ const CU_JIT_INFO_LOG_BUFFER: c_int = 3;
 const CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES: c_int = 4;
 const CU_JIT_ERROR_LOG_BUFFER: c_int = 5;
 const CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES: c_int = 6;
+/// The driver may keep the caller's code pointer until library unload.
+pub const CU_LIBRARY_BINARY_IS_PRESERVED: c_int = 1;
 
 /// A lazily compiled library: its PTX is kept, and kernels are compiled on demand.
 struct LazyLibrary {
@@ -192,7 +194,9 @@ unsafe fn filter_jit_options(options: *mut c_int, values: *mut *mut c_void, coun
     (opts, vals)
 }
 
-/// Save library options (logged at trace level).
+/// Copy the library options for internal images. CU_LIBRARY_BINARY_IS_PRESERVED is
+/// a promise about the caller's original pointer. Without this optional hint the
+/// driver makes its own copy of each replacement, including the stand-in and retries.
 ///
 /// # Safety
 /// The option and value pointers must be valid for `count` elements.
@@ -206,15 +210,22 @@ unsafe fn save_library_options(
     }
     // SAFETY: caller guarantees the pointers are valid for `count` elements.
     let raw_opts = unsafe { std::slice::from_raw_parts(options, count as usize) };
-    let raw_vals = unsafe { std::slice::from_raw_parts(values as *const usize, count as usize) };
-
-    if log::tracing() {
-        for (i, (&opt, &val)) in raw_opts.iter().zip(raw_vals.iter()).enumerate() {
-            log::trace(format_args!("lazy: library option [{i}]: code={opt}, value={val:#x}"));
+    let mut opts = Vec::with_capacity(raw_opts.len());
+    let mut vals = Vec::with_capacity(raw_opts.len());
+    for (i, &opt) in raw_opts.iter().enumerate() {
+        if opt == CU_LIBRARY_BINARY_IS_PRESERVED {
+            continue;
         }
+        let value = if values.is_null() {
+            0
+        } else {
+            unsafe { *values.add(i) as usize }
+        };
+        log::trace(format_args!("lazy: library option [{i}]: code={opt}, value={value:#x}"));
+        opts.push(opt);
+        vals.push(value);
     }
-
-    (raw_opts.to_vec(), raw_vals.to_vec())
+    (opts, vals)
 }
 
 /// Try to set up lazy compilation for a library. Returns `true` if the library was made lazy (the
@@ -238,7 +249,7 @@ pub unsafe fn setup(
     library_count: c_uint,
     cache_key: Option<crate::cache::CacheKey>,
 ) -> bool {
-    if !enabled() {
+    if !enabled() || handle.is_null() {
         return false;
     }
 
@@ -357,7 +368,7 @@ pub unsafe fn setup_from_cache(
     library_values: *mut *mut c_void,
     library_count: c_uint,
 ) -> bool {
-    if !enabled() || manifest.entries.len() <= 1 {
+    if !enabled() || handle.is_null() || manifest.entries.len() <= 1 {
         return false;
     }
 
@@ -508,7 +519,7 @@ unsafe fn setup_common(
         unsafe { filter_jit_options(jit_options, jit_values, jit_count) };
 
     // Save library options.
-    let (saved_lib_options, saved_lib_values) =
+    let (mut saved_lib_options, mut saved_lib_values) =
         // SAFETY: the caller passes the original cuLibraryLoadData arguments; valid for
         // library_count.
         unsafe { save_library_options(library_options, library_values, library_count) };
@@ -518,8 +529,7 @@ unsafe fn setup_common(
 
     let real_load = real_library_load();
     let mut standin: *mut c_void = std::ptr::null_mut();
-    // SAFETY: the stand-in PTX is a valid null-terminated string; jit/library option pointers are
-    // the originals from the caller, still valid during this call.
+    // SAFETY: the stand-in PTX and both option arrays are valid during this call.
     let result = unsafe {
         real_load(
             &mut standin,
@@ -527,9 +537,9 @@ unsafe fn setup_common(
             jit_options,
             jit_values,
             jit_count,
-            library_options,
-            library_values,
-            library_count,
+            saved_lib_options.as_mut_ptr(),
+            saved_lib_values.as_mut_ptr().cast(),
+            saved_lib_options.len() as c_uint,
         )
     };
 
@@ -1283,9 +1293,9 @@ pub fn unload(library: usize) -> Option<CUresult> {
                 crate::images::release(entry.lib_handle);
                 report_unload(format_args!("the sub-module of kernel {name}"), result);
             }
-            k2l.remove(&entry.kernel_handle);
         }
     }
+    k2l.retain(|_, owner| *owner != library);
     drop(k2l);
 
     // Unload the materialized module.
@@ -1302,58 +1312,15 @@ pub fn unload(library: usize) -> Option<CUresult> {
     Some(result)
 }
 
-/// Get the kernel count for a lazy library.
-pub fn kernel_count(library: usize) -> Option<usize> {
-    let (mutex, _) = &*LAZY_LIBS;
-    let libs = mutex.lock().unwrap_or_else(|e| e.into_inner());
-    libs.get(&library).map(|lib| {
-        if let Some(ref entries) = lib.cached_entries {
-            entries.len()
-        } else if let Some(ref info) = lib.info {
-            info.entry_count()
-        } else {
-            0
-        }
-    })
-}
-
-/// Enumerate kernels of a lazy library by materializing the full module (one compilation instead
-/// of one per kernel) and enumerating from it. Gives how many handles the driver wrote
-/// (`hooks::written_by_enumeration`: `count` is a capacity), or the driver's error.
-///
-/// # Safety
-/// `kernels` must point to an array of at least `count` pointers.
-pub unsafe fn enumerate_kernels(library: usize, kernels: *mut *mut c_void, count: c_uint) -> Result<usize, CUresult> {
-    // Materialize so the driver can enumerate from a fully compiled module.
-    // SAFETY: the driver call is unsafe.
-    let mat_handle = unsafe { materialize(library) }?;
-
-    // Use the real enumerate on the materialized handle.
-    let real_enum: unsafe extern "C" fn(*mut *mut c_void, c_uint, *mut c_void) -> CUresult =
-        // SAFETY: REALS holds the address of NVIDIA's cuLibraryEnumerateKernels.
-        unsafe { std::mem::transmute(REALS[idx::cuLibraryEnumerateKernels].load(Relaxed)) };
-
-    // SAFETY: kernels points to an array of at least count pointers (caller's contract);
-    // mat_handle is a valid materialized library handle.
-    let result = unsafe { real_enum(kernels, count, mat_handle as *mut c_void) };
-
-    if result != CUDA_SUCCESS {
-        return Err(result);
-    }
-
-    // Track the returned kernel handles so cuKernelGetLibrary returns the lazy library handle.
-    // SAFETY: the materialized handle is a library that the driver loaded.
-    let written = unsafe { crate::hooks::written_by_enumeration(mat_handle as *mut c_void, count) };
-    let mut k2l = KERNEL_TO_LIB.lock().unwrap_or_else(|e| e.into_inner());
-    for i in 0..written {
-        // SAFETY: kernels[0..written] were filled by the driver.
-        let kh = unsafe { *kernels.add(i) } as usize;
-        if kh != 0 {
-            k2l.insert(kh, library);
+/// Associate the handles returned by enumeration of a materialized library with the
+/// stand-in handle given to the application.
+pub fn register_enumerated(library: usize, handles: &[*mut c_void]) {
+    let mut owners = KERNEL_TO_LIB.lock().unwrap_or_else(|e| e.into_inner());
+    for &handle in handles {
+        if !handle.is_null() {
+            owners.insert(handle as usize, library);
         }
     }
-
-    Ok(written)
 }
 
 /// Get the library handle that a kernel belongs to (for `cuKernelGetLibrary`).

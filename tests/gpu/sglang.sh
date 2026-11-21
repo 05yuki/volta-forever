@@ -74,16 +74,6 @@ fi
 
 # --- Caches and temporary files under the output directory, not under /root ---
 cache=$out/sglang-cache
-# What this run alone writes (the CPU's references, the server's log, the stamp): a directory of
-# its own, so that two runs at once do not write each other's files. Removed at the end, the
-# server's log kept when a stage did not pass.
-run=$cache/run-$$
-mkdir -p "$run"
-stamp=$run/started
-touch "$stamp"
-failed=0
-engine_wait=${VF_ENGINE_WAIT:-1800}
-trap 'if [ "$failed" = 0 ]; then rm -rf "$run"; else echo "kept: $run"; fi' EXIT
 export HOME=$cache
 export TMPDIR=$cache/tmp
 export XDG_CACHE_HOME=$cache/.cache
@@ -97,6 +87,19 @@ mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$SGLANG_CACHE_DIR" "$S
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$gpu
 source "$W/tests/gpu/cache.sh"
+# What this run alone writes (the CPU's references, the server's log, the stamp): a directory of
+# its own, so that two runs at once do not write each other's files. Removed at the end, the
+# server's log kept when a stage did not pass.
+run=$(mktemp -d "$cache/run-XXXXXXXX") || exit 1
+stamp=$run/started
+touch "$stamp"
+failed=0
+engine_wait=${VF_ENGINE_WAIT:-1800}
+cleanup() {
+    vf_cleanup_proxy_cache
+    if [ "$1" = 0 ] && [ "$failed" = 0 ]; then rm -rf "$run"; else echo "kept: $run"; fi
+}
+trap 'cleanup "$?"' EXIT
 export PYTHONDONTWRITEBYTECODE=1 TORCH_COMPILE_DISABLE=1
 export DO_NOT_TRACK=1 HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_OFFLINE=1
 

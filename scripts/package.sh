@@ -23,7 +23,8 @@
 # is older than the sources.
 # $DIST: the built tree to pack and where the archive goes (default: dist/ of this tree).
 # Prints what it packed and the checksums.
-# Output: volta-forever-<version>-linux-x86_64.tar.zst (or .tar.gz if zstd is missing).
+# Output: volta-forever-<version>-linux-x86_64.tar.gz (what install.sh downloads), the same as
+# .tar.zst when zstd is there, and SHA256SUMS, which names them.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 # (The version of the workspace, unless another is given.)
@@ -198,14 +199,20 @@ pack() {
         --numeric-owner --mode='u=rwX,go=rX' -cf - "$name"
 }
 echo "--- packing $name ---"
+# A .tar.gz always: it is what install.sh downloads, and gzip is on every system. A .tar.zst
+# too when zstd is there (smaller). SHA256SUMS names what was written, for whoever downloads.
+archives=("${name}.tar.gz")
+pack | gzip -n -9 > "$staging/${name}.tar.gz"
 if command -v zstd >/dev/null 2>&1; then
-    archive="${name}.tar.zst"
-    pack | zstd -9 --single-thread > "$staging/$archive"
-else
-    archive="${name}.tar.gz"
-    pack | gzip -n -9 > "$staging/$archive"
+    archives+=("${name}.tar.zst")
+    pack | zstd -9 --single-thread > "$staging/${name}.tar.zst"
 fi
-cp "$staging/$archive" "$out/$archive"
+for archive in "${archives[@]}"; do
+    cp "$staging/$archive" "$out/$archive"
+done
+(cd "$out" && sha256sum "${archives[@]}" > SHA256SUMS)
+# (What is listed below: the last one written, the .tar.zst where there is one.)
+archive=${archives[-1]}
 echo ""
 echo "=== archive: $out/$archive ==="
 ls -lh "$out/$archive"
@@ -222,8 +229,8 @@ echo ""
 echo "=== sizes ==="
 du -sh "$pkg/lib" "$pkg/forward" "$pkg/bin" "$pkg/scripts"
 echo ""
-echo "=== checksums ==="
-sha256sum "$out/$archive"
+echo "=== checksums ($out/SHA256SUMS) ==="
+cat "$out/SHA256SUMS"
 echo ""
 echo "--- file checksums ---"
 find "$pkg" -type f | sort | while read -r f; do

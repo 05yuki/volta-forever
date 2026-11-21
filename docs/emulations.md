@@ -138,7 +138,9 @@ four accumulator registers, in straight-line code, are a chain, and are computed
 one `mma.m8n8k4.row.col` for each product instead of two. The accumulator is kept in eight
 registers of the rewriting, in Volta's layout and split: the two halves of k of a product are
 computed by different octets of the warp, and each lane holds partial sums that only the end
-of the chain adds up. The registers of the program get the accumulator back before any
+of the chain adds up. The direct load for a pair of A fragments requires consecutive matrices
+in the source load. Other pairs gather their two registers by index. The registers of the
+program get the accumulator back before any
 statement that names one of them, before a label or a branch, and at the bounds of a block.
 
 A register is followed by its name, and it has one: a member of a family written with zeros
@@ -601,7 +603,7 @@ The reference vectors are in `tests/kernels/blackwell/ref_scaled/`.
 | `cvt.rn.f16x2.f32` (pack two f32 to f16x2) | `cvt.rn.f16.f32` for each, then `mov.b32` to pack. |
 | `cvt.rn.bf16x2.f32` | The same with bf16 (a shift to f32, `cvt.rn.f16.f32` of that, shifts to assemble). |
 | `cvt.rn.tf32.f32` | The 10-bit mantissa (zero the low 13 bits), ties to even: 9 instructions. |
-| `redux.sync.{add,min,max}.{s32,u32}` | A tree of warp shuffles. |
+| `redux.sync.{add,min,max}.{s32,u32}` | A ballot identifies the participating lanes. A full warp uses five butterfly shuffles. A partial warp gathers each remaining lane once. |
 | `{min,max}.NaN.f32` | The comparison with the standard `min`/`max` does not propagate NaN; this form does. It is a comparison and a `selp`. |
 | `{min,max,add,mul,...}.relu.{s32,f32,...}` | The operation followed by a clamp to zero. |
 | `fma.rn.f32x2`, `add.rn.f32x2`, ... | Arithmetic on pairs of f32, packed in a 64-bit register. Each is two scalar operations. |

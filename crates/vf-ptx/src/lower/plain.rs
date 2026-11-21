@@ -429,7 +429,7 @@ impl<'a> Body<'a> {
             kind,
         ] = words[..]
         {
-            // The reduction over all the lanes of the warp; another member mask is not handled.
+            // The member mask names the whole warp. Some of its threads may have exited.
             let [d, a, mask] = parts[..] else {
                 return Err(unsupported("operands not recognised"));
             };
@@ -442,11 +442,36 @@ impl<'a> Body<'a> {
                 _ => format!("{operation}.{kind}"),
             };
             let value = self.fresh();
+            let [live, remaining, peer, bit, other]: [String; 5] = self.fresh_n();
+            let lane = self.lane(super::lane::Lane::Id);
+            let n = self.current_index;
+            self.scratch_predicate = true;
             emit!(self, "mov.b32 {value}, {a};");
+            emit!(self, "vote.sync.ballot.b32 {live}, 1, -1;");
+            emit!(self, "setp.ne.u32 %vf_n, {live}, -1;");
+            emit!(self, "@%vf_n bra.uni $vf_partial{n};");
             for distance in [16, 8, 4, 2, 1] {
                 let other = self.exchange(&value, distance);
                 emit!(self, "{instruction} {value}, {value}, {other};");
             }
+            emit!(self, "bra.uni $vf_reduced{n};");
+
+            // Start with this lane's own input, then visit each surviving peer once.
+            // Every lane iterates popc(live) - 1 times and shuffles with the same mask.
+            let _ = write!(self.out, "\n$vf_partial{n}:");
+            emit!(self, "shl.b32 {bit}, 1, {lane};");
+            emit!(self, "xor.b32 {remaining}, {live}, {bit};");
+            let _ = write!(self.out, "\n$vf_peers{n}:");
+            emit!(self, "setp.eq.u32 %vf_n, {remaining}, 0;");
+            emit!(self, "@%vf_n bra.uni $vf_reduced{n};");
+            emit!(self, "bfind.u32 {peer}, {remaining};");
+            emit!(self, "shfl.sync.idx.b32 {other}, {a}, {peer}, 31, {live};");
+            emit!(self, "{instruction} {value}, {value}, {other};");
+            emit!(self, "shl.b32 {bit}, 1, {peer};");
+            emit!(self, "xor.b32 {remaining}, {remaining}, {bit};");
+            emit!(self, "bra.uni $vf_peers{n};");
+            let _ = write!(self.out, "\n$vf_reduced{n}:");
+            self.shuffles = 0;
             self.written(d);
             emit!(self, "mov.b32 {d}, {value};");
         } else if memory && wide(&words).is_some() {

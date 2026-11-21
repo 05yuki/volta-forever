@@ -78,9 +78,9 @@ pub struct ModuleInfo {
     func_defs: Vec<FuncDef>,
     /// Entry function names, in order.
     pub entries: Vec<String>,
-    /// For each function (by name), the set of functions it references (calls, address-taken, etc.).
+    /// For each function (by name), functions it references in its body or through variable initializers.
     func_refs: HashMap<String, HashSet<String>>,
-    /// For each function, the set of module-level variable names it references.
+    /// For each function, module variables it references in its body or through initializers.
     var_refs: HashMap<String, HashSet<String>>,
     /// Module-level variable names that are written (stored to) by at least one function.
     written_vars: HashSet<String>,
@@ -180,13 +180,11 @@ fn find_referenced_names(text: &str) -> HashSet<String> {
 const READONLY_EXTERN_CALLEES: &[&str] = &["vprintf", "__assertfail"];
 
 fn find_writes_to_globals(
-    body_text: &[u8],
-    body_range: &std::ops::Range<usize>,
+    code: &str,
     global_names: &HashSet<String>,
     safe_callees: &HashSet<String>,
 ) -> (HashSet<String>, HashSet<String>) {
-    // Parse statements with the proper scanner.
-    let items = match scan::items(body_text, body_range.start..body_range.end) {
+    let items = match scan::items(code.as_bytes(), 0..code.len()) {
         Some(items) => items,
         None => return (HashSet::new(), HashSet::new()),
     };
@@ -204,15 +202,14 @@ fn find_writes_to_globals(
         source_names: Vec<String>,
     }
 
-    let text_str = std::str::from_utf8(body_text).unwrap_or("");
     let mut stmts: Vec<Stmt<'_>> = Vec::new();
 
     for item in &items {
         let scan::Kind::Statement { opcode, operands, .. } = &item.kind else {
             continue;
         };
-        let op = &text_str[opcode.clone()];
-        let ops = &text_str[operands.clone()];
+        let op = &code[opcode.clone()];
+        let ops = &code[operands.clone()];
         let names: Vec<String> = scan::names(ops).map(|s| s.to_string()).collect();
         // First operand (destination): up to the first comma outside braces/brackets.
         let first_comma = {
@@ -767,13 +764,17 @@ fn entry_references_var_static(
 impl ModuleInfo {
     /// Analyse a PTX module. The text should be the full module content (already lowered for Volta
     /// if needed).
-    pub fn analyse(text: &[u8]) -> ModuleInfo {
+    pub fn analyse(source: &[u8]) -> ModuleInfo {
+        // The declaration scanner, statement scanner and operand analysis must see the same
+        // tokens. Keep byte offsets and newlines so extraction can copy the original source.
+        let source_text = std::str::from_utf8(source).unwrap_or("");
+        let blanked = source_text.contains('/').then(|| scan::blank_comments(source_text));
+        let text_str = blanked.as_deref().unwrap_or(source_text);
+        let text = text_str.as_bytes();
         let header_end = find_header_end(text);
 
         // Use the existing `functions()` to find all function definitions.
         let all_funcs = crate::functions(text);
-        let text_str = std::str::from_utf8(text).unwrap_or("");
-
         let mut func_defs = Vec::new();
         let mut entries = Vec::new();
 
@@ -842,6 +843,23 @@ impl ModuleInfo {
         let mut written_vars = HashSet::new();
         let mut loaded_vars = HashSet::new();
 
+        // A referenced variable brings every symbol used to initialize it. A persistent
+        // address in an initializer can also be loaded and written through.
+        let mut initializer_refs: HashMap<&str, HashSet<String>> = HashMap::new();
+        let mut escaped_vars = HashSet::new();
+        for var in &variables {
+            let Some((_, initializer)) = text_str[var.range.clone()].split_once('=') else {
+                continue;
+            };
+            let mut refs = find_referenced_names(initializer);
+            refs.retain(|n| all_var_names.contains(n) || all_func_names.contains(n));
+            escaped_vars.extend(refs.intersection(&persistent_names).cloned());
+            if !refs.is_empty() {
+                initializer_refs.entry(&var.name).or_default().extend(refs);
+            }
+        }
+        written_vars.extend(escaped_vars.iter().cloned());
+
         // The write/load taint analysis is only needed when the module has persistent variables.
         // Modules without persistent variables have no coherence concern, and the taint analysis
         // over an empty set of globals is a no-op anyway.
@@ -849,12 +867,26 @@ impl ModuleInfo {
 
         for func in &func_defs {
             let body_text = &text_str[func.body.clone()];
-            let all_names = find_referenced_names(body_text);
+            let mut all_names = find_referenced_names(body_text);
+            if !initializer_refs.is_empty() {
+                let mut pending: Vec<_> = all_names
+                    .iter()
+                    .filter_map(|n| initializer_refs.get(n.as_str()))
+                    .collect();
+                while let Some(refs) = pending.pop() {
+                    for name in refs {
+                        if all_names.insert(name.clone())
+                            && let Some(next) = initializer_refs.get(name.as_str())
+                        {
+                            pending.push(next);
+                        }
+                    }
+                }
+            }
             let fn_refs: HashSet<String> = all_names.intersection(&all_func_names).cloned().collect();
             let vr: HashSet<String> = all_names.intersection(&all_var_names).cloned().collect();
             if need_taint {
-                let (var_writes, var_loads) =
-                    find_writes_to_globals(text, &func.body, &persistent_names, &safe_callees);
+                let (var_writes, var_loads) = find_writes_to_globals(body_text, &persistent_names, &safe_callees);
                 written_vars.extend(var_writes);
                 loaded_vars.extend(var_loads);
             }
@@ -862,36 +894,8 @@ impl ModuleInfo {
             var_refs_map.insert(func.name.clone(), vr);
         }
 
-        // A variable whose name appears in another variable's initializer has its address escaped.
-        // Treat it as written for the split rule: the address could be loaded by any kernel and
-        // stored through.
-        let mut escaped_vars = HashSet::new();
-        for var in &variables {
-            let decl_text = std::str::from_utf8(&text[var.range.clone()]).unwrap_or("");
-            let names_in_init = find_referenced_names(decl_text);
-            for other_var in &names_in_init {
-                if persistent_names.contains(other_var) && other_var != &var.name {
-                    escaped_vars.insert(other_var.clone());
-                    written_vars.insert(other_var.clone());
-                }
-            }
-        }
-
-        // Also scan variable initializers for function name references.
-        // A variable like `.global .u64 table[2] = {func_a, func_b};` references those functions.
-        // When the variable is needed, those functions are also needed.
-        let mut var_func_deps: HashMap<String, HashSet<String>> = HashMap::new();
-        for var in &variables {
-            let decl_text = std::str::from_utf8(&text[var.range.clone()]).unwrap_or("");
-            let names = find_referenced_names(decl_text);
-            let deps: HashSet<String> = names.intersection(&all_func_names).cloned().collect();
-            if !deps.is_empty() {
-                var_func_deps.insert(var.name.clone(), deps);
-            }
-        }
-
         ModuleInfo {
-            text: text.to_vec(),
+            text: source.to_vec(),
             header: 0..header_end,
             file_directives,
             variables,
@@ -1067,30 +1071,27 @@ impl ModuleInfo {
         // Emit the header.
         out.extend_from_slice(&self.text[self.header.clone()]);
 
-        // Emit .file directives (debugging info).
-        for range in &self.file_directives {
-            out.extend_from_slice(&self.text[range.clone()]);
-        }
-
-        // Emit needed variables.
+        // A declaration or definition used as an initializer must precede that initializer.
+        // Keep the original relative order of all selected items.
+        let mut ranges: Vec<_> = self.file_directives.iter().collect();
         for var in &self.variables {
             if needed_vars.contains(&var.name) {
-                out.extend_from_slice(&self.text[var.range.clone()]);
+                ranges.push(&var.range);
             }
         }
-
-        // Emit needed function declarations: any declared function that is in the needed set.
         for decl in &self.func_decls {
-            if needed_funcs.contains(&decl.name) {
-                out.extend_from_slice(&self.text[decl.range.clone()]);
+            if needed_funcs.contains(&decl.name) || decl.name == entry_name {
+                ranges.push(&decl.range);
             }
         }
-
-        // Emit needed function definitions (in order).
         for def in &self.func_defs {
             if def.name == entry_name || needed_funcs.contains(&def.name) {
-                out.extend_from_slice(&self.text[def.range.clone()]);
+                ranges.push(&def.range);
             }
+        }
+        ranges.sort_unstable_by_key(|range| range.start);
+        for range in ranges {
+            out.extend_from_slice(&self.text[range.clone()]);
         }
 
         Some(out)
@@ -1542,6 +1543,62 @@ mod tests {
     }
 
     #[test]
+    fn comments_in_instructions_do_not_hide_access_to_module_state() {
+        let module = "\
+.version 7.0
+.target sm_75
+.address_size 64
+.global .u32 g;
+.visible .entry access(.param .u64 output) {
+    .reg .b64 %p, %out;
+    .reg .b32 %value;
+    ld.param.u64 %out, [output];
+    mov.u64 %p, g;
+    ld.global.u32 %value, [%p];
+    st.global.u32 [%out], %value;
+    ret;
+}
+.visible .entry unrelated() { ret; }
+";
+        for (original, commented) in [
+            ("mov.u64 %p", "mov.u64 /* comma, */ %p"),
+            ("mov.u64 %p", "mov.u64 // ; comma, [\n %p"),
+            ("mov.u64 %p", "mov.u64/* %ignored, */%p"),
+            ("ld.global.u32 %value,", "ld.global.u32 %value /* [ */,"),
+            ("ld.global.u32 %value", "ld.global.u32/*words*/%value"),
+        ] {
+            for program in [module.to_owned(), module.replace(original, commented)] {
+                let info = ModuleInfo::analyse(program.as_bytes());
+                assert_eq!(info.dependent_vars("access"), ["g"], "{commented}");
+                assert!(info.is_entry_independent("unrelated"));
+            }
+        }
+    }
+
+    #[test]
+    fn names_in_comments_do_not_change_call_dependencies() {
+        let module = "\
+.version 7.0
+.target sm_75
+.address_size 64
+.global .u32 g;
+.extern .func (.param .b32 result) vprintf(.param .b64 fmt, .param .b64 args);
+.func sink(.reg .b64 ptr) { ret; }
+.visible .entry caller() {
+    .reg .b64 %p;
+    mov.u64 %p, g;
+    call.uni sink /* vprintf */, (%p);
+    ret;
+}
+.visible .entry unrelated() { ret; }
+";
+        let info = ModuleInfo::analyse(module.as_bytes());
+        assert_eq!(info.dependent_vars("caller"), ["g"]);
+        assert!(info.is_entry_independent("unrelated"));
+        assert!(!info.func_refs["caller"].contains("vprintf"));
+    }
+
+    #[test]
     fn taint_through_brace_enclosed_statements() {
         // Compiler output puts statements on one line with braces:
         // `{ .reg .b64 %tmp; cvta.shared.u64 %rd12, %tmp; }`
@@ -1619,6 +1676,75 @@ mod tests {
             info.written_vars.contains("counter"),
             "counter should be detected as written through a 30-register chain"
         );
+    }
+
+    #[test]
+    fn dependencies_follow_initializer_chains_and_cycles() {
+        // caller -> dispatch -> targets -> target -> dispatch. A function
+        // address in a PTX initializer must already have been declared.
+        let module = "\
+.version 8.0
+.target sm_90
+.address_size 64
+.func target();
+.const .align 8 .u64 targets[1] /* ; = */ = {target};
+.const .align 8 .u64 dispatch = targets;
+.func target() {
+    .reg .u32 %id;
+    .reg .u64 %p;
+    ld.const.u64 %p, [dispatch];
+    mov.u32 %id, %cluster_ctaid.x;
+    ret;
+}
+.visible .entry caller() {
+    .reg .u64 %p, %fn;
+    proto: .callprototype _ ();
+    ld.const.u64 %p, [dispatch];
+    ld.const.u64 %fn, [%p];
+    call.uni %fn, (), proto;
+    ret;
+}
+.visible .entry unrelated() { ret; }
+";
+        let info = ModuleInfo::analyse(module.as_bytes());
+        let reached: HashMap<_, _> = info.reach().collect();
+        assert_eq!(reached["caller"], ["caller", "target"]);
+        assert_eq!(reached["unrelated"], ["unrelated"]);
+        let caller = String::from_utf8(info.extract("caller").unwrap()).unwrap();
+        assert_eq!(caller, module.split_once(".visible .entry unrelated").unwrap().0);
+        let unrelated = String::from_utf8(info.extract("unrelated").unwrap()).unwrap();
+        assert!(!unrelated.contains("targets"));
+        assert!(!unrelated.contains(".func target"));
+
+        let (_, report) = crate::lower_to_volta(module.as_bytes());
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(report.refused[0].kernel, "caller");
+        assert_eq!(report.refused[0].function, "target");
+    }
+
+    #[test]
+    fn variable_initializer_cycle_closes_and_preserves_forward_declarations() {
+        let module = "\
+.version 8.0
+.target sm_90
+.address_size 64
+.extern .global .u64 second;
+.global .u64 first = generic(second);
+.visible .global .u64 second = generic(first);
+.visible .entry caller() {
+    .reg .u64 %p;
+    ld.global.u64 %p, [first];
+    ret;
+}
+.visible .entry unrelated() { ret; }
+";
+        let info = ModuleInfo::analyse(module.as_bytes());
+        let mut vars = info.dependent_vars("caller");
+        vars.sort();
+        assert_eq!(vars, ["first", "second"]);
+        assert!(info.dependent_vars("unrelated").is_empty());
+        let caller = String::from_utf8(info.extract("caller").unwrap()).unwrap();
+        assert_eq!(caller, module.split_once(".visible .entry unrelated").unwrap().0);
     }
 
     #[test]

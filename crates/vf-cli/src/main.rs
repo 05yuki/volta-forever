@@ -77,6 +77,7 @@ fn extract(path: &str, dir: &str, only_sm: Option<u32>) -> Result<(), String> {
     let mut written = 0;
     for (index, &offset) in fatbin::find_containers(&bytes).iter().enumerate() {
         let fat = fatbin::parse(&bytes[offset..]).map_err(|e| format!("{path}: {e}"))?;
+        let mut occurrences = BTreeMap::new();
         for entry in fat.entries.iter().filter(|e| only_sm.is_none_or(|sm| e.sm() == sm)) {
             let extension = match entry.kind() {
                 KIND_PTX => "ptx",
@@ -84,7 +85,14 @@ fn extract(path: &str, dir: &str, only_sm: Option<u32>) -> Result<(), String> {
                 KIND_LTO_IR => "ltoir",
                 _ => "bin",
             };
-            let name = format!("{dir}/{index:04}.{}.{extension}", entry.arch_name());
+            let arch = entry.arch_name();
+            let occurrence = occurrences.entry((arch.clone(), extension)).or_insert(0usize);
+            *occurrence += 1;
+            let name = if *occurrence == 1 {
+                format!("{dir}/{index:04}.{arch}.{extension}")
+            } else {
+                format!("{dir}/{index:04}-{occurrence}.{arch}.{extension}")
+            };
             let payload = entry
                 .payload()
                 .map_err(|e| format!("{path}: fat binary {index}: {e}"))?;
@@ -244,5 +252,33 @@ fn main() -> ExitCode {
             eprintln!("vf-translate: {message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vf_fatbin::NewEntry;
+
+    #[test]
+    fn extract_preserves_multiple_ptx_entries_for_one_architecture() {
+        let fixture = include_bytes!("../../vf-fatbin/tests/data/elf75-ptx75-zstd.fatbin");
+        let fat = fatbin::parse(fixture).unwrap();
+        let ptx = fat.entries.iter().find(|entry| entry.kind() == KIND_PTX).unwrap();
+        let data = fatbin::build(&[
+            NewEntry::replace(ptx, b"first".to_vec(), 75, (8, 8)),
+            NewEntry::replace(ptx, b"second".to_vec(), 75, (8, 8)),
+            NewEntry::replace(ptx, b"third".to_vec(), 80, (8, 8)),
+        ]);
+        let tmp = std::process::Command::new("mktemp").arg("-d").output().unwrap();
+        assert!(tmp.status.success());
+        let path = std::path::Path::new(std::str::from_utf8(&tmp.stdout).unwrap().trim());
+        let input = path.join("input.fatbin");
+        std::fs::write(&input, data).unwrap();
+        extract(input.to_str().unwrap(), path.to_str().unwrap(), Some(75)).unwrap();
+        assert_eq!(std::fs::read(path.join("0000.sm_75.ptx")).unwrap(), b"first");
+        assert_eq!(std::fs::read(path.join("0000-2.sm_75.ptx")).unwrap(), b"second");
+        assert!(!path.join("0000.sm_80.ptx").exists());
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

@@ -152,6 +152,10 @@ fn contains(text: &[u8], needle: &[u8]) -> bool {
 
 /// `text` holds something `lower_to_volta` rewrites or refuses: its header alone is not enough.
 pub fn needs_lowering(text: &[u8]) -> bool {
+    body_needs_lowering(text) || CLUSTER_DIRECTIVES.iter().any(|needle| contains(text, needle))
+}
+
+fn body_needs_lowering(text: &[u8]) -> bool {
     lower::REWRITTEN.iter().any(|needle| contains(text, needle.as_bytes()))
 }
 
@@ -185,20 +189,38 @@ pub(crate) const TRAP_BODY: &[u8] = b"{\n\ttrap;\n\tret;\n}";
 /// Directives that ask for a cluster of blocks, which GPUs have from sm_90 on.
 const CLUSTER_DIRECTIVES: &[&[u8]] = &[b".explicitcluster", b".reqnctapercluster", b".maxclusterrank"];
 
-/// The whole lines between the name of `function` and its body whose first word is one of `words`.
-fn directive_lines(text: &[u8], function: &Function, words: &[&[u8]]) -> Vec<std::ops::Range<usize>> {
-    let to = function.body.start;
-    let mut lines = Vec::new();
-    let mut start = function.name.end;
-    while let Some(length) = text[start..to].iter().position(|&byte| byte == b'\n') {
-        let line = text[start..start + length].trim_ascii();
-        let word = &line[..line.iter().take_while(|byte| !byte.is_ascii_whitespace()).count()];
-        if words.contains(&word) {
-            lines.push(start..start + length + 1);
+/// Ranges of cluster directives after the signature, up to the next directive or the body.
+fn cluster_directives(text: &[u8], function: &Function) -> Vec<std::ops::Range<usize>> {
+    let header = &text[..function.body.start];
+    let mut ranges = Vec::new();
+    let mut start = None;
+    let mut at = function.name.end;
+    while at < header.len() {
+        if let Some(end) = skip_comment(header, at) {
+            at = end;
+        } else if header[at] == b'"' {
+            at = skip_string(header, at);
+        } else if header[at] == b'(' {
+            at = matching(header, at).map_or(header.len(), |end| end + 1);
+        } else if is_name_byte(header[at]) {
+            let end = at + header[at..].iter().take_while(|&&b| is_name_byte(b)).count();
+            if header[at] == b'.' {
+                if let Some(previous) = start.take() {
+                    ranges.push(previous..at);
+                }
+                if CLUSTER_DIRECTIVES.contains(&&header[at..end]) {
+                    start = Some(at);
+                }
+            }
+            at = end;
+        } else {
+            at += 1;
         }
-        start += length + 1;
     }
-    lines
+    if let Some(last) = start {
+        ranges.push(last..header.len());
+    }
+    ranges
 }
 
 use scan::{skip_comment, skip_string};
@@ -437,8 +459,8 @@ pub fn lower_to_volta_with(text: &[u8], options: lower::Options) -> (Vec<u8>, Lo
     let mut outside: Option<Vec<String>> = None;
     for function in &functions {
         let body = &text[function.body.clone()];
-        let cluster = directive_lines(text, function, CLUSTER_DIRECTIVES);
-        if cluster.is_empty() && !needs_lowering(body) {
+        let cluster = cluster_directives(text, function);
+        if cluster.is_empty() && !body_needs_lowering(body) {
             continue;
         }
         for line in &cluster {

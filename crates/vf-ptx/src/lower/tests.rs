@@ -1201,7 +1201,7 @@ fn instructions_of_later_targets_get_their_plain_equivalents() {
     assert!(lowered.contains("\tcvt.u32.u16 %vf_r7, %h1;\n\tshl.b32 %vf_r7, %vf_r7, 16;\n\tmov.b32 %f0, %vf_r7;\n"));
     // Five exchanges reach every lane.
     assert_eq!(count(&lowered, "shfl.sync.bfly.b32"), 5);
-    assert_eq!(count(&lowered, "max.s32 %vf_r8, %vf_r8, "), 5);
+    assert_eq!(count(&lowered, "max.s32 %vf_r8, %vf_r8, "), 6);
     assert!(lowered.contains(
         "\tld.global.v4.b32 {%r1, %r2, %r3, %r4}, [%rd1+32];\n\tld.global.v4.b32 {%r5, %r6, %r7, %r8}, [%rd1+48];\n"
     ));
@@ -3044,4 +3044,55 @@ fn a_chain_before_its_loads_in_the_text_takes_what_they_load() {
     // No operand is gathered: the shuffles are those of the accumulator and of the addresses.
     assert_eq!(count(&lowered, "shfl.sync.idx.b32"), 4 + 16 + 8);
     assert_eq!(undeclared(&lowered), Vec::<String>::new());
+}
+
+#[test]
+fn regression_chain_gathers_nonconsecutive_a_fragments() {
+    for (low, high) in [("%r1", "%r3"), ("%r3", "%r1"), ("%r2", "%r2")] {
+        let pair = format!("{{{low}, {high}}}");
+        let source = loaded_chain("", "").replace("{%r1, %r2}", &pair);
+        let lowered = lower_aligned(&source);
+        assert_eq!(count(&lowered, CHAIN), 4);
+        for name in [low, high] {
+            assert!(lowered.contains(&format!("ld.shared.u32 {name},")));
+            assert!(lowered.contains(&format!(", {name}, %vf_cw0, 31, -1;")));
+        }
+    }
+}
+
+#[test]
+fn regression_reduction_keeps_only_live_lanes() {
+    for op in ["add.s32", "min.s32", "max.u32", "and.b32", "or.b32", "xor.b32"] {
+        let source = format!(
+            "{{\n.reg .b32 %r<2>;\n.reg .pred %p;\nmov.u32 %r0, %laneid;\n\
+             setp.ge.u32 %p, %r0, 16;\n@%p exit;\nredux.sync.{op} %r1, %r0, -1;\nret;\n}}"
+        );
+        let lowered = lower(&source);
+        assert!(nth(&lowered, "vote.sync.ballot.b32", 0) < nth(&lowered, "shfl.sync.bfly", 0));
+        assert!(lowered.contains("bfind.u32"));
+        assert!(lowered.contains("shfl.sync.idx.b32"));
+        assert_eq!(count(&lowered, "shfl.sync.bfly"), 5);
+        assert!(undeclared(&lowered).is_empty());
+    }
+}
+
+#[test]
+fn regression_ptx_integer_radices_in_sizes_and_offsets() {
+    let source = "{\n.reg .b32 %r<8>;\n.reg .b64 %rd;\n\
+                  cp.async.ca.shared.global [%r0+32], [%rd+64], 16, 8;\n\
+                  ld.global.v8.b32 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7}, [%rd+32];\nret;\n}";
+    let expected = lower(source);
+    for encoded in [
+        source
+            .replace("+32", "+040")
+            .replace("+64", "+0100")
+            .replace(", 8;", ", 010;"),
+        source.replace(", 8;", ", +010U;"),
+        source
+            .replace("+32", "+0X20U")
+            .replace("+64", "+0b1000000")
+            .replace("16, 8;", "020, 0B1000U;"),
+    ] {
+        assert_eq!(lower(&encoded), expected);
+    }
 }

@@ -14,9 +14,9 @@ vf llama-completion -m model.gguf -p "Hello" -n 48 -ngl 99
 What a GPU of 2017 lacks is emulated on what it has: the tensor-core instructions of Turing,
 Ampere and Blackwell, so your V100 now speaks BF16, FP8 and NVFP4.
 
-> **Preview (0.1.0-preview).** Young software, run on Tesla V100-SXM2-32GB cards with NVIDIA's
-> driver 580.178.04. What it cannot run it refuses with a reason; `LIMITS.md` has what does not
-> work, what is slower and what was not tried. Not NVIDIA's, and not endorsed by NVIDIA.
+> Tested on Tesla V100-SXM2-32GB cards with NVIDIA's driver 580.178.04. What it cannot run it
+> refuses with a reason; `LIMITS.md` has what does not work, what is slower and what was not
+> tried. Not NVIDIA's, and not endorsed by NVIDIA.
 
 ## Why
 
@@ -30,31 +30,24 @@ program loads it. The program is not touched, and neither is the driver.
 
 ## Quick start
 
-You need a Tesla V100, NVIDIA's driver 580, and Linux x86-64 with glibc 2.34 or later.
+You need a Tesla V100, NVIDIA's driver 580, and Linux x86-64 with glibc 2.34 or later (Ubuntu
+22.04, Debian 12, or later ones).
 
-**1. Get volta-forever.** Unpack an archive and put its `bin` on your path. (There is no
-binary release yet: `scripts/package.sh` makes the archive from a built tree, `Build` below;
-the launcher also works from the built tree itself, as `scripts/vf`.) The command is `vf`;
-`volta-forever` is the same program under its long name.
+**1. Install.**
 
 ```sh
-tar --zstd -xf volta-forever-VERSION-linux-x86_64.tar.zst
-export PATH=$PWD/volta-forever-VERSION-linux-x86_64/bin:$PATH
+curl -fsSL https://raw.githubusercontent.com/nbald/volta-forever/main/install.sh | bash
 ```
 
-**2. Get NVIDIA's cuBLAS for CUDA 12.9.2.** NVIDIA's libraries are NVIDIA's to distribute, so
-none is in the archive. This downloads from NVIDIA's servers the one that a program cannot
-keep from CUDA 13 (1 GB):
+This puts volta-forever under `~/.local/share/volta-forever` and the command `vf` in
+`~/.local/bin` (`volta-forever` is the same program under its long name), then downloads
+NVIDIA's cuBLAS for CUDA 12.9.2 from NVIDIA's servers (1 GB). NVIDIA's libraries are NVIDIA's
+to distribute, so none is in the archive, and cuBLAS is the one that a program cannot keep
+from CUDA 13. The script installs no package of the system and asks for no password; it needs
+`curl`, `python3` and `xz`, and says so when one is missing. `INSTALL.md` has what it does
+step by step, its settings, and the same by hand.
 
-```sh
-vf fetch
-```
-
-A program's other CUDA 13 libraries (the cuFFT, cuSOLVER and cuSPARSE of a PyTorch wheel) are
-translated like the rest of its code. `vf fetch --all` downloads their CUDA 12.9.2 builds too
-(2.7 GB in all), which still have code for Volta, and the layer then uses those instead.
-
-**3. Run your program** with `vf` in front:
+**2. Run your program** with `vf` in front:
 
 ```sh
 vf python3 train.py
@@ -62,6 +55,10 @@ vf python3 train.py
 
 That is all. If something is missing, `vf doctor` says what: the card, the driver, the
 libraries.
+
+A program's other CUDA 13 libraries (the cuFFT, cuSOLVER and cuSPARSE of a PyTorch wheel) are
+translated like the rest of its code. `vf fetch --all` downloads their CUDA 12.9.2 builds too
+(2.7 GB in all), which still have code for Volta, and the layer then uses those instead.
 
 ### With pip and virtual environments
 
@@ -97,8 +94,8 @@ Measured on one Tesla V100-SXM2-32GB, driver 580.178.04, with no switch set, on 
 | PyTorch 2.14.0 and 2.14.1, the stock wheels for CUDA 13 (2.14.1 is what `pip install torch` brings today) | 925 operations and 32 small whole models, the tests' own (`tests/gpu/torch-ops.py`, `torch-models.py`) | 924 operations give the CPU's result, and the CPU does not do the other one; 32 models of 32 |
 | llama.cpp b12418, the official build for CUDA 13.5 | Qwen2.5-0.5B-Instruct (GGUF, Q4_0), flash attention on and off | the CPU's text; next-token distributions at a KL divergence of 0.0017 from the CPU's |
 | | Qwen3.8-27B with NVFP4 weights (GGUF) | the CPU's text; KL divergence 0.0005 |
-| vLLM 0.34.0 (pip) | Qwen2.5-0.5B-Instruct in f16, three prompts, 50 tokens each, greedy | the engine's text and its HTTP server's are the CPU's (`transformers`, f32), token for token |
-| SGLang 0.5.23 (pip), its default attention (FlashInfer) | the same | the same |
+| vLLM 0.34.0 (pip) | Qwen2.5-0.5B-Instruct in f16, three prompts, greedy, 50 tokens each in the engine and up to 32 over HTTP | the engine's text and its HTTP server's are the CPU's (`transformers`, f32), token for token |
+| SGLang 0.5.23 (pip), its default attention (FlashInfer) | Qwen2.5-0.5B-Instruct in f16, three prompts, greedy, 50 tokens each in the engine and over HTTP | the engine and server both match the CPU reference token for token |
 | ZML (upstream build, its own CUDA libraries) | Qwen3.5-9B in f16, one prompt | it answers with the expected word: compared with no reference, the weakest of these checks |
 
 **What does it cost?** Compared with a build of the same program that has code for Volta,
@@ -111,7 +108,7 @@ where one exists.
 | | the same: a prompt of 2,048 tokens | 9,700 to 11,900 tokens a second | 19,600 to 27,800 |
 | | Qwen3.8-27B with NVFP4 weights: generation | 34.6 to 34.7 tokens a second | 34.8 to 35.0 |
 | | the same: a prompt of 512 tokens | 300 tokens a second | 224 |
-| vLLM 0.34.0 | Qwen2.5-0.5B-Instruct in f16, one request at a time | 83 to 99 tokens a second | none exists: with PyTorch's build for CUDA 12.6 under it, vLLM 0.34.0 does not start (its own compiled part and its torchvision are built for CUDA 13) |
+| vLLM 0.34.0 | Qwen2.5-0.5B-Instruct in f16, one request at a time | 83 to 99 tokens a second | no native reference was validated here. Installing PyTorch for CUDA 12.6 left this vLLM wheel and its torchvision built for CUDA 13, and vLLM failed to start |
 | SGLang 0.5.23 | the same | 45 to 52 tokens a second (FlashInfer), 55 to 59 (`--attention-backend triton`) | none to compare with |
 | ZML | Qwen3.5-9B in f16 | 27 to 29 tokens a second | none to compare with (upstream builds for CUDA 13 only) |
 

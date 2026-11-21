@@ -1,6 +1,6 @@
 # Changes
 
-## 0.1.0-preview (2026-11-21)
+## 0.1.0 (2026-11-21)
 
 The first version made public. It runs software built with CUDA 13 on a Tesla V100 with the 580
 driver:

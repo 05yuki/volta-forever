@@ -3,7 +3,7 @@
 
 use crate::scan;
 
-use super::types::{Element, Fp8, ScaledKind, address, integer, type_width};
+use super::types::{Element, Fp8, ScaledKind, address, integer, place_of, type_width};
 use super::{LATER_TYPES, Unsupported};
 
 /// A tensor-core instruction this module rewrites, with its operands.
@@ -428,11 +428,7 @@ pub(super) fn parse<'a>(opcode: &str, operands: &'a str) -> Result<Tensor<'a>, U
             [to, from, size, amount] => (to, from, size, Some(amount)),
             _ => return Err(unsupported("operands not recognised")),
         };
-        let place = |operand| {
-            let (base, offset) = address(operand)?;
-            Some((base, offset.map_or(Some(0), |offset| offset.parse().ok())?))
-        };
-        match (words[2], plain, place(to), place(from), integer(size)) {
+        match (words[2], plain, place_of(to), place_of(from), integer(size)) {
             ("ca", true, Some(to), Some(from), Some(size @ (4 | 8 | 16)))
             | ("cg", true, Some(to), Some(from), Some(size @ 16)) => Ok(Tensor::Copy { size, to, from, amount }),
             _ => Err(unsupported("no Volta sequence for this form")),

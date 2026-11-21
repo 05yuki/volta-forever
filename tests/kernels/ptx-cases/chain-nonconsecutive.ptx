@@ -1,0 +1,31 @@
+.version 7.0
+.target sm_75
+.address_size 64
+.visible .entry k(.param .u64 output) .reqntid 32,1,1 {
+    .reg .b32 %a<4>, %b, %d<4>, %lane, %base, %value;
+    .reg .b64 %out;
+    .reg .pred %high;
+    .shared .align 16 .b8 rows[512];
+    mov.u32 %lane, %laneid;
+    mov.u32 %base, rows;
+    mad.lo.u32 %base, %lane, 16, %base;
+    // The first two matrices contain ones, the last two contain twos.
+    setp.ge.u32 %high, %lane, 16;
+    selp.b32 %value, 0x40004000, 0x3c003c00, %high;
+    st.shared.v4.b32 [%base], {%value,%value,%value,%value};
+    bar.sync 0;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%a0,%a1,%a2,%a3}, [%base];
+    ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%b}, [%base];
+    mov.b32 %d0, 0;
+    mov.b32 %d1, 0;
+    mov.b32 %d2, 0;
+    mov.b32 %d3, 0;
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a2}, {%b}, {%d0,%d1,%d2,%d3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a2}, {%b}, {%d0,%d1,%d2,%d3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a2}, {%b}, {%d0,%d1,%d2,%d3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a2}, {%b}, {%d0,%d1,%d2,%d3};
+    ld.param.u64 %out, [output];
+    mad.wide.u32 %out, %lane, 16, %out;
+    st.global.v4.b32 [%out], {%d0,%d1,%d2,%d3};
+    ret;
+}

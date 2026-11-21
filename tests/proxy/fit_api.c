@@ -23,11 +23,14 @@
 // k_fit_regs (tests/kernels/k_fit_test.135.sm75.cubin).
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <linux/futex.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 typedef int CUresult;
@@ -50,12 +53,12 @@ static void reset_counters(void) {
     *(int*)dlsym(mock, "fit_mock_set_calls") = 0;
     *(int*)dlsym(mock, "fit_mock_require_attr") = 0;
     memset(dlsym(mock, "fit_mock_attrs"), 0, 1024 * sizeof(int));
-    *(int*)dlsym(mock, "fit_mock_pause") = 0;
-    *(int*)dlsym(mock, "fit_mock_started") = 0;
-    *(int*)dlsym(mock, "fit_mock_release") = 0;
-    *(int*)dlsym(mock, "fit_mock_hold_set") = 0;
-    *(int*)dlsym(mock, "fit_mock_set_held") = 0;
-    *(int*)dlsym(mock, "fit_mock_set_release") = 0;
+    *(_Atomic int*)dlsym(mock, "fit_mock_pause") = 0;
+    *(_Atomic int*)dlsym(mock, "fit_mock_started") = 0;
+    *(_Atomic int*)dlsym(mock, "fit_mock_release") = 0;
+    *(_Atomic int*)dlsym(mock, "fit_mock_hold_set") = 0;
+    *(_Atomic int*)dlsym(mock, "fit_mock_set_held") = 0;
+    *(_Atomic int*)dlsym(mock, "fit_mock_set_release") = 0;
 }
 static int mock_loads(void) { return *(int*)dlsym(mock, "fit_mock_loads"); }
 static int mock_unloads(void) { return *(int*)dlsym(mock, "fit_mock_unloads"); }
@@ -111,13 +114,33 @@ static void *launch_thread_fn(void *arg) {
 }
 
 // A setting made from a thread: on a function (kernel == 0) or on a library's kernel.
-struct set_args { void *handle; int kernel; int value; volatile int done; };
+struct set_args { void *handle; int kernel; int value; _Atomic int tid, done; CUresult result; };
 static void *set_thread_fn(void *arg) {
     struct set_args *p = arg;
-    if (p->kernel) cuKernelSetAttribute(8, p->value, p->handle, 0);
-    else cuFuncSetAttribute(p->handle, 8, p->value);
+    p->tid = (int)syscall(SYS_gettid);
+    if (p->kernel) p->result = cuKernelSetAttribute(8, p->value, p->handle, 0);
+    else p->result = cuFuncSetAttribute(p->handle, 8, p->value);
     p->done = 1;
     return NULL;
+}
+
+// A reaches its pause inside the mock before B starts. The worker has no other
+// blocking calls between publishing its tid and returning from the setter. In
+// the serialized proxy B waits on the setter mutex; without it B completes.
+// A thread delayed before entering the setter satisfies neither observation.
+static int waiting_on_setter(int tid) {
+    if (!tid) return 0;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d/syscall", tid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;  // The worker may already have exited.
+    long nr;
+    unsigned long address, op;
+    int parsed = fscanf(f, "%ld %lx %lx", &nr, &address, &op);
+    fclose(f);
+    if (parsed != 3 || nr != SYS_futex) return 0;
+    unsigned long command = op & FUTEX_CMD_MASK;
+    return command == FUTEX_WAIT || command == FUTEX_WAIT_BITSET;
 }
 
 // Two settings of one kernel at once (CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 32768 and
@@ -128,27 +151,49 @@ static void *set_thread_fn(void *arg) {
 static void two_settings_at_once(const char *name, void *handle, int kernel, void *launched,
                                  int first_module, int second_module) {
     int *attrs = dlsym(mock, "fit_mock_attrs");
-    *(int*)dlsym(mock, "fit_mock_set_held") = 0;
-    *(int*)dlsym(mock, "fit_mock_set_release") = 0;
-    *(int*)dlsym(mock, "fit_mock_hold_set") = 32768;
-    struct set_args a = { handle, kernel, 32768, 0 }, b = { handle, kernel, 65536, 0 };
+    _Atomic int *held = dlsym(mock, "fit_mock_set_held");
+    _Atomic int *release = dlsym(mock, "fit_mock_set_release");
+    *held = 0;
+    *release = 0;
+    *(_Atomic int*)dlsym(mock, "fit_mock_hold_set") = 32768;
+    struct set_args a = { .handle = handle, .kernel = kernel, .value = 32768 };
+    struct set_args b = { .handle = handle, .kernel = kernel, .value = 65536 };
     pthread_t ta, tb;
-    pthread_create(&ta, NULL, set_thread_fn, &a);
-    for (int i = 0; i < 10000 && !*(volatile int*)dlsym(mock, "fit_mock_set_held"); i++) usleep(1000);
-    pthread_create(&tb, NULL, set_thread_fn, &b);
-    // (The second call returns at once when nothing orders the two, and waits for the first when
-    // something does: a fifth of a second is given to it either way.)
-    for (int i = 0; i < 200 && !b.done; i++) usleep(1000);
-    *(int*)dlsym(mock, "fit_mock_set_release") = 1;
+    if (pthread_create(&ta, NULL, set_thread_fn, &a)) {
+        fprintf(stderr, "%s: could not start first setter\n", name);
+        exit(2);
+    }
+    for (int i = 0; i < 10000 && !*held; i++) usleep(1000);
+    if (!*held) {
+        fprintf(stderr, "%s: first setter did not reach its pause\n", name);
+        exit(2);
+    }
+    if (pthread_create(&tb, NULL, set_thread_fn, &b)) {
+        fprintf(stderr, "%s: could not start second setter\n", name);
+        exit(2);
+    }
+    int observed = 0;
+    for (int i = 0; i < 10000; i++) {
+        if (b.done || waiting_on_setter(b.tid)) {
+            observed = 1;
+            break;
+        }
+        usleep(1000);
+    }
+    *release = 1;
     pthread_join(ta, NULL);
     pthread_join(tb, NULL);
+    if (!observed) {
+        fprintf(stderr, "%s: could not observe the second setter while the first was held\n", name);
+        exit(2);
+    }
     char label[96];
     checks++;
     {
-        int ok = attrs[first_module] == attrs[second_module];
+        int ok = !a.result && !b.result && attrs[first_module] == 65536 && attrs[second_module] == 65536;
         if (!ok) wrong++;
         snprintf(label, sizeof label, "%s_same_value", name);
-        printf("%s  %-50s first image=%d second image=%d (want the same)\n",
+        printf("%s  %-50s first image=%d second image=%d (want both 65536)\n",
                ok ? "ok   " : "WRONG", label, attrs[first_module], attrs[second_module]);
     }
     *(int*)dlsym(mock, "fit_mock_require_attr") = attrs[first_module] == 65536;
@@ -474,9 +519,9 @@ int main(int argc, char **argv) {
     // prevents it from launching a second image after asked_for_data returned. A later launch is
     // also refused.
     reset_counters();
-    *(int*)dlsym(mock, "fit_mock_pause") = 1;
-    *(int*)dlsym(mock, "fit_mock_started") = 0;
-    *(int*)dlsym(mock, "fit_mock_release") = 0;
+    *(_Atomic int*)dlsym(mock, "fit_mock_pause") = 1;
+    *(_Atomic int*)dlsym(mock, "fit_mock_started") = 0;
+    *(_Atomic int*)dlsym(mock, "fit_mock_release") = 0;
     r = cuModuleLoadData(&module, image); if (r) return 1;
     r = cuModuleGetFunction(&function, module, "k_fit_regs"); if (r) return 1;
     // Thread A: launch in a thread (the second load will pause).
@@ -485,11 +530,11 @@ int main(int argc, char **argv) {
     pthread_t thread;
     pthread_create(&thread, NULL, launch_thread_fn, &targ);
     // Wait for the second load to reach the pause point.
-    for (int i = 0; i < 10000 && !*(volatile int*)dlsym(mock, "fit_mock_started"); i++) usleep(1000);
+    for (int i = 0; i < 10000 && !*(_Atomic int*)dlsym(mock, "fit_mock_started"); i++) usleep(1000);
     // Thread B: asked_for_data.
     { uint64_t dptr; size_t sz; cuModuleGetGlobal_v2(&dptr, &sz, module, "fit_scale"); }
     // Release the paused load.
-    *(int*)dlsym(mock, "fit_mock_release") = 1;
+    *(_Atomic int*)dlsym(mock, "fit_mock_release") = 1;
     pthread_join(thread, NULL);
     checks++;
     {

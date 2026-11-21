@@ -1,0 +1,29 @@
+.version 7.0
+.target sm_80
+.address_size 64
+.visible .entry k(.param .u64 output) .reqntid 32,1,1 {
+    .reg .b32 %lane, %input, %sum, %least, %greatest, %parity;
+    .reg .b64 %out;
+    .reg .pred %leave, %other;
+    ld.param.u64 %out, [output];
+    mov.u32 %lane, %laneid;
+    mad.wide.u32 %out, %lane, 16, %out;
+    // Lanes 0 and 3 survive and reduce the values 1 and 4. All other
+    // lanes store the expected values before exiting for the one-warp harness.
+    mov.u32 %sum, 5;
+    mov.u32 %least, 1;
+    mov.u32 %greatest, 4;
+    mov.u32 %parity, 5;
+    setp.ne.u32 %leave, %lane, 0;
+    setp.ne.u32 %other, %lane, 3;
+    and.pred %leave, %leave, %other;
+    @%leave st.global.v4.b32 [%out], {%sum,%least,%greatest,%parity};
+    @%leave exit;
+    add.u32 %input, %lane, 1;
+    redux.sync.add.s32 %sum, %input, -1;
+    redux.sync.min.u32 %least, %input, -1;
+    redux.sync.max.s32 %greatest, %input, -1;
+    redux.sync.xor.b32 %parity, %input, -1;
+    st.global.v4.b32 [%out], {%sum,%least,%greatest,%parity};
+    ret;
+}

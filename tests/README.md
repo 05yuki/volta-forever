@@ -39,7 +39,8 @@ default; a variable already set in the environment wins.
 - `run.sh`: the test kernels, loaded as PTX and as machine code through the proxy (retargeting,
   translation, refusal, the cache, the second translation at launch, the CUDA runtime), give
   what the native sm_70 build of the same source, the host models or the reference vectors of
-  an RTX 5090 say. 68 cases.
+  an RTX 5090 say. 71 cases, including nonconsecutive MMA fragments, a partial warp reduction
+  and a zero-filled asynchronous copy.
 - `forward.sh`: for each of ten libraries, a program built against CUDA 13.5 calls a few
   functions through the forwarding library and gets the host's result (cuBLAS is exercised by
   `run.sh`).
@@ -105,7 +106,10 @@ exit status, standard input, a child process), what it refuses, how it is turned
 
 | Script | What it does | Time | What it needs |
 |---|---|---|---|
-| `launcher.sh` | 63 checks; run it under `dash` and under `bash --posix` | seconds | the launcher (`scripts/vf`); python3 3.10 or later with `venv` for the checks of `vf venv` |
+| `launcher.sh` | 66 checks; run it under `dash` and under `bash --posix` | seconds | the launcher (`scripts/vf`); python3 3.10 or later with `venv` for the checks of `vf venv` |
+
+The downloader tests use local archives. Run `python3 tests/launcher/fetch-redist.py`
+to check retries after an interruption, concurrent fetches and runtime-only installs.
 
 ### Tests of the machine-code translator (`tests/sass/`)
 
@@ -132,6 +136,17 @@ through the stand-in.
 |---|---|---|---|
 | `fit_api.sh` | The second translation at launch by every way a program can come to it: a variable or a surface reference asked for by name (both exported names, and what `cuGetProcAddress` gives) excludes it; the launch entries for the per-thread default stream, a library's kernels taken by enumeration, and the functions of the module that the driver gives for a library are launched from it; a library and that module are one image; an enumeration into an array larger than the library's number of kernels reads only what the driver wrote; what is set on a library's kernel is given to the function of the same name in the library's module, for the device of its context, unless the function has a setting of its own, and when it is set later too; a launch whose second translation was being made when the program asked for data is refused; two settings of one kernel made at once leave it and its second image with the same value. 33 checks | seconds | the proxy built, `tests/kernels/k_fit_test.135.sm75.cubin`, gcc |
 | `marker.sh` | The functions by which a program can tell that the layer is there (`volta_forever_abi`, `volta_forever_version`): found by `dlsym` in the layer's `libcuda.so.1`, with the interface number 1 and the workspace's version | seconds | the proxy built, gcc |
+
+Two more host regressions exercise the built libraries directly:
+
+```sh
+python3 tests/proxy/library_entries.py dist/lib/libcuda.so.1
+python3 tests/proxy/jitlink_objects.py dist/lib/libnvJitLink.so.13 toolkits/cuda-12.9.2
+```
+
+The first checks filtered kernel counts and enumeration with a stand-in driver, including
+deferred loads and the lifetime of replacement images. The second links a native sm_70
+device function from both a host object and a static library with the CUDA 12.9 toolkit.
 
 ### Forwarding stack test (`tests/forward/`)
 

@@ -7,21 +7,60 @@ Tesla V100) run on V100s with the 580 driver.
 
 - **GPU**: NVIDIA Tesla V100 (compute capability 7.0)
 - **Driver**: NVIDIA 580.178.04 (tested; the last branch with Volta support)
-- **OS**: Linux x86_64, glibc 2.34 or later (Ubuntu 22.04+, Debian 12+, RHEL 9+, Fedora 36+)
+- **OS**: Linux x86_64, glibc 2.34 or later. The installation was run in fresh systems of
+  Ubuntu 22.04, 24.04 and 26.04 and of Debian 12 and 13 (2026-11-21; no GPU in them: what was
+  seen is that everything installs, that the binaries start, and that the downloads are
+  made). RHEL 9 and Fedora 36 or later have the C library it takes; not tried.
+- **On a fresh Debian or Ubuntu**, what the commands below use and the system does not have
+  yet: `curl` (for the installer), `python3` and `xz-utils` (for `vf fetch`), `python3-venv`
+  (for `vf venv`). The installer and the launcher say which one is missing; they install
+  nothing themselves.
 - **CUDA 12.9.2 runtime libraries**: not included; `vf fetch` downloads them (below)
 
-## 1. Unpack
+## 1. Install
+
+With the installer:
 
 ```sh
-tar --zstd -xf volta-forever-VERSION-linux-x86_64.tar.zst
+curl -fsSL https://raw.githubusercontent.com/nbald/volta-forever/main/install.sh | bash
+```
+
+`install.sh` is at the root of the repository; read it before you run it, or download it and
+run it as a file. What it does, in order:
+
+1. checks the machine: Linux, x86-64, glibc 2.34 or later, and the tools it uses (`tar`,
+   `gzip`, `sha256sum`, `curl` or `wget`);
+2. downloads the archive of its version and the file `SHA256SUMS` from the project's releases,
+   and stops if the archive's SHA-256 is not the one that the file gives;
+3. unpacks the archive under `~/.local/share/volta-forever` (`/opt/volta-forever` for root)
+   and links `vf` and `volta-forever` in `~/.local/bin` (`/usr/local/bin` for root). The CUDA
+   12.9.2 libraries that an earlier installation downloaded are kept;
+4. runs `vf fetch` (section 2: NVIDIA's cuBLAS, from NVIDIA's servers), when `python3` and `xz`
+   are there; when one is not, it says which and leaves that step to you;
+5. runs `vf doctor`, and says so if the directory of the commands is not on your `PATH`.
+
+It installs no package of the system, asks for no password and writes nowhere else.
+
+| Setting (environment) | |
+|---|---|
+| `VF_VERSION` | the version to install (default: the one the script was published with) |
+| `VF_PREFIX`, `VF_BIN` | where versions are unpacked, and where the commands are linked |
+| `VF_INSTALL_FETCH=0` | do not run `vf fetch` |
+| `VF_INSTALL_BASE` | where the archive and `SHA256SUMS` are taken from (a mirror, a directory served locally) |
+
+To remove it: delete the directory of `VF_PREFIX` and the two links.
+
+By hand, from a release's archive:
+
+```sh
+tar -xzf volta-forever-VERSION-linux-x86_64.tar.gz      # or: tar --zstd -xf ...tar.zst
 export PATH=$PWD/volta-forever-VERSION-linux-x86_64/bin:$PATH
 ```
 
-(`tar -xzf` if the archive is `.tar.gz`.) `bin/vf` is the launcher: everything below goes
-through it. `bin/volta-forever` is a link to it, the same program under its long name (in the
-fish shell, `vf` may already be the command of VirtualFish). It finds the rest of the archive
-from its own place, so it may also be called by its full path, or through a link from a
-directory of the `PATH`.
+`bin/vf` is the launcher: everything below goes through it. `bin/volta-forever` is a link to
+it, the same program under its long name (in the fish shell, `vf` may already be the command
+of VirtualFish). It finds the rest of the archive from its own place, so it may also be called
+by its full path, or through a link from a directory of the `PATH`.
 
 ## 2. Download the CUDA 12.9.2 libraries
 
@@ -91,8 +130,10 @@ vf venv .venv                 # python3 -m venv .venv, then every Python of it r
 
 `vf venv DIR` makes the environment when DIR is not one yet (`--python PYTHON` names the
 Python to make it with, and what follows `--` goes to `python -m venv`), or takes one that is
-there (made by `python -m venv` or by `uv venv`: a directory with a `pyvenv.cfg`). It puts a
-module in the environment's
+there (made by `python -m venv` or by `uv venv`: a directory with a `pyvenv.cfg`). When Python
+cannot make the environment (on Debian and Ubuntu, without the package `python3-venv`), it
+says what Python says and removes what the attempt left, so that the same command works once
+the package is there. It puts a module in the environment's
 `site-packages` that every Python of the environment imports when it starts, and that starts
 Python again through the launcher when the layer's environment is not set yet: activated or
 not, started by a service or by an editor. So a package that compiles GPU code when it is

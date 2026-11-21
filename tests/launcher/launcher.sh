@@ -51,7 +51,7 @@ libcublasLt.so.13                222       175         0       36       11      
 libcufft.so.12                    75        57         0        1       17        0   libcufft.so.11
 total                           9710      9492      6768       49      169        0
 REPORT
-    echo "0.1.0-preview test" > "$_d/VERSION"
+    echo "0.1.0 test" > "$_d/VERSION"
     # Copy the launcher into bin/.
     cp "$launcher" "$_d/bin/vf"
     chmod +x "$_d/bin/vf"
@@ -99,7 +99,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0-preview"
+version = "0.1.0"
 TOML
     cp "$launcher" "$_d/scripts/vf"
     chmod +x "$_d/scripts/vf"
@@ -155,7 +155,7 @@ esac
 name="env-volta-forever-version"
 vfv=$(get_var "$vf" VOLTA_FOREVER)
 case $vfv in
-    "0.1.0-preview")
+    "0.1.0")
         pass "$name" ;;
     *)
         fail "$name" "got: $vfv" ;;
@@ -359,6 +359,26 @@ case $map in
         fail "$name" "got: $map" ;;
 esac
 
+# Rust str::trim accepts Unicode White_Space in every locale, including NBSP and NEL.
+# U+001C..U+001F are ordinary filename bytes for the audit library.
+name="map-file-unicode-whitespace"
+padding=$(printf '\011\302\240\302\205\341\232\200\342\200\207\342\200\250\342\200\257\342\201\237\343\200\200')
+controls=$(printf '\034\035\036\037')
+printf '%s# comment=with:colon\n%sabs.so%s=%s/absolute.so%s\nrel.so=%srelative.so%s\n%sname%s=%sfile%s' \
+    "$padding" "$padding" "$padding" "$padding" "$padding" "$padding" "$padding" \
+    "$controls" "$controls" "$controls" "$controls" >"$tmp/config/unicode.map"
+wanted="abs.so=/absolute.so:rel.so=$config/relative.so:${controls}name${controls}=$config/${controls}file${controls}"
+for map_locale in C C.UTF-8; do
+    if value=$(LC_ALL=$map_locale run_var "$vf" VF_AUDIT_MAP --map "$tmp/config/unicode.map"); then
+        case $value in
+            "$wanted:"*) pass "$name-$map_locale" ;;
+            *) fail "$name-$map_locale" "map differs from the audit file format" ;;
+        esac
+    else
+        fail "$name-$map_locale" "launcher rejected the map"
+    fi
+done
+
 name="map-file-named-by-a-relative-path"
 map2=$(cd "$tmp" && get_var "$vf" VF_AUDIT_MAP --map config/relative.map)
 if [ "$map2" = "$map" ]; then
@@ -423,6 +443,20 @@ case $ldp in
     *)
         fail "$name" "VF_CUDA12 not honored: $ldp" ;;
 esac
+
+# Relative CUDA paths must keep pointing to the same files after the program changes directory.
+name="cuda12-relative"
+if (cd "$tmp" && "$vf" --cuda12 my-cuda12 sh -c '
+    cd /
+    case ":$LD_LIBRARY_PATH:" in *":$1/my-cuda12:"*) ;; *) exit 1 ;; esac
+' sh "$tmp") && (cd "$tmp" && VF_CUDA12=my-cuda12 "$vf" sh -c '
+    cd /
+    case ":$VF_AUDIT_MAP:" in *":libcublas.so.12=$1/my-cuda12/libcublas.so.12:"*) ;; *) exit 1 ;; esac
+' sh "$tmp"); then
+    pass "$name"
+else
+    fail "$name" "relative CUDA library directory lost when the command changes directory"
+fi
 
 # 9. Warning when CUDA 12.9.2 is absent.
 
@@ -501,7 +535,7 @@ fi
 # 13c. The marker is the version alone, as the library gives it.
 name="marker-version"
 got=$(get_var "$vf" VOLTA_FOREVER)
-if [ "$got" = "0.1.0-preview" ]; then
+if [ "$got" = "0.1.0" ]; then
     pass "$name"
 else
     fail "$name" "VOLTA_FOREVER is: $got"
@@ -536,7 +570,7 @@ esac
 name="source-version"
 ver=$("$vfs" version)
 case $ver in
-    "0.1.0-preview")
+    "0.1.0")
         pass "$name" ;;
     *)
         fail "$name" "version: $ver" ;;
@@ -762,7 +796,7 @@ if python3 -c 'import sys, venv; sys.exit(0 if hasattr(sys, "orig_argv") else 1)
 
     name="venv-python-through-the-layer"
     got=$("$ve/bin/python" -c 'import os; print(os.environ.get("VOLTA_FOREVER"), os.environ.get("VOLTA_FOREVER_HOME"), os.environ.get("LD_AUDIT"))')
-    if [ "$got" = "0.1.0-preview $tmp/arch-venv $tmp/arch-venv/lib/libvf_audit.so" ]; then
+    if [ "$got" = "0.1.0 $tmp/arch-venv $tmp/arch-venv/lib/libvf_audit.so" ]; then
         pass "$name"
     else
         fail "$name" "its Python saw: $got"
@@ -783,14 +817,14 @@ if python3 -c 'import sys, venv; sys.exit(0 if hasattr(sys, "orig_argv") else 1)
 
     name="venv-child"
     got=$("$ve/bin/python" -c 'import subprocess, sys; print(subprocess.run([sys.executable, "-c", "import os; print(os.environ.get(\"VOLTA_FOREVER\"))"], capture_output=True, text=True).stdout.strip())')
-    if [ "$got" = "0.1.0-preview" ]; then pass "$name"; else fail "$name" "a child Python saw: $got"; fi
+    if [ "$got" = "0.1.0" ]; then pass "$name"; else fail "$name" "a child Python saw: $got"; fi
 
     name="venv-off-for-one-command"
     got=$(VF_VENV=0 "$ve/bin/python" -c 'import os; print(os.environ.get("VOLTA_FOREVER"))')
     if [ "$got" = None ]; then pass "$name"; else fail "$name" "with VF_VENV=0: $got"; fi
 
     name="venv-again"
-    if "$vfv" venv "$ve" >/dev/null 2>&1 && [ "$("$ve/bin/python" -c 'import os; print(os.environ.get("VOLTA_FOREVER"))')" = "0.1.0-preview" ]; then
+    if "$vfv" venv "$ve" >/dev/null 2>&1 && [ "$("$ve/bin/python" -c 'import os; print(os.environ.get("VOLTA_FOREVER"))')" = "0.1.0" ]; then
         pass "$name"
     else
         fail "$name" "a second vf venv on the same directory"
@@ -836,6 +870,40 @@ if python3 -c 'import sys, venv; sys.exit(0 if hasattr(sys, "orig_argv") else 1)
     if [ "$got" = None ]; then pass "$name"; else fail "$name" "with the launcher gone: $got"; fi
 else
     echo "SKIP  venv (no python3 of 3.10 or later with the venv module)"
+fi
+
+# 30. vf venv: when Python cannot make the environment, nothing is left of the attempt (on a
+# Debian or an Ubuntu without python3-venv, Python makes the directory and its links, then
+# fails; what it left was taken for an environment the next time).
+
+name="venv-failed-attempt-leaves-nothing"
+cat >"$tmp/half-python" <<'STUB'
+#!/bin/sh
+# A stand-in for `python -m venv DIR` that fails half-way: the directory and its
+# configuration are made, then it stops.
+for last; do :; done
+mkdir -p "$last/bin" && : >"$last/pyvenv.cfg" && : >"$last/bin/python" && chmod +x "$last/bin/python"
+echo "ensurepip is not available" >&2
+exit 1
+STUB
+chmod +x "$tmp/half-python"
+_st=0
+"$vf" venv --python "$tmp/half-python" "$tmp/half-venv" >"$tmp/half.out" 2>&1 || _st=$?
+if [ "$_st" != 0 ] && [ ! -e "$tmp/half-venv" ] && grep -q "no environment was made" "$tmp/half.out"; then
+    pass "$name"
+else
+    fail "$name" "exit $_st; left: $(ls -A "$tmp/half-venv" 2>/dev/null | tr '\n' ' '); said: $(cat "$tmp/half.out")"
+fi
+
+# (An empty directory that was there stays, empty.)
+name="venv-failed-attempt-in-an-empty-directory"
+mkdir "$tmp/half-empty"
+_st=0
+"$vf" venv --python "$tmp/half-python" "$tmp/half-empty" >"$tmp/half2.out" 2>&1 || _st=$?
+if [ "$_st" != 0 ] && [ -d "$tmp/half-empty" ] && [ -z "$(ls -A "$tmp/half-empty")" ]; then
+    pass "$name"
+else
+    fail "$name" "exit $_st; left: $(ls -A "$tmp/half-empty" 2>/dev/null | tr '\n' ' ')"
 fi
 
 # --- done -----------------------------------------------------------------------

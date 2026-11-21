@@ -103,7 +103,11 @@ get_version() {
 find_cuda12() {
     _cuda12_dir=${opt_cuda12:-${VF_CUDA12:-}}
     if [ -n "$_cuda12_dir" ]; then
-        echo "$_cuda12_dir"
+        case $_cuda12_dir in
+            /*) ;;
+            *) _cuda12_dir=$(pwd -P)/$_cuda12_dir ;;
+        esac
+        printf '%s\n' "$_cuda12_dir"
         return
     fi
     # In the installation directory.
@@ -255,15 +259,20 @@ setup_env() {
         # is not an absolute path is in the directory of the file; an empty one stays empty
         # (the library is then not found). The last line counts without its end of line.
         _map_dir=$(cd "$(dirname "$opt_map_file")" && pwd) || exit 2
+        # Match the audit library's str::trim in every locale. In addition to ASCII
+        # whitespace, Unicode White_Space has U+0085, 00A0, 1680, 2000..200A,
+        # 2028, 2029, 202F, 205F and 3000. Match their UTF-8 bytes under LC_ALL=C.
+        _unicode_space=$(printf '\302[\205\240]|\341\232\200|\342\200[\200-\212\250\251\257]|\342\201\237|\343\200\200')
+        _map_space="([[:space:]]|$_unicode_space)"
         while IFS= read -r _mline || [ -n "$_mline" ]; do
-            _mline=$(printf '%s\n' "$_mline" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            _mline=$(printf '%s\n' "$_mline" | LC_ALL=C sed -E "s/^$_map_space+//; s/$_map_space+$//")
             case $_mline in
                 ''|'#'*) continue ;;
                 *=*) ;;
                 *) continue ;;
             esac
-            _mname=$(printf '%s\n' "${_mline%%=*}" | sed 's/[[:space:]]*$//')
-            _mrepl=$(printf '%s\n' "${_mline#*=}" | sed 's/^[[:space:]]*//')
+            _mname=$(printf '%s\n' "${_mline%%=*}" | LC_ALL=C sed -E "s/$_map_space+$//")
+            _mrepl=$(printf '%s\n' "${_mline#*=}" | LC_ALL=C sed -E "s/^$_map_space+//")
             case $_mrepl in
                 ''|/*) ;;
                 *) _mrepl=$_map_dir/$_mrepl ;;
@@ -539,7 +548,23 @@ cmd_venv() {
             echo "vf: $_dir is there, is not empty and is not a virtual environment: nothing is changed" >&2
             exit 2
         fi
-        "$opt_venv_python" -m venv "$@" "$_dir" || exit $?
+        # (Nothing was there, or an empty directory: what a failed attempt leaves is this
+        # call's own, and is taken away. Python makes the directory and its own links before
+        # it finds that it cannot put pip there, on a Debian or an Ubuntu without the package
+        # python3-venv: left as it is, that half would be taken for an environment the next
+        # time, when the package is there.)
+        _was_there=0
+        [ -d "$_dir" ] && _was_there=1
+        _status=0
+        "$opt_venv_python" -m venv "$@" "$_dir" || _status=$?
+        if [ "$_status" != 0 ]; then
+            if [ -d "$_dir" ]; then
+                rm -rf "$_dir"
+                [ "$_was_there" = 1 ] && mkdir -p "$_dir"
+                echo "vf: no environment was made in $_dir (what the attempt left there is removed): the same command again, once what is missing is there" >&2
+            fi
+            exit "$_status"
+        fi
     elif [ $# -gt 0 ]; then
         echo "vf: $_dir is a virtual environment already: the options after -- are for making one" >&2
         exit 2

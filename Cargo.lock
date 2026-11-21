@@ -31,7 +31,7 @@ checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "vf-adapt"
-version = "0.1.0-preview"
+version = "0.1.0"
 dependencies = [
  "vf-fatbin",
  "vf-ptx",
@@ -40,14 +40,14 @@ dependencies = [
 
 [[package]]
 name = "vf-audit"
-version = "0.1.0-preview"
+version = "0.1.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "vf-cli"
-version = "0.1.0-preview"
+version = "0.1.0"
 dependencies = [
  "vf-adapt",
  "vf-fatbin",
@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "vf-fatbin"
-version = "0.1.0-preview"
+version = "0.1.0"
 dependencies = [
  "lz4_flex",
  "ruzstd",
@@ -65,14 +65,14 @@ dependencies = [
 
 [[package]]
 name = "vf-fwdgen"
-version = "0.1.0-preview"
+version = "0.1.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "vf-jitlink"
-version = "0.1.0-preview"
+version = "0.1.0"
 dependencies = [
  "libc",
  "vf-adapt",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "vf-proxy"
-version = "0.1.0-preview"
+version = "0.1.0"
 dependencies = [
  "libc",
  "twox-hash",
@@ -93,15 +93,15 @@ dependencies = [
 
 [[package]]
 name = "vf-ptx"
-version = "0.1.0-preview"
+version = "0.1.0"
 
 [[package]]
 name = "vf-sass"
-version = "0.1.0-preview"
+version = "0.1.0"
 dependencies = [
  "vf-tables",
 ]
 
 [[package]]
 name = "vf-tables"
-version = "0.1.0-preview"
+version = "0.1.0"

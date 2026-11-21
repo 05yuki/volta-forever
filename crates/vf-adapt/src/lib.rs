@@ -928,6 +928,37 @@ mod tests {
     }
 
     #[test]
+    fn cluster_directives_without_later_instructions_refuse_only_their_entry() {
+        for directives in [
+            ".explicitcluster\n.reqnctapercluster 2, 1, 1\n",
+            ".explicitcluster .maxntid 128 .maxclusterrank 4 ",
+            ".reqnctapercluster 2, /* rows */ 1, 1 ",
+        ] {
+            let ptx = format!(
+                ".version 8.8\n.target sm_90\n.address_size 64\n\
+                 .visible .entry clustered() {directives}{{ ret; }}\n\
+                 .visible .entry plain() /* .explicitcluster */ {{ .reg .u32 %vf_tmp; /* .explicitcluster */ ret; }}\n"
+            );
+            let adapted = Policy::default().adapt_ptx(ptx.as_bytes());
+            let Outcome::Retargeted { refused, .. } = adapted.outcome else {
+                panic!("expected adapted PTX");
+            };
+            assert_eq!(refused.len(), 1);
+            assert_eq!(refused[0].kernel, "clustered");
+            let output = String::from_utf8(adapted.image.unwrap()).unwrap();
+            let (cluster, plain) = output.split_once(".entry plain()").unwrap();
+            assert!(cluster.contains("trap;"));
+            assert!(!cluster.contains(".explicitcluster"));
+            assert!(!cluster.contains(".reqnctapercluster"));
+            assert!(!cluster.contains(".maxclusterrank"));
+            if directives.contains(".maxntid") {
+                assert!(cluster.contains(".maxntid 128"));
+            }
+            assert!(plain.contains(".reg .u32 %vf_tmp; /* .explicitcluster */ ret;"));
+        }
+    }
+
+    #[test]
     fn ptx_text() {
         let policy = Policy::default();
         let adapted = policy.adapt_ptx(b".version 9.5\n.target sm_75\n.address_size 64\n");

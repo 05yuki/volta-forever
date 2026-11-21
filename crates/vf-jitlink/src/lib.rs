@@ -491,7 +491,7 @@ fn check_fatbin_data(data: &[u8]) -> Result<Option<Vec<u8>>, c_int> {
     Ok(None)
 }
 
-/// Check machine code (cubin/object/library): only sm_70 code is accepted.
+/// Check a raw CUDA cubin. Host objects and archives are read by the native linker.
 fn check_machine_code(
     lib: &RealLib,
     handle: HandlePtr,
@@ -596,9 +596,12 @@ fn do_add_data(handle: HandlePtr, input_type: c_int, data: *const c_void, size: 
             Ok(None) => unsafe { (lib.add_data)(handle, input_type, data, size, name) },
             Err(e) => e,
         },
-        NVJITLINK_INPUT_CUBIN | NVJITLINK_INPUT_OBJECT | NVJITLINK_INPUT_LIBRARY => {
-            check_machine_code(lib, handle, input_type, data, size, name, raw)
+        NVJITLINK_INPUT_OBJECT | NVJITLINK_INPUT_LIBRARY => {
+            // The ELF header belongs to the host, and an archive has no ELF header at all.
+            // nvJitLink selects the embedded device code for the architecture set at Create.
+            unsafe { (lib.add_data)(handle, input_type, data, size, name) }
         }
+        NVJITLINK_INPUT_CUBIN => check_machine_code(lib, handle, input_type, data, size, name, raw),
         NVJITLINK_INPUT_LTOIR => {
             // LTO-IR: 12.9.2 supports LTO. The architecture is embedded in the IR;
             // 12.9.2 will reject an architecture it cannot handle.
@@ -640,8 +643,14 @@ fn do_add_data(handle: HandlePtr, input_type: c_int, data: *const c_void, size: 
                     };
                 }
             }
-            // ELF magic -> machine code.
-            if size >= 4 && raw[..4] == [0x7f, b'E', b'L', b'F'] {
+            if raw.starts_with(b"!<arch>\n") || raw.starts_with(b"!<thin>\n") {
+                return unsafe { (lib.add_data)(handle, NVJITLINK_INPUT_LIBRARY, data, size, name) };
+            }
+            // EM_CUDA (190) identifies a cubin. Other ELF files may contain device code.
+            if vf_fatbin::is_elf(raw) {
+                if raw.get(18..20) != Some(&190u16.to_le_bytes()) {
+                    return unsafe { (lib.add_data)(handle, NVJITLINK_INPUT_OBJECT, data, size, name) };
+                }
                 return check_machine_code(lib, handle, NVJITLINK_INPUT_CUBIN, data, size, name, raw);
             }
             // Unrecognised: reject rather than pass through unexamined data.
@@ -667,12 +676,7 @@ fn do_add_file(handle: HandlePtr, input_type: c_int, file_name: *const c_char) -
     // For types that need adaptation, read the file and use do_add_data.
     let needs_adaptation = matches!(
         input_type,
-        NVJITLINK_INPUT_PTX
-            | NVJITLINK_INPUT_FATBIN
-            | NVJITLINK_INPUT_CUBIN
-            | NVJITLINK_INPUT_OBJECT
-            | NVJITLINK_INPUT_LIBRARY
-            | NVJITLINK_INPUT_ANY
+        NVJITLINK_INPUT_PTX | NVJITLINK_INPUT_FATBIN | NVJITLINK_INPUT_CUBIN | NVJITLINK_INPUT_ANY
     );
 
     if needs_adaptation {

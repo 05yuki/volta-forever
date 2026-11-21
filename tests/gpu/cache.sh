@@ -4,14 +4,16 @@
 # translates them again (VF_PROXY_CACHE), goes by default to the home directory of whoever runs:
 # on the nodes that is memory, and up to 2 GB of it. It cannot go to the NFS either: the proxy
 # refuses a cache whose files do not belong to the user it runs as, and root's files there do not.
-# So the tests keep it in a directory under /tmp for this script and this GPU, emptied when the
-# script starts and removed when it ends (a script must not `exec` its last command, or the trap
-# never runs). $VF_PROXY_CACHE, when it is set, is left as it is: a directory, or 0 for none.
+# Each run gets a directory under /tmp and removes it on exit. Scripts with their own exit
+# trap call vf_cleanup_proxy_cache. A caller can supply VF_PROXY_CACHE, or 0 to disable it.
+_vf_owned_proxy_cache=
+vf_cleanup_proxy_cache() {
+    if [ -n "$_vf_owned_proxy_cache" ]; then rm -rf -- "$_vf_owned_proxy_cache"; fi
+}
 if [ -z "${VF_PROXY_CACHE:-}" ]; then
-    VF_PROXY_CACHE=/tmp/vf-cache-$(basename "$0" .sh)-gpu${CUDA_VISIBLE_DEVICES:-x}
-    rm -rf "$VF_PROXY_CACHE"
-    trap 'rm -rf "$VF_PROXY_CACHE"' EXIT
-    export VF_PROXY_CACHE
+    _vf_owned_proxy_cache=$(mktemp -d /tmp/vf-cache-XXXXXXXX) || exit 1
+    export VF_PROXY_CACHE=$_vf_owned_proxy_cache
+    trap vf_cleanup_proxy_cache EXIT
 fi
 
 # Two more things a program writes under the home directory of whoever runs it, which on the nodes

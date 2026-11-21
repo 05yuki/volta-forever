@@ -283,7 +283,7 @@ fn is_own_library(cookie: usize) -> bool {
 
 // --- rtld-audit interface ---
 
-// LAV_CURRENT is 2 on modern glibc (>= 2.35, which Ubuntu 24.04 has).
+// The x86_64 callbacks used here have the same ABI for audit versions 1 and 2.
 const LAV_CURRENT: libc::c_uint = 2;
 /// `la_objopen` flags: bindings to, and from, this object are reported to `la_symbind64`.
 const LA_FLG_BINDTO: libc::c_uint = 1;
@@ -297,11 +297,7 @@ const LA_SYMB_NOPLTEXIT: libc::c_uint = 2;
 pub extern "C" fn la_version(version: libc::c_uint) -> libc::c_uint {
     // Initialize state (reads the map).
     let _ = state();
-    if version < LAV_CURRENT {
-        // The loader's version is too old; return 0 to disable.
-        return 0;
-    }
-    LAV_CURRENT
+    version.min(LAV_CURRENT)
 }
 
 /// Called when a shared object is loaded. We use this to record cookies of our own libraries.
@@ -480,6 +476,14 @@ pub unsafe extern "C" fn la_objsearch(
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn negotiate_audit_versions() {
+        assert_eq!(la_version(0), 0);
+        assert_eq!(la_version(1), 1);
+        assert_eq!(la_version(2), 2);
+        assert_eq!(la_version(3), 2);
+    }
 
     #[test]
     fn basename_extracts_filename() {

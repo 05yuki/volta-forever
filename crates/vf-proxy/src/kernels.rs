@@ -28,7 +28,7 @@ pub enum Origin {
     CacheHit,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct Kernels {
     /// By kernel: the function it needs that traps, and why.
     refused: HashMap<String, (String, String)>,
@@ -46,6 +46,16 @@ static EXPLAINED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new
 
 fn known() -> std::sync::MutexGuard<'static, HashMap<usize, Kernels>> {
     KNOWN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Module aliases consult their library's current metadata, including compiler
+/// refusals learned after a lazy submodule first exposed a function.
+fn metadata(known: &HashMap<usize, Kernels>, handle: usize) -> Option<&Kernels> {
+    let entry = known.get(&handle)?;
+    match entry.library {
+        Some(library) => known.get(&library),
+        None => Some(entry),
+    }
 }
 
 /// Record what the adaptation found about the kernels of the image loaded as `handle`.
@@ -74,15 +84,27 @@ pub fn set_origin(handle: usize, origin: Origin) {
 /// The code origin for the module or library `handle`.
 #[allow(dead_code)]
 pub fn origin(handle: usize) -> Option<Origin> {
-    known().get(&handle).and_then(|k| k.origin)
+    metadata(&known(), handle).and_then(|k| k.origin)
 }
 
 /// `module` is the module of library `library`: the same kernels.
 pub fn share(module: usize, library: usize) {
     let mut known = known();
-    if let Some(mut kernels) = known.get(&library).cloned() {
-        kernels.library = Some(library);
-        known.insert(module, kernels);
+    if module == library {
+        return;
+    }
+    if known.contains_key(&library) {
+        known.insert(
+            module,
+            Kernels {
+                library: Some(library),
+                ..Default::default()
+            },
+        );
+    } else {
+        // A context can return the former module address for a different
+        // library, including a native one with no recorded refusals.
+        known.remove(&module);
     }
 }
 
@@ -106,11 +128,16 @@ pub fn forget(handle: usize) {
     }
 }
 
+/// Whether enumerations need to filter this module or library.
+pub fn has_refused(handle: usize) -> bool {
+    metadata(&known(), handle).is_some_and(|k| !k.refused.is_empty())
+}
+
 /// Kernel `name` of `handle` must not be given to the program. The first time the program asks for
 /// it, the reason is printed.
 pub fn refused(handle: usize, name: &str) -> bool {
     let known = known();
-    let Some((function, reason)) = known.get(&handle).and_then(|kernels| kernels.refused.get(name)) else {
+    let Some((function, reason)) = metadata(&known, handle).and_then(|kernels| kernels.refused.get(name)) else {
         return false;
     };
     if EXPLAINED
@@ -135,7 +162,7 @@ pub fn refused(handle: usize, name: &str) -> bool {
 pub fn given(handle: usize, name: &str) {
     let (counts, origin_val) = {
         let k = known();
-        let kernels = k.get(&handle);
+        let kernels = metadata(&k, handle);
         let counts = kernels.and_then(|k| k.emulated.get(name)).cloned();
         let origin_val = kernels.and_then(|k| k.origin);
         (counts, origin_val)
@@ -170,8 +197,7 @@ pub fn given(handle: usize, name: &str) {
 /// The emulated instruction counts for kernel `name` in module or library `handle`, if known.
 #[allow(dead_code)]
 pub fn emulated_counts(handle: usize, name: &str) -> Option<EmulatedCounts> {
-    known()
-        .get(&handle)
+    metadata(&known(), handle)
         .and_then(|kernels| kernels.emulated.get(name))
         .cloned()
 }

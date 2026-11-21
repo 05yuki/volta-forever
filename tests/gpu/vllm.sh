@@ -71,16 +71,6 @@ fi
 
 # --- Caches and temporary files under the output directory, not under /root ---
 cache=$out/vllm-cache
-# What this run alone writes (the CPU's references, the server's log, the stamp): a directory of
-# its own, so that two runs at once do not write each other's files. Removed at the end, the
-# server's log kept when a stage did not pass.
-run=$cache/run-$$
-mkdir -p "$run"
-stamp=$run/started
-touch "$stamp"
-failed=0
-engine_wait=${VF_ENGINE_WAIT:-1800}
-trap 'if [ "$failed" = 0 ]; then rm -rf "$run"; else echo "kept: $run"; fi' EXIT
 export HOME=$cache
 export TMPDIR=$cache/tmp
 export XDG_CACHE_HOME=$cache/.cache
@@ -91,6 +81,27 @@ mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$HF_HOME"
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$gpu
 source "$W/tests/gpu/cache.sh"
+# What this run alone writes (the CPU's references, the server's log, the stamp): a directory of
+# its own, so that two runs at once do not write each other's files. Removed at the end, the
+# server's log kept when a stage did not pass.
+run=$(mktemp -d "$cache/run-XXXXXXXX") || exit 1
+stamp=$run/started
+touch "$stamp"
+failed=0
+engine_wait=${VF_ENGINE_WAIT:-1800}
+# vLLM appends a UUID to each socket name. Keep sockets on the node under
+# a short path, even when the model caches live deep in an output tree.
+rpc_dir=
+cleanup() {
+    vf_cleanup_proxy_cache
+    if [ -n "$rpc_dir" ]; then rm -rf -- "$rpc_dir"; fi
+    if [ "$1" = 0 ] && [ "$failed" = 0 ]; then rm -rf "$run"; else echo "kept: $run"; fi
+}
+trap 'cleanup "$?"' EXIT
+if [ -z "${VLLM_RPC_BASE_PATH:-}" ]; then
+    rpc_dir=$(mktemp -d /tmp/vf-vllm-rpc.XXXXXXXX) || exit 1
+    export VLLM_RPC_BASE_PATH=$rpc_dir
+fi
 export PYTHONDONTWRITEBYTECODE=1 TORCH_COMPILE_DISABLE=1
 export DO_NOT_TRACK=1 HF_HUB_DISABLE_TELEMETRY=1 VLLM_NO_USAGE_STATS=1 HF_HUB_OFFLINE=1
 

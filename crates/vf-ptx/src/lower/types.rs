@@ -247,7 +247,7 @@ pub(super) fn first_operand(operands: &str) -> &str {
     operands
 }
 
-/// An address operand `[register]` or `[register+offset]`, the offset in decimal or hexadecimal.
+/// An address operand `[register]` or `[register+offset]`, the offset a PTX integer literal.
 pub(super) fn place_of(operand: &str) -> Option<(&str, u32)> {
     let inner = operand.strip_prefix('[')?.strip_suffix(']')?.trim();
     let (base, offset) = match inner.split_once('+') {
@@ -267,10 +267,17 @@ pub(super) fn all_ones(operand: &str) -> bool {
     operand == "-1" || integer(operand) == Some(u32::MAX)
 }
 
-/// An integer written in decimal or as `0x...`.
+/// A nonnegative 32-bit PTX integer literal, including its optional unsigned suffix.
 pub(super) fn integer(text: &str) -> Option<u32> {
-    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        Some(digits) => u32::from_str_radix(digits, 16).ok(),
-        None => text.parse().ok(),
+    let text = text.strip_prefix('+').unwrap_or(text);
+    let text = text.strip_suffix('U').unwrap_or(text);
+    if let Some(digits) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        u32::from_str_radix(digits, 16).ok()
+    } else if let Some(digits) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
+        u32::from_str_radix(digits, 2).ok()
+    } else if text.starts_with('0') {
+        u32::from_str_radix(text, 8).ok()
+    } else {
+        text.parse().ok()
     }
 }

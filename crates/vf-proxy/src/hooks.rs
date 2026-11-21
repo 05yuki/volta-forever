@@ -336,7 +336,9 @@ unsafe fn load(
             log::warn(format_args!(
                 "{who}: the driver refused the adapted image (error {result}); loading the original"
             ));
-            call(image)
+            let result = call(image);
+            unsafe { images::loaded_as_is(result, handle) };
+            result
         }
     }
 }
@@ -418,7 +420,9 @@ pub unsafe extern "C" fn cuModuleLoad(module: *mut *mut c_void, path: *const c_c
             log::warn(format_args!(
                 "cuModuleLoad: the driver refused the adapted image (error {result}); loading the file"
             ));
-            unsafe { real(module, path) }
+            let result = unsafe { real(module, path) };
+            unsafe { images::loaded_as_is(result, module) };
+            result
         }
     }
 }
@@ -710,8 +714,7 @@ pub unsafe extern "C" fn cuLibraryLoadData(
                 cache_key,
             )
         } {
-            // Lazy setup succeeded: the stand-in handle is in *library. Keep the replacement so
-            // the driver can lazy-read the stand-in image.
+            // Associate the adaptation metadata with the stand-in handle.
             if !library.is_null() {
                 images::keep(unsafe { *library } as usize, replacement);
             }
@@ -738,7 +741,9 @@ pub unsafe extern "C" fn cuLibraryLoadData(
             log::warn(format_args!(
                 "cuLibraryLoadData: the driver refused the adapted image (error {result}); loading the original"
             ));
-            call(code)
+            let result = call(code);
+            unsafe { images::loaded_as_is(result, library) };
+            result
         }
     }
 }
@@ -806,6 +811,14 @@ pub unsafe extern "C" fn cuLibraryLoadFromFile(
             library_count,
         )
     };
+    // This hint is only valid for the data API. Forward it unchanged on a file
+    // load so that adapting through cuLibraryLoadData cannot turn it into success.
+    if !library_options.is_null()
+        && unsafe { std::slice::from_raw_parts(library_options, library_count as usize) }
+            .contains(&lazy::CU_LIBRARY_BINARY_IS_PRESERVED)
+    {
+        return from_file();
+    }
     let replacement = if path.is_null() {
         None
     } else {
@@ -834,7 +847,9 @@ pub unsafe extern "C" fn cuLibraryLoadFromFile(
             log::warn(format_args!(
                 "cuLibraryLoadFromFile: the driver refused the adapted image (error {result}); loading the file"
             ));
-            from_file()
+            let result = from_file();
+            unsafe { images::loaded_as_is(result, library) };
+            result
         }
     }
 }
@@ -881,19 +896,173 @@ pub unsafe extern "C" fn cuLibraryGetKernel(
     result
 }
 
+type CountEntries = unsafe extern "C" fn(*mut c_uint, *mut c_void) -> CUresult;
+type EnumerateEntries = unsafe extern "C" fn(*mut *mut c_void, c_uint, *mut c_void) -> CUresult;
+type EntryName = unsafe extern "C" fn(*mut *const c_char, *mut c_void) -> CUresult;
+
+struct Enumeration {
+    /// Application handle used to look up refusal metadata.
+    owner: *mut c_void,
+    /// Library or module actually queried in the driver.
+    handle: *mut c_void,
+    library: bool,
+    count: CountEntries,
+    enumerate: EnumerateEntries,
+    name: EntryName,
+}
+
+impl Enumeration {
+    fn module(module: *mut c_void) -> Self {
+        unsafe {
+            Self {
+                owner: module,
+                handle: module,
+                library: false,
+                count: std::mem::transmute::<usize, CountEntries>(REALS[idx::cuModuleGetFunctionCount].load(Relaxed)),
+                enumerate: std::mem::transmute::<usize, EnumerateEntries>(
+                    REALS[idx::cuModuleEnumerateFunctions].load(Relaxed),
+                ),
+                name: std::mem::transmute::<usize, EntryName>(REALS[idx::cuFuncGetName].load(Relaxed)),
+            }
+        }
+    }
+
+    unsafe fn library(owner: *mut c_void) -> Result<Self, CUresult> {
+        // The full compiler can discover further refusals, so both the count and
+        // enumeration must see the same materialized library.
+        let handle = if lazy::is_lazy(owner as usize) {
+            unsafe { lazy::materialize(owner as usize)? as *mut c_void }
+        } else {
+            owner
+        };
+        unsafe {
+            Ok(Self {
+                owner,
+                handle,
+                library: true,
+                count: std::mem::transmute::<usize, CountEntries>(REALS[idx::cuLibraryGetKernelCount].load(Relaxed)),
+                enumerate: std::mem::transmute::<usize, EnumerateEntries>(
+                    REALS[idx::cuLibraryEnumerateKernels].load(Relaxed),
+                ),
+                name: std::mem::transmute::<usize, EntryName>(REALS[idx::cuKernelGetName].load(Relaxed)),
+            })
+        }
+    }
+
+    unsafe fn driver_count(&self) -> Result<c_uint, CUresult> {
+        let mut count = 0;
+        let rc = unsafe { (self.count)(&mut count, self.handle) };
+        if rc == CUDA_SUCCESS { Ok(count) } else { Err(rc) }
+    }
+
+    fn name_of(&self, handle: *mut c_void) -> Result<std::borrow::Cow<'_, str>, CUresult> {
+        let mut name = std::ptr::null();
+        let mut rc = unsafe { (self.name)(&mut name, handle) };
+        if self.library && (rc != CUDA_SUCCESS || name.is_null()) {
+            // cuFuncGetName takes a CUfunction. A CUkernel must first be
+            // resolved for the current context; the driver may refuse that.
+            let convert: unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> CUresult =
+                unsafe { std::mem::transmute(REALS[idx::cuKernelGetFunction].load(Relaxed)) };
+            let mut function = std::ptr::null_mut();
+            rc = unsafe { convert(&mut function, handle) };
+            if rc == CUDA_SUCCESS && !function.is_null() {
+                let fallback: EntryName = unsafe { std::mem::transmute(REALS[idx::cuFuncGetName].load(Relaxed)) };
+                name = std::ptr::null();
+                rc = unsafe { fallback(&mut name, function) };
+            } else {
+                return Err(if rc == CUDA_SUCCESS { CUDA_ERROR_INVALID_PTX } else { rc });
+            }
+        }
+        if rc != CUDA_SUCCESS {
+            return Err(rc);
+        }
+        if name.is_null() {
+            return Err(CUDA_ERROR_INVALID_PTX);
+        }
+        Ok(unsafe { CStr::from_ptr(name) }.to_string_lossy())
+    }
+
+    /// Inspect the complete list, even when the caller supplied a smaller buffer:
+    /// a refused first entry must not hide a usable entry later in the list.
+    unsafe fn allowed(&self) -> Result<Vec<*mut c_void>, CUresult> {
+        let count = unsafe { self.driver_count()? };
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut entries = vec![std::ptr::null_mut(); count as usize];
+        let rc = unsafe { (self.enumerate)(entries.as_mut_ptr(), count, self.handle) };
+        if rc != CUDA_SUCCESS {
+            return Err(rc);
+        }
+        let mut allowed = Vec::new();
+        for handle in entries {
+            let name = self.name_of(handle)?;
+            if !kernels::refused(self.owner as usize, &name) {
+                allowed.push(handle);
+            }
+        }
+        Ok(allowed)
+    }
+
+    unsafe fn write_count(&self, count: *mut c_uint) -> CUresult {
+        if count.is_null() || !kernels::has_refused(self.owner as usize) {
+            return unsafe { (self.count)(count, self.handle) };
+        }
+        match unsafe { self.allowed() } {
+            Ok(entries) => {
+                unsafe { *count = entries.len() as c_uint };
+                CUDA_SUCCESS
+            }
+            Err(rc) => rc,
+        }
+    }
+
+    unsafe fn write_entries(&self, out: *mut *mut c_void, capacity: c_uint) -> CUresult {
+        if out.is_null() || capacity == 0 {
+            // Preserve the driver's argument validation.
+            return unsafe { (self.enumerate)(out, capacity, self.handle) };
+        }
+        let written = if kernels::has_refused(self.owner as usize) {
+            let allowed = match unsafe { self.allowed() } {
+                Ok(entries) => entries,
+                Err(rc) => return rc,
+            };
+            let len = allowed.len().min(capacity as usize);
+            unsafe { std::ptr::copy_nonoverlapping(allowed.as_ptr(), out, len) };
+            len
+        } else {
+            let rc = unsafe { (self.enumerate)(out, capacity, self.handle) };
+            if rc != CUDA_SUCCESS {
+                return rc;
+            }
+            if !self.library {
+                return rc;
+            }
+            // Only inspect the slots that the driver filled, even with excess capacity.
+            unsafe { self.driver_count() }.unwrap_or(0).min(capacity) as usize
+        };
+        let returned = unsafe { std::slice::from_raw_parts(out, written) };
+        if self.owner != self.handle {
+            lazy::register_enumerated(self.owner as usize, returned);
+        }
+        for &entry in returned {
+            if !entry.is_null()
+                && let Ok(name) = self.name_of(entry)
+            {
+                fit::register_kernel(entry as usize, self.owner as usize, &name, self.library);
+            }
+        }
+        CUDA_SUCCESS
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cuLibraryGetKernelCount(count: *mut c_uint, library: *mut c_void) -> CUresult {
     COUNTS[idx::cuLibraryGetKernelCount].fetch_add(1, Relaxed);
-    let handle = library as usize;
-    if let Some(n) = lazy::kernel_count(handle) {
-        if !count.is_null() {
-            unsafe { *count = n as c_uint };
-        }
-        return CUDA_SUCCESS;
+    match unsafe { Enumeration::library(library) } {
+        Ok(list) => unsafe { list.write_count(count) },
+        Err(rc) => rc,
     }
-    let real: unsafe extern "C" fn(*mut c_uint, *mut c_void) -> CUresult =
-        unsafe { std::mem::transmute(REALS[idx::cuLibraryGetKernelCount].load(Relaxed)) };
-    unsafe { real(count, library) }
 }
 
 #[unsafe(no_mangle)]
@@ -903,77 +1072,26 @@ pub unsafe extern "C" fn cuLibraryEnumerateKernels(
     library: *mut c_void,
 ) -> CUresult {
     COUNTS[idx::cuLibraryEnumerateKernels].fetch_add(1, Relaxed);
-    let handle = library as usize;
-    if lazy::is_lazy(handle) {
-        return match unsafe { lazy::enumerate_kernels(handle, kernels, count) } {
-            Ok(written) => {
-                unsafe { register_enumerated_kernels(kernels, written, handle) };
-                CUDA_SUCCESS
-            }
-            Err(code) => code,
-        };
+    match unsafe { Enumeration::library(library) } {
+        Ok(list) => unsafe { list.write_entries(kernels, count) },
+        Err(rc) => rc,
     }
-    let real: unsafe extern "C" fn(*mut *mut c_void, c_uint, *mut c_void) -> CUresult =
-        unsafe { std::mem::transmute(REALS[idx::cuLibraryEnumerateKernels].load(Relaxed)) };
-    let result = unsafe { real(kernels, count, library) };
-    if result == CUDA_SUCCESS {
-        let written = unsafe { written_by_enumeration(library, count) };
-        unsafe { register_enumerated_kernels(kernels, written, handle) };
-    }
-    result
 }
 
-/// How many handles the driver wrote when it enumerated the kernels of `library` (the handle
-/// that the driver itself knows) into `capacity` places: the library's number of kernels, by
-/// the driver's own count, or the capacity when that is smaller. The other places are the
-/// program's memory as it was, which may hold anything: they are not read. Nothing when the
-/// driver does not give the count.
-///
-/// # Safety
-/// `library` must be a library that the driver loaded.
-pub(crate) unsafe fn written_by_enumeration(library: *mut c_void, capacity: c_uint) -> usize {
-    let count: unsafe extern "C" fn(*mut c_uint, *mut c_void) -> CUresult =
-        unsafe { std::mem::transmute(REALS[idx::cuLibraryGetKernelCount].load(Relaxed)) };
-    let mut kernels: c_uint = 0;
-    let result = unsafe { count(&mut kernels, library) };
-    if result != CUDA_SUCCESS {
-        log::info(format_args!(
-            "cuLibraryEnumerateKernels: the driver does not give the library's number of kernels (error {result}): none of the handles is followed"
-        ));
-        return 0;
-    }
-    kernels.min(capacity) as usize
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuModuleGetFunctionCount(count: *mut c_uint, module: *mut c_void) -> CUresult {
+    COUNTS[idx::cuModuleGetFunctionCount].fetch_add(1, Relaxed);
+    unsafe { Enumeration::module(module).write_count(count) }
 }
 
-/// Register each kernel handle returned by `cuLibraryEnumerateKernels` with FIT, so that a launch
-/// through one of them can be retried. The name of each kernel is obtained from the driver
-/// (`cuKernelGetName`, with `cuFuncGetName` as a fallback: older drivers may not have the first).
-///
-/// # Safety
-/// `kernels` must point to `written` kernel handles that the driver stored
-/// (`written_by_enumeration`).
-unsafe fn register_enumerated_kernels(kernels: *mut *mut c_void, written: usize, library: usize) {
-    if kernels.is_null() {
-        return;
-    }
-    let kernel_get_name: unsafe extern "C" fn(*mut *const c_char, *mut c_void) -> CUresult =
-        unsafe { std::mem::transmute(REALS[idx::cuKernelGetName].load(Relaxed)) };
-    let func_get_name: unsafe extern "C" fn(*mut *const c_char, *mut c_void) -> CUresult =
-        unsafe { std::mem::transmute(REALS[idx::cuFuncGetName].load(Relaxed)) };
-    for i in 0..written {
-        let kernel = unsafe { *kernels.add(i) };
-        if kernel.is_null() {
-            continue;
-        }
-        let mut name_ptr: *const c_char = std::ptr::null();
-        let got_name = unsafe { kernel_get_name(&mut name_ptr, kernel) } == CUDA_SUCCESS && !name_ptr.is_null();
-        let got_name =
-            got_name || (unsafe { func_get_name(&mut name_ptr, kernel) } == CUDA_SUCCESS && !name_ptr.is_null());
-        if got_name {
-            let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
-            fit::register_kernel(kernel as usize, library, &name, true);
-        }
-    }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuModuleEnumerateFunctions(
+    functions: *mut *mut c_void,
+    count: c_uint,
+    module: *mut c_void,
+) -> CUresult {
+    COUNTS[idx::cuModuleEnumerateFunctions].fetch_add(1, Relaxed);
+    unsafe { Enumeration::module(module).write_entries(functions, count) }
 }
 
 #[unsafe(no_mangle)]
@@ -1102,6 +1220,35 @@ pub unsafe extern "C" fn cuLibraryGetUnifiedFunction(
     let real: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> CUresult =
         unsafe { std::mem::transmute(REALS[idx::cuLibraryGetUnifiedFunction].load(Relaxed)) };
     unsafe { real(fptr, library, name) }
+}
+
+/// A function obtained from a library kernel can lead back to its module through
+/// cuFuncGetModule, even if the program never calls cuLibraryGetModule.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuKernelGetFunction(function: *mut *mut c_void, kernel: *mut c_void) -> CUresult {
+    type GetHandle = unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> CUresult;
+    let real = real!(cuKernelGetFunction: GetHandle);
+    let result = unsafe { real(function, kernel) };
+    if result != CUDA_SUCCESS || function.is_null() {
+        return result;
+    }
+    let mut library = std::ptr::null_mut();
+    // For a submodule or materialized image, refusal metadata belongs to the stand-in.
+    let owner = if let Some(handle) = lazy::kernel_library(kernel as usize) {
+        handle
+    } else {
+        let get_library: GetHandle = unsafe { std::mem::transmute(REALS[idx::cuKernelGetLibrary].load(Relaxed)) };
+        if unsafe { get_library(&mut library, kernel) } != CUDA_SUCCESS {
+            return result;
+        }
+        library as usize
+    };
+    let get_module: GetHandle = unsafe { std::mem::transmute(REALS[idx::cuFuncGetModule].load(Relaxed)) };
+    let mut module = std::ptr::null_mut();
+    if unsafe { get_module(&mut module, *function) } == CUDA_SUCCESS {
+        kernels::share(module as usize, owner);
+    }
+    result
 }
 
 /// `cuKernelGetLibrary`: for a kernel from a lazy library, return the lazy library handle.

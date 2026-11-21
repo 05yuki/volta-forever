@@ -157,7 +157,8 @@ For details of the translation itself, see `docs/translator.md`.
 A kernel that cannot run on the GPU is refused when the program asks for it
 (`cuLibraryGetKernel` or `cuModuleGetFunction` returns
 `CUDA_ERROR_INVALID_PTX`, 218), with the reason on the console. The other kernels
-of its module load and run. Nothing traps knowingly.
+of its module load and run. Module and library enumeration return the usable handles, and
+the corresponding count includes only those entries.
 
 There are two origins of refusal:
 
@@ -183,7 +184,7 @@ on demand (`crates/vf-proxy/src/lazy.rs`, `VF_LAZY`, on by default):
 - At `cuLibraryGetKernel(library, name)`, a sub-module for that kernel alone is
   extracted and loaded through the driver.
 - Operations that need the full module (`cuLibraryGetGlobal`, `cuLibraryGetManaged`,
-  enumeration) load the whole adapted image through the driver at that moment.
+  kernel count and enumeration) load the whole adapted image through the driver at that moment.
 
 The soundness rule: a kernel is **independent** (can be compiled alone) when it
 references no persistent variable (`.global`, `.const`) of the module, except the
@@ -425,7 +426,8 @@ nvJitLink API and serves it with nvJitLink 12.9.2:
 - `-arch=sm_75` (or higher) becomes `-arch=sm_70`.
 - PTX inputs are adapted the same way as in the proxy: header lowered to ISA 8.8
   (the 12.9.2 ptxas limit) and `.target` to sm_70, Turing-only instructions rewritten.
-- Machine code inputs for sm_75 and later are rejected.
+- Raw cubins must target sm_70. For host objects and static archives the CUDA 12.9 linker
+  selects their embedded device code for the requested target.
 - Options only in 13.5 (`-Ofc`, `-nvvm-latest`, `-no-cache`) are dropped silently.
 
 

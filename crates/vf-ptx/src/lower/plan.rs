@@ -371,7 +371,13 @@ impl<'a> Plan<'a> {
                     plan.rows.insert((a[0], a[1]));
                     plan.cols.insert(b);
                 } else if options.aligned_rows {
-                    plan.chain_a.insert((a[0], a[1]));
+                    // The direct chain load selects the next matrix for the upper
+                    // rows. Other legal pairings gather the actual A registers.
+                    if plan.origins[a[1]].matrix == plan.origins[a[0]].matrix + 1 {
+                        plan.chain_a.insert((a[0], a[1]));
+                    } else {
+                        plan.plain.extend(a);
+                    }
                     plan.chain_b.insert(b);
                 } else {
                     plan.plain.extend(a);
