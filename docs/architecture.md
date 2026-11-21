@@ -243,25 +243,43 @@ which loaded file is asking (through `dladdr`), and classifies it:
 |---|---|---|
 | A file whose fat binaries hold code for sm_70 | The real 7.0 | It has native Volta code and must use it. |
 | `libcudart.so.13` or later | 7.5 (default) | The CUDA 13 runtime serves programs built for sm_75 and later; the program's code starts there. |
-| A file whose embedded code starts at sm_75 | 7.5 (default) | Its code can be adapted from that architecture. |
-| Anything else | The real 7.0 | An older runtime, or a program that calls the driver directly. |
+| A file whose embedded code starts at sm_75 or later | Its lowest target (default) | The caller selects that architecture's code. |
+| A readable caller with no detectable CUDA fat binary, under `vf` or `vf venv` | 7.5 (default) | Direct driver clients, including Python bindings, can load code from a separate file. |
+| A CUDA 12 or older runtime | The real 7.0 by default | The runtime supports Volta directly. |
+| Unidentified or unreadable caller | The real 7.0 by default | The proxy cannot classify its GPU code. |
 
-`VF_CAPABILITY=8.0` replaces the answer of the last three cases with 8.0, and
-the code taken from a program is then its code for that capability.
+On a V100, `VF_CAPABILITY=7.0`, `8.0` or `12.0` explicitly sets the answer for
+direct clients, older CUDA runtimes and programs built for later GPUs. A caller
+with embedded Volta code retains 7.0 even with an explicit override. The proxy checks the queried
+device's physical major and minor before changing an answer. Other GPUs keep their
+physical values, including in a mixed-device process. A code-free client using the
+proxy without the launcher gets the physical capability by default.
+
+vLLM also asks NVML for the compute capability before creating a CUDA context. Under
+`vf` or `vf venv`, the audit library binds `nvmlDeviceGetCudaComputeCapability` to a
+wrapper. It calls NVIDIA's function with the original device handle and, on success
+for an sm_70 GPU, reports 7.5 by default or the value of `VF_CAPABILITY`. This covers
+Python's `ctypes` lookup via `dlsym` and native calls through the ELF procedure
+linkage table. Native clients compiled with `-fno-plt` can read the physical value
+through a direct data relocation. Running outside VF or with `vf --no-audit` also
+exposes the physical capability through NVML.
 
 A program may also ask the architecture of a kernel's machine code
 (`cuFuncGetAttribute`, attribute `CU_FUNC_ATTRIBUTE_BINARY_VERSION`): the backward
 pass of PyTorch's attention stops when the answer is below the architecture of the
 variant it chose. The driver has the layer's sm_70 code and answers 7.0. The proxy
-raises the answer to at least the capability that caller was told.
+raises the answer for a runtime or a caller with later GPU code to at least the
+capability it was told. A direct client with no embedded GPU code under the
+launcher gets the driver's actual kernel binary version, including 70 for a
+native Volta kernel, even when its device query returns 7.5 or a configured value.
 
 A program that wants to know what is really there can ask the layer itself
 (`crates/vf-proxy/src/marker.rs`): `libcuda.so.1` has the functions
 `volta_forever_version()` (the layer's version, a C string) and `volta_forever_abi()`
 (the number of this interface, 1) only when it is the layer's, so that `dlsym` finds
-them or does not. When they are there the card is a Volta, whatever capability the
-program was told, and a program that has kernels written for Volta (PTX for `sm_70`,
-which the driver compiles as it is) may prefer them to code for later GPUs. The
+them or does not. The symbols identify the proxy loaded in this process. On a V100,
+a program can prefer its native Volta kernels, including PTX for `sm_70` that the
+driver compiles directly. The
 launcher sets `VOLTA_FOREVER` (the version) and `VOLTA_FOREVER_HOME` in the
 environment of what it runs, for scripts.
 

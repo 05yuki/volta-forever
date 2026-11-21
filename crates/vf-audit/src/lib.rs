@@ -19,9 +19,9 @@
 //! One setting is not a library: `@cudnn-version=9.24.0` makes cuDNN's version queries
 //! (`cudnnGetProperty`, `cudnnGetVersion`) answer that version. A program refuses a cuDNN older
 //! than the one it was built with (XLA does, and then fails), while the cuDNN that still has code
-//! for the GPU is an older one with the same interface. Only then does this library take part in
-//! symbol binding (`la_symbind64`), for the two functions and at binding time only: no call goes
-//! through it afterwards.
+//! for the GPU is an older one with the same interface. Under the VF launcher, the NVML compute
+//! capability query also reports the application-facing architecture of a Volta GPU. Dispatchers
+//! such as vLLM use NVML before initializing CUDA.
 //!
 //! Logging: `VF_LOG`, `VF_LOG_LEVEL` (level 2 = each substitution).
 
@@ -29,6 +29,7 @@ use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // --- Logging ---
 
@@ -92,6 +93,8 @@ struct AuditState {
     own_cookies: std::sync::Mutex<Vec<usize>>,
     /// What cuDNN's version queries answer (major, minor, patch), if set.
     cudnn_version: Option<[libc::c_int; 3]>,
+    /// The compute capability advertised to NVML clients running under the VF launcher.
+    nvml_sm: Option<u32>,
 }
 
 /// `@cudnn-version=9.24.0` among the entries: taken out of them.
@@ -257,6 +260,13 @@ fn init_state() -> AuditState {
         entries,
         own_cookies: std::sync::Mutex::new(Vec::new()),
         cudnn_version,
+        nvml_sm: std::env::var_os("VOLTA_FOREVER").map(|_| {
+            std::env::var("VF_CAPABILITY")
+                .ok()
+                .as_deref()
+                .and_then(vf_adapt::capability_sm)
+                .unwrap_or(vf_adapt::TRANSLATED_FROM)
+        }),
     }
 }
 
@@ -307,7 +317,7 @@ pub extern "C" fn la_version(version: libc::c_uint) -> libc::c_uint {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn la_objopen(
     map: *mut libc::c_void, // struct link_map*
-    _lmid: libc::c_long,
+    lmid: libc::c_long,
     cookie: *mut libc::c_ulong,
 ) -> libc::c_uint {
     if map.is_null() || cookie.is_null() {
@@ -346,21 +356,69 @@ pub unsafe extern "C" fn la_objopen(
         }
     }
 
-    // Symbol binding is only watched for cuDNN's version functions, when asked: from any object,
-    // to cuDNN's libraries.
-    if s_cudnn_version().is_none() || l_name.is_null() {
+    let s = state();
+    if (s.cudnn_version.is_none() && s.nvml_sm.is_none()) || l_name.is_null() {
         return 0;
     }
-    let name = unsafe { CStr::from_ptr(l_name) }.to_bytes();
-    if basename(name).starts_with(b"libcudnn") {
-        LA_FLG_BINDTO | LA_FLG_BINDFROM
-    } else {
-        LA_FLG_BINDFROM
+    let name = basename(unsafe { CStr::from_ptr(l_name) }.to_bytes());
+    if lmid == libc::LM_ID_BASE
+        && s.nvml_sm.is_some()
+        && (name == b"libnvidia-ml.so" || name.starts_with(b"libnvidia-ml.so."))
+    {
+        // A second copy has its own handles. Let that copy serve its own clients.
+        if NVML_COOKIE
+            .compare_exchange(0, unsafe { *cookie } as usize, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return LA_FLG_BINDTO | LA_FLG_BINDFROM;
+        }
     }
+    if s.cudnn_version.is_some() && name.starts_with(b"libcudnn") {
+        return LA_FLG_BINDTO | LA_FLG_BINDFROM;
+    }
+    LA_FLG_BINDFROM
 }
 
 fn s_cudnn_version() -> Option<[libc::c_int; 3]> {
     state().cudnn_version
+}
+
+static NVML_COOKIE: AtomicUsize = AtomicUsize::new(0);
+static REAL_NVML_CAPABILITY: AtomicUsize = AtomicUsize::new(0);
+
+/// Release the recorded NVML instance so a later dlopen can bind its own implementation.
+///
+/// # Safety
+/// The loader supplies the cookie from `la_objopen`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn la_objclose(cookie: *mut libc::c_ulong) -> libc::c_uint {
+    if !cookie.is_null() {
+        let _ = NVML_COOKIE.compare_exchange(unsafe { *cookie } as usize, 0, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    0
+}
+
+unsafe extern "C" fn nvml_device_get_cuda_compute_capability(
+    device: *mut libc::c_void,
+    major: *mut libc::c_int,
+    minor: *mut libc::c_int,
+) -> libc::c_int {
+    type Query = unsafe extern "C" fn(*mut libc::c_void, *mut libc::c_int, *mut libc::c_int) -> libc::c_int;
+    // la_symbind64 receives NVML's resolved address before it hands out this wrapper.
+    let query: Query = unsafe { std::mem::transmute(REAL_NVML_CAPABILITY.load(Ordering::Relaxed)) };
+    let status = unsafe { query(device, major, minor) };
+    if status == 0
+        && !major.is_null()
+        && !minor.is_null()
+        && unsafe { (*major, *minor) } == (7, 0)
+        && let Some(sm) = state().nvml_sm
+    {
+        unsafe {
+            *major = (sm / 10) as libc::c_int;
+            *minor = (sm % 10) as libc::c_int;
+        }
+    }
+    status
 }
 
 /// The functions of the loaded cuDNN that the two below stand for.
@@ -396,7 +454,7 @@ pub unsafe extern "C" fn la_symbind64(
     sym: *mut libc::Elf64_Sym,
     _index: libc::c_uint,
     _referrer: *mut libc::c_ulong,
-    _definer: *mut libc::c_ulong,
+    definer: *mut libc::c_ulong,
     flags: *mut libc::c_uint,
     name: *const libc::c_char,
 ) -> usize {
@@ -404,16 +462,24 @@ pub unsafe extern "C" fn la_symbind64(
         unsafe { *flags |= LA_SYMB_NOPLTENTER | LA_SYMB_NOPLTEXIT };
     }
     let value = unsafe { (*sym).st_value } as usize;
-    if name.is_null() || s_cudnn_version().is_none() {
+    if name.is_null() {
         return value;
     }
     match unsafe { CStr::from_ptr(name) }.to_bytes() {
-        b"cudnnGetProperty" => {
+        b"nvmlDeviceGetCudaComputeCapability" if !definer.is_null() => {
+            let cookie = unsafe { *definer } as usize;
+            if cookie == 0 || cookie != NVML_COOKIE.load(Ordering::Relaxed) {
+                return value;
+            }
+            REAL_NVML_CAPABILITY.store(value, Ordering::Relaxed);
+            nvml_device_get_cuda_compute_capability as *const () as usize
+        }
+        b"cudnnGetProperty" if s_cudnn_version().is_some() => {
             REAL_PROPERTY.store(value, std::sync::atomic::Ordering::Relaxed);
             log::info(format_args!("cudnnGetProperty answers the configured version"));
             cudnn_get_property as *const () as usize
         }
-        b"cudnnGetVersion" => {
+        b"cudnnGetVersion" if s_cudnn_version().is_some() => {
             log::info(format_args!("cudnnGetVersion answers the configured version"));
             cudnn_get_version as *const () as usize
         }

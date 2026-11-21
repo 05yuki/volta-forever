@@ -1,5 +1,10 @@
 # Changes
 
+## Unreleased
+
+- vLLM's standard NVML backend now sees the same capability as its CUDA 13 PyTorch runtime under `vf`. Its NVML query reports 7.5 for Volta by default and honors `VF_CAPABILITY`.
+- Under `vf` or `vf venv`, direct CUDA driver clients with no embedded GPU code also see 7.5 on a V100 by default. Direct clients can still read native Volta kernel binary versions. CUDA 12 runtimes keep their previous handling of explicit overrides, and other GPUs retain their physical capabilities.
+
 ## 0.1.0 (2026-11-21)
 
 The first version made public. It runs software built with CUDA 13 on a Tesla V100 with the 580

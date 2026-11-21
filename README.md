@@ -147,17 +147,19 @@ What to expect elsewhere:
 
 ## For programs that know about it
 
-A program built for later GPUs is told the compute capability that its code starts at (7.5),
-so that it loads that code; the name of the card is still the V100's. What it cannot tell from
-the driver's answers is that the card is a Volta with volta-forever in front of it. It can
-ask:
+On a V100, `vf` and `vf venv` report capability 7.5 by default to CUDA 13 and to
+direct driver clients with no embedded GPU code, including Python's `ctypes`.
+`VF_CAPABILITY` can select another target. A caller with native Volta kernels and
+a CUDA 12 runtime both see 7.0 by default. A direct client can read the actual binary version
+of a loaded kernel (70 for native Volta code). The GPU name still identifies the
+physical card. A program can check for the layer with its version symbol.
 
 ```python
 import ctypes
 try:
     version = ctypes.CDLL("libcuda.so.1").volta_forever_version
     version.restype = ctypes.c_char_p
-    print("volta-forever", version().decode())      # a Volta, and the layer in front of it
+    print("volta-forever", version().decode())
 except AttributeError:
     print("NVIDIA's driver alone")
 ```

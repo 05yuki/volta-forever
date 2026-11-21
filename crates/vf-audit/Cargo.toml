@@ -12,3 +12,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 libc.workspace = true
+vf-adapt.workspace = true

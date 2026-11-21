@@ -21,7 +21,7 @@ use vf_fatbin::{self as fatbin, Entry, FatBinary, KIND_ELF, KIND_PTX, NewEntry};
 pub use vf_ptx::{Emulated, EmulatedCounts, Refused, RefusedFunction, Trapped};
 
 /// The architecture whose machine code is translated for sm_70: Turing.
-const TRANSLATED_FROM: u32 = 75;
+pub const TRANSLATED_FROM: u32 = 75;
 
 /// The GPU and the driver the image is adapted for.
 #[derive(Debug, Clone, Copy)]
@@ -67,7 +67,10 @@ pub enum Translate {
 pub fn capability_sm(text: &str) -> Option<u32> {
     let (major, minor) = text.trim().split_once('.')?;
     let (major, minor): (u32, u32) = (major.parse().ok()?, minor.parse().ok()?);
-    (minor < 10).then_some(major * 10 + minor)
+    if minor >= 10 {
+        return None;
+    }
+    major.checked_mul(10)?.checked_add(minor)
 }
 
 /// With `VF_TRANSLATE_DUMP=DIR`, every cubin given to the translator is written to

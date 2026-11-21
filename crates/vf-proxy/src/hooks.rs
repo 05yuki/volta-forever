@@ -100,14 +100,20 @@ unsafe extern "C" fn device_attribute(value: *mut c_int, attribute: c_int, devic
     if !matches!(attribute, ATTRIBUTE_CAPABILITY_MAJOR | ATTRIBUTE_CAPABILITY_MINOR) {
         return result;
     }
-    if let Some((major, minor)) = callers::capability(caller) {
-        unsafe {
-            *value = if attribute == ATTRIBUTE_CAPABILITY_MAJOR {
-                major
-            } else {
-                minor
-            }
-        };
+    let Some((major, minor)) = callers::device_capability(caller) else {
+        return result;
+    };
+    // A single attribute cannot identify Volta: Turing shares its major, Ampere can share its minor.
+    let (physical, reported, other_attr, other_physical) = if attribute == ATTRIBUTE_CAPABILITY_MAJOR {
+        (7, major, ATTRIBUTE_CAPABILITY_MINOR, 0)
+    } else {
+        (0, minor, ATTRIBUTE_CAPABILITY_MAJOR, 7)
+    };
+    if reported != physical && unsafe { *value } == physical {
+        let mut other = -1;
+        if unsafe { real(&mut other, other_attr, device) } == CUDA_SUCCESS && other == other_physical {
+            unsafe { *value = reported };
+        }
     }
     result
 }
@@ -121,15 +127,15 @@ pub unsafe extern "C" fn cuDeviceComputeCapability(major: *mut c_int, minor: *mu
 unsafe extern "C" fn device_capability(major: *mut c_int, minor: *mut c_int, device: c_int, caller: usize) -> CUresult {
     let real = real!(cuDeviceComputeCapability: unsafe extern "C" fn(*mut c_int, *mut c_int, c_int) -> CUresult);
     let result = unsafe { real(major, minor, device) };
-    if result != CUDA_SUCCESS {
-        return result;
-    }
-    if let Some(capability) = callers::capability(caller) {
-        if !major.is_null() {
-            unsafe { *major = capability.0 };
-        }
-        if !minor.is_null() {
-            unsafe { *minor = capability.1 };
+    if result == CUDA_SUCCESS
+        && !major.is_null()
+        && !minor.is_null()
+        && unsafe { (*major, *minor) } == (7, 0)
+        && let Some((reported_major, reported_minor)) = callers::device_capability(caller)
+    {
+        unsafe {
+            *major = reported_major;
+            *minor = reported_minor;
         }
     }
     result
@@ -141,18 +147,19 @@ unsafe extern "C" fn device_capability(major: *mut c_int, minor: *mut c_int, dev
 // (`cudaFuncGetAttributes`, `binaryVersion`), to see that the driver took the code it meant: the
 // backward pass of PyTorch's attention stops when the answer is below the architecture of the
 // variant it chose. What the driver has is the layer's code for this GPU in place of the
-// program's, and it answers 7.0. A caller that is told a capability is answered at least that.
+// program's, and it answers 7.0. Runtimes and callers with later GPU code are answered at least the
+// capability they were told. A launcher client with no embedded GPU code gets the actual binary version.
 
 /// `CUfunction_attribute` value of the architecture of a function's machine code: major * 10 + minor.
 const FUNCTION_BINARY_VERSION: c_int = 6;
 
 /// After NVIDIA's answer `result` to a question about a function: the architecture of its machine
-/// code is never below the capability `caller` is told.
+/// code may need to match the variant selected by the caller.
 unsafe fn binary_version(value: *mut c_int, attribute: c_int, result: CUresult, caller: usize) {
     if result != CUDA_SUCCESS || value.is_null() || attribute != FUNCTION_BINARY_VERSION {
         return;
     }
-    if let Some((major, minor)) = callers::capability(caller) {
+    if let Some((major, minor)) = callers::binary_capability(caller) {
         let told = major * 10 + minor;
         if unsafe { *value } < told {
             unsafe { *value = told };

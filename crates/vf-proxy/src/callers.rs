@@ -8,17 +8,17 @@
 //! in the same process as the program built for CUDA 13.
 //!
 //! So the answer depends on who asks. The caller is the library the capability function returns to:
-//! a CUDA runtime, either `libcudart.so` or the copy linked statically into an NVIDIA library.
+//! for example, a CUDA runtime, an application or a binding such as libffi.
 //!
 //! - A file that embeds code the driver uses on this GPU is told the real capability, always.
 //! - `libcudart.so.13` and later, and a file whose embedded code starts at an architecture of the
 //!   same generation that PTX can be retargeted from (sm_75 on Volta), are told that architecture.
-//! - Anything else (a program that calls the driver itself, an older `libcudart.so`) is told the real
-//!   capability.
+//! - Under the launcher, a readable file with no embedded GPU code sees 7.5 for the device.
+//!   Its queries about an individual kernel still return the architecture of the loaded binary.
+//! - Older CUDA runtimes retain the physical capability by default.
 //!
-//! `VF_CAPABILITY` replaces the answer of the last two cases, and with it the code that is taken
-//! from a program: the code for the capability it is told (`vf_adapt::Policy::told_sm`), not for
-//! the lowest it has. A program told 8.0 launches the kernels it has for 8.0.
+//! `VF_CAPABILITY` overrides the device answer for a direct client or code targeting later GPUs.
+//! The code taken from the program follows that setting (`vf_adapt::Policy::told_sm`).
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
@@ -34,16 +34,37 @@ enum Caller {
     Native,
     /// Has code from architecture `sm` on, which can be adapted.
     From(u32),
+    /// A launcher client whose file contains no GPU code.
+    Direct,
     /// Neither is known.
     Other,
 }
 
 /// First CUDA release without Volta: its runtime serves programs built for sm_75 and later.
 const FIRST_RUNTIME_WITHOUT_DEVICE: u32 = 13;
-const FIRST_SM_OF_THAT_RUNTIME: u32 = 75;
+const FIRST_SM_OF_THAT_RUNTIME: u32 = vf_adapt::TRANSLATED_FROM;
 
-/// What each loaded file is, by the address it is loaded at.
-static CALLERS: LazyLock<Mutex<HashMap<usize, Caller>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static UNDER_LAUNCHER: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VOLTA_FOREVER").is_some());
+
+#[derive(Default)]
+struct Cache {
+    unloads: u64,
+    by_base: HashMap<usize, Caller>,
+}
+
+static CALLERS: LazyLock<Mutex<Cache>> = LazyLock::new(|| Mutex::new(Cache::default()));
+
+/// glibc's unload counter changes even if another DSO takes the exact same address and filename.
+fn unload_count() -> u64 {
+    unsafe extern "C" fn first(info: *mut libc::dl_phdr_info, _: usize, data: *mut c_void) -> i32 {
+        // SAFETY: glibc on the supported x86-64 Linux systems supplies dlpi_subs; data points to n.
+        unsafe { *data.cast::<u64>() = (*info).dlpi_subs };
+        1
+    }
+    let mut n = 0u64;
+    unsafe { libc::dl_iterate_phdr(Some(first), (&raw mut n).cast()) };
+    n
+}
 
 /// A file mapped read-only.
 struct Mapped {
@@ -106,41 +127,58 @@ fn classify(path: &CStr) -> Caller {
     }
     match Mapped::open(path).map(|file| policy.embedded(file.bytes())) {
         Some(Embedded::Usable) => Caller::Native,
+        Some(Embedded::Nothing) if *UNDER_LAUNCHER => Caller::Direct,
         Some(Embedded::Other { lowest_sm }) if policy.retargetable(lowest_sm) => Caller::From(lowest_sm),
         _ => Caller::Other,
     }
 }
 
-/// The compute capability to report to the code that `return_address` belongs to, when it is not the
-/// real one.
-pub fn capability(return_address: usize) -> Option<(i32, i32)> {
+fn caller(return_address: usize) -> Caller {
     let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
-    // SAFETY: dladdr only reads the loader's tables.
-    let known = unsafe { libc::dladdr(return_address as *const c_void, &mut info) } != 0 && !info.dli_fname.is_null();
-    let caller = if known {
-        let base = info.dli_fbase as usize;
-        let mut callers = CALLERS.lock().unwrap_or_else(|e| e.into_inner());
-        *callers.entry(base).or_insert_with(|| {
-            // SAFETY: dladdr returned a string of the loader.
-            let path = unsafe { CStr::from_ptr(info.dli_fname) };
-            let caller = classify(path);
-            let answer = match (caller, config().capability) {
-                (Caller::Native, _) => "the real compute capability: it has code for this GPU".to_string(),
-                (Caller::From(sm), None) => {
-                    format!("compute capability {}.{}: its code starts there", sm / 10, sm % 10)
-                }
-                (Caller::Other, None) => "the real compute capability".to_string(),
-                (_, Some((major, minor))) => format!("compute capability {major}.{minor}, as VF_CAPABILITY asks"),
-            };
-            log::info(format_args!("{} is told {answer}", path.to_string_lossy()));
-            caller
-        })
-    } else {
-        Caller::Other
-    };
-    match caller {
-        Caller::Native => None,
-        Caller::From(sm) => config().capability.or(Some(((sm / 10) as i32, (sm % 10) as i32))),
-        Caller::Other => config().capability,
+    // SAFETY: the call site is live for the duration of this driver call.
+    if unsafe { libc::dladdr(return_address as *const c_void, &mut info) } == 0 || info.dli_fname.is_null() {
+        return Caller::Other;
     }
+    let unloads = unload_count();
+    let mut cache = CALLERS.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.unloads != unloads {
+        cache.by_base.clear();
+        cache.unloads = unloads;
+    }
+    *cache.by_base.entry(info.dli_fbase as usize).or_insert_with(|| {
+        let path = unsafe { CStr::from_ptr(info.dli_fname) };
+        let caller = classify(path);
+        let answer = match (caller, config().capability) {
+            (Caller::Native, _) => "the real compute capability: it has code for this GPU".to_string(),
+            (_, Some((major, minor))) => format!("compute capability {major}.{minor}, as VF_CAPABILITY asks"),
+            (Caller::From(sm), None) => format!("compute capability {}.{}: its code starts there", sm / 10, sm % 10),
+            (Caller::Direct, None) => "compute capability 7.5: it has no embedded GPU code".to_string(),
+            (Caller::Other, None) => "the real compute capability".to_string(),
+        };
+        log::info(format_args!("{} is told {answer}", path.to_string_lossy()));
+        caller
+    })
+}
+
+/// The capability reported for a physical sm_70 device.
+pub fn device_capability(return_address: usize) -> Option<(i32, i32)> {
+    capability(caller(return_address))
+}
+
+/// A client without embedded GPU code can identify the native architecture of an external kernel.
+pub fn binary_capability(return_address: usize) -> Option<(i32, i32)> {
+    match caller(return_address) {
+        Caller::Direct => None,
+        other => capability(other),
+    }
+}
+
+fn capability(caller: Caller) -> Option<(i32, i32)> {
+    let sm = match caller {
+        Caller::Native => return None,
+        Caller::Direct => FIRST_SM_OF_THAT_RUNTIME,
+        Caller::From(sm) => sm,
+        Caller::Other => return config().capability,
+    };
+    config().capability.or(Some(((sm / 10) as i32, (sm % 10) as i32)))
 }
