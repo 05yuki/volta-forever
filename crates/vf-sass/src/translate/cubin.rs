@@ -246,22 +246,25 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
             let predicates: Result<Vec<Predicates>, Refused> = fs.iter().map(|f| stand_ins(f)).collect();
             let attempt_result = predicates.and_then(|predicates| {
                 let saves = predicates.iter().map(|p| p.save_slots).max().unwrap_or(0);
-                // `borrow_level`: 2, the uniform registers that find a home in the function's
-                // own registers have it and the pool is taken there at each instruction; 1, the
-                // homes only, the pool above; 0, everything above, as it was.
-                let mut attempt = |do_pairs: bool, borrow_level: u32, top_override: Option<u32>, gave_up: &[String]| -> Result<Vec<(usize, TransResult)>, Refused> {
-                    // Plan pairs for each function.
-                    let plans: Vec<Option<crate::pairing::Plan>> = fs
-                        .iter()
+                // A function's pairing plan depends on the original instructions and control
+                // flow. Register-placement retries and budget alternatives can reuse it.
+                let paired = std::cell::LazyCell::new(|| {
+                    fs.iter()
                         .map(|f| {
-                            if do_pairs && opts.pairs && f.needs_lane && !f.entered_inside {
-                                let ent = self::entries(f);
-                                crate::pairing::plan(&f.src, &f.tables, &ent)
+                            if opts.pairs && f.needs_lane && !f.entered_inside {
+                                crate::pairing::plan(&f.src, &f.tables, &self::entries(f))
                             } else {
                                 None
                             }
                         })
-                        .collect();
+                        .collect::<Vec<_>>()
+                });
+                let unpaired: Vec<_> = fs.iter().map(|_| None).collect();
+                // `borrow_level`: 2, the uniform registers that find a home in the function's
+                // own registers have it and the pool is taken there at each instruction; 1, the
+                // homes only, the pool above; 0, everything above, as it was.
+                let mut attempt = |do_pairs: bool, borrow_level: u32, top_override: Option<u32>, gave_up: &[String]| -> Result<Vec<(usize, TransResult)>, Refused> {
+                    let plans = if do_pairs { &*paired } else { &unpaired };
                     // has_product when not in a pair site.
                     let has_product_flags: Vec<bool> = fs
                         .iter()
@@ -511,16 +514,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     Ok(result)
                 };
                 let alone = fs.len() == 1 && indices.iter().any(|si| entries.contains(si));
-                let has_pairs_to_drop = || {
-                    fs.iter().any(|f| {
-                        if opts.pairs && f.needs_lane && !f.entered_inside {
-                            let ent = self::entries(f);
-                            crate::pairing::plan(&f.src, &f.tables, &ent).is_some()
-                        } else {
-                            false
-                        }
-                    })
-                };
+                let has_pairs_to_drop = || paired.iter().any(Option::is_some);
                 type Tried = Result<Vec<(usize, TransResult)>, Refused>;
                 type AttemptFn<'a> = dyn FnMut(bool, u32, Option<u32>, &[String]) -> Tried + 'a;
                 let empty_gave_up: Vec<String> = Vec::new();
