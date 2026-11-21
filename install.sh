@@ -28,7 +28,7 @@ fail() { printf 'volta-forever: %s\n' "$*" >&2; exit 1; }
 # (Everything is in a function that is called on the last line: a script cut short while it
 # was being downloaded runs nothing.)
 main() {
-    version=${VF_VERSION:-0.1.0}
+    version=${VF_VERSION:-0.1.1}
     name=volta-forever-$version-linux-x86_64
     archive=$name.tar.gz
     base=${VF_INSTALL_BASE:-https://github.com/nbald/volta-forever/releases/download/v$version}
