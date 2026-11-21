@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    # Everything that needs no GPU and no file of NVIDIA's.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --workspace
+      - name: The layer built as scripts/build.sh installs it
+        run: scripts/build.sh
+      - name: The proxy against a stand-in for the driver
+        run: |
+          tests/proxy/fit_api.sh
+          tests/proxy/marker.sh
+      - name: The launcher, under dash and under bash
+        run: |
+          dash tests/launcher/launcher.sh
+          bash --posix tests/launcher/launcher.sh
+      - name: The installer is a POSIX shell script
+        run: |
+          dash -n install.sh
+          bash --posix -n install.sh
+      - name: The Rust translator against the Python reference, on the test kernels
+        run: |
+          scripts/fetch-all.sh denvdis
+          VF_TOOL=dist/bin/vf-translate JOBS=4 tests/sass/compare.sh
+
+  install:
+    # The one-liner of the README in fresh systems, against the release of this tree's version.
+    # Until that release exists the installer is not run, and a notice says so.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04", "debian:12", "debian:13"]
+    container: ${{ matrix.image }}
+    steps:
+      - name: What a user has before the one-liner
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates
+      - uses: actions/checkout@v4
+      - name: Install, then run a command through the layer
+        run: |
+          version=$(sed -n 's/^    version=${VF_VERSION:-\(.*\)}$/\1/p' install.sh)
+          test -n "$version"
+          if ! curl -fsIL -o /dev/null "https://github.com/$GITHUB_REPOSITORY/releases/download/v$version/SHA256SUMS"; then
+              echo "::notice::there is no release v$version yet: install.sh was not run in ${{ matrix.image }}"
+              exit 0
+          fi
+          VF_INSTALL_FETCH=0 sh install.sh
+          vf version
+          test "$(VF_QUIET=1 vf sh -c 'echo "$VOLTA_FOREVER"')" = "$version"
