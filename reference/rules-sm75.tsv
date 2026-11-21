@@ -33,6 +33,7 @@ imad_wide__RRU_RRU	imad_wide__RRR_RRR	27
 imad_wide__RUR_RUR	imad_wide__RRR_RRR	5378
 imad_x__RRU_RRU	imad_x__RRR_RRR	274
 isetp__RUR_RUR	isetp__RRR_RR	50013
+lea_hi_noimm__RUR_RUR	lea_hi_noimm__RRR_RRR	12
 lea_hi_noimm_sx32_x__RUR_RUR	lea_hi_noimm_sx32_x__RRR_RRR	1499
 lea_hi_noimm_x__RUR_RUR	lea_hi_noimm_x__RRR_RRR	6769
 lea_lo_noimm__RUR_RUR	lea_lo_noimm__RRR_RRR	10577
@@ -71,6 +72,7 @@ uplop3_lut_2out_	plop3_lut_2out_	22
 uprmt__URIUR	prmt__RuIR_RIR	2781
 usel__URURUR_UUU	sel__RRR_RRR	1389
 usel__URuIUR_URIR	sel__RuIR_RIR	1870
+usgxt__URuIUR_URIR	sgxt__RuIR_RIR	12
 ushf__URURUR_URURUR	shf__RRR_RRR	3017
 ushf__URuIUR_URIR	shf__RuIR_RIR	15270
 voteu_	vote_	8167

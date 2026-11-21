@@ -116,3 +116,31 @@ pub fn dropped_fields(rule_idx: usize) -> &'static [(&'static str, u16)] {
 pub fn rule_sm70_name(rule_idx: usize) -> &'static str {
     RULES[rule_idx].1
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::Decoder;
+
+    #[test]
+    fn remap_uniform_operands_in_triton_gated_delta_kernel() {
+        // Actual sm_75 words and their sm_70 forms as read by nvdisasm.
+        // Ordinary registers start at R100 in this check.
+        let cases = [
+            // USGXT.U32 UR11, UR11, 0x4 -> SGXT.U32 R111, R111, 0x4
+            (0x000fe20008000000_000000040b0b789a, 0x000fe20000000000_000000046f6f781a),
+            // LEA.HI R0, R2, UR14, RZ, 0x1c -> LEA.HI R0, R2, R114, RZ, 0x1c
+            (0x000fe4000f8fe0ff_0000000e02007c11, 0x000fe400078fe0ff_0000007202007211),
+        ];
+        let mut decoder = Decoder::new(75);
+        for (source, expected) in cases {
+            let insn = decoder.decode(source).unwrap();
+            let target = rule_of_target(insn.class_id).expect(insn.name);
+            let rule = find_rule(insn.name, target, "").unwrap();
+            let Applied::Word(mapped) = apply(rule, source, &|ur| Some(100 + ur), &Some) else {
+                panic!("failed to map {}", insn.name);
+            };
+            assert_eq!(mapped, expected, "{}", insn.name);
+        }
+    }
+}

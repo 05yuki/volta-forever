@@ -74,12 +74,12 @@ A V100 has no uniform register file. The translator gives each uniform register
 an ordinary register above those the function uses (a 64-bit pair stays on an
 even register and the next), and each uniform predicate an ordinary predicate
 that holds nothing of the program during its life. Each instruction on uniform
-registers is then rewritten to its ordinary twin by one of the 75 rules of
-`reference/rules-sm75.tsv`. A rule is kept only if, for every instruction of
-its class in PyTorch's 475 cubins, the word it makes reads for nvdisasm, as
-sm_70, like the original read as sm_75 with the uniform registers renamed:
-393,803 instructions go by a rule (`reference/remap.py`, which gives the same
-75 rules again from that code, 2026-11-20).
+registers is then rewritten to its ordinary twin using `reference/rules-sm75.tsv`.
+For each rule, nvdisasm must read the translated word on sm_70 exactly as it read
+the original on sm_75, with the uniform registers renamed. PyTorch's 475 cubins
+exercise 75 rules across 393,803 instructions. The Triton gated delta rule
+kernel used by vLLM exercises two further forms, `USGXT.U32` with an immediate
+and `LEA.HI` with a uniform source.
 
 An instruction with a uniform operand (a load at `[R4 + UR6 + 0x10]`, a
 comparison against UR2) is rewritten to the sm_70 form with an ordinary
