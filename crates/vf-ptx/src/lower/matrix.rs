@@ -181,19 +181,13 @@ impl<'a> Body<'a> {
         Ok(())
     }
 
-    /// `ldmatrix`: the registers in Turing layout where something reads them so, and the operands of
-    /// the products in the layouts the plan chose.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn ldmatrix(
+    fn matrix_address(
         &mut self,
         opcode: &str,
-        transposed: bool,
-        shared: bool,
-        r: &[&str],
         base: &str,
         offset: Option<&str>,
-        followed: bool,
-    ) -> Result<(), Unsupported> {
+        shared: bool,
+    ) -> Result<String, Unsupported> {
         let unsupported = |what: &str| Unsupported(format!("{opcode}: {what}"));
         // The row address as an offset in shared memory, which fits 32 bits. The width of the register
         // comes from its declaration; one declared outside the body (a function parameter) is taken
@@ -222,6 +216,47 @@ impl<'a> Body<'a> {
         if let Some(offset) = offset {
             emit!(self, "add.u32 {start}, {start}, {offset};");
         }
+        Ok(start)
+    }
+
+    /// PTX stmatrix.m8n8.x1: lanes 0..7 supply independent row addresses. Lane 4r+c
+    /// stores both 16-bit elements in its register at byte offset 4c in row r.
+    pub(super) fn stmatrix(
+        &mut self,
+        opcode: &str,
+        guard: &str,
+        src: &str,
+        base: &str,
+        offset: Option<&str>,
+    ) -> Result<(), Unsupported> {
+        let start = self.matrix_address(opcode, base, offset, true)?;
+        let at = self.fresh();
+        let group = self.lane(Lane::Group);
+        let pair = self.lane(Lane::PairOffset);
+        // All threads that execute an aligned store participate. Keep a uniform guard on the
+        // collective as well as on the store, including on paths where the instruction is skipped.
+        emit!(self, "{guard}shfl.sync.idx.b32 {at}, {start}, {group}, 31, -1;");
+        self.shuffles += 1;
+        emit!(self, "{guard}add.u32 {at}, {at}, {pair};");
+        emit!(self, "{guard}st.shared.b32 [{at}], {src};");
+        emit!(self, "{guard}bar.warp.sync -1;");
+        Ok(())
+    }
+
+    /// `ldmatrix`: the registers in Turing layout where something reads them so, and the operands of
+    /// the products in the layouts the plan chose.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ldmatrix(
+        &mut self,
+        opcode: &str,
+        transposed: bool,
+        shared: bool,
+        r: &[&str],
+        base: &str,
+        offset: Option<&str>,
+        followed: bool,
+    ) -> Result<(), Unsupported> {
+        let start = self.matrix_address(opcode, base, offset, shared)?;
         // The row addresses fetched so far, and the 16-byte loads to do: address, registers.
         let mut rows: Vec<(Lane, String)> = Vec::new();
         let mut wide: Vec<(String, Vec<String>)> = Vec::new();

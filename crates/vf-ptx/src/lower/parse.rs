@@ -83,6 +83,12 @@ pub(super) enum Tensor<'a> {
         base: &'a str,
         offset: Option<&'a str>,
     },
+    /// One untransposed 8x8 matrix stored in CTA shared memory.
+    Store {
+        src: &'a str,
+        base: &'a str,
+        offset: Option<&'a str>,
+    },
     /// `movmatrix`.
     Transpose { d: &'a str, a: &'a str },
     /// `cp.async` of `size` bytes (4, 8 or 16) from global to shared memory, addresses as
@@ -378,6 +384,18 @@ pub(super) fn parse<'a>(opcode: &str, operands: &'a str) -> Result<Tensor<'a>, U
                     }
                 })
             }
+        }
+    } else if matches!(
+        opcode,
+        "stmatrix.sync.aligned.m8n8.x1.shared.b16" | "stmatrix.sync.aligned.m8n8.x1.shared::cta.b16"
+    ) {
+        if let [place, vector] = parts.as_slice()
+            && let (Some((base, offset)), Some(words)) = (address(place), scan::vector(vector))
+            && let [src] = words.as_slice()
+        {
+            Ok(Tensor::Store { src, base, offset })
+        } else {
+            Err(unsupported("operands not recognised"))
         }
     } else if opcode.starts_with("ldmatrix.") {
         // The shape is written first (`m8n8.x4.trans`) or after the count and `trans` (`x4.trans.m8n8`).

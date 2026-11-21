@@ -329,14 +329,14 @@ impl<'a> Body<'a> {
             Some(parse(opcode, operands)?)
         };
         // A copy of all or nothing under a predicate is a load and a store under it (so CUTLASS
-        // writes its copies). Nothing else is rewritten under a predicate.
+        // writes its copies). A warp matrix store may also be uniformly predicated.
         let whole_copy = match &tensor {
             Some(Tensor::Copy { size, amount, .. }) => {
                 amount.is_none_or(|amount| matches!(integer(amount), Some(bytes) if bytes == *size || bytes == 0))
             }
             _ => false,
         };
-        if guarded && !matches!(tensor, Some(Tensor::Copied)) && !whole_copy {
+        if guarded && !matches!(tensor, Some(Tensor::Copied | Tensor::Store { .. })) && !whole_copy {
             return Err(Unsupported(format!("{opcode}: guarded by a predicate")));
         }
         // The statement is `<guard><opcode><operands>;`.
@@ -444,6 +444,7 @@ impl<'a> Body<'a> {
                 base,
                 offset,
             }) => self.ldmatrix(opcode, transposed, shared, &r, base, offset, followed)?,
+            Some(Tensor::Store { src, base, offset }) => self.stmatrix(opcode, &guard, src, base, offset)?,
             Some(Tensor::Transpose { d, a }) => self.movmatrix(d, a),
         }
         self.counts.tensor += 1;

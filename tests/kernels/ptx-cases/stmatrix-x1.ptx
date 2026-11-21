@@ -1,0 +1,99 @@
+.version 8.0
+.target sm_90
+.address_size 64
+
+// Eight independently addressed rows, each aligned to 16 bytes with padding on both sides.
+// Only lanes 0..7 supply row addresses. Other lanes point into the guard region.
+.visible .entry k(.param .u64 output)
+{
+    .reg .b32 lane, base, i, at, row, column, own, regbits, v, lo, hi, first, second, guards;
+    .reg .u32 source;
+    .reg .u64 wide, out, delta;
+    .reg .pred more, valid, use_other;
+    .shared .align 16 .b32 rows[160];
+    mov.u32 lane, %laneid;
+    mov.u32 base, rows;
+    mov.u32 i, lane;
+fill:
+    mad.lo.u32 at, i, 4, base;
+    st.shared.u32 [at], 0x6b1df147;
+    add.u32 i, i, 32;
+    setp.lt.u32 more, i, 160;
+    @more bra fill;
+    bar.sync 0;
+
+    mad.lo.u32 row, lane, 5, 3;
+    and.b32 row, row, 7;
+    setp.ge.u32 use_other, lane, 8;
+    @use_other mov.u32 row, 8;
+    mad.lo.u32 at, row, 48, base;
+    cvt.u64.u32 wide, at;
+    add.u32 own, at, 16;
+
+    // The low and high halves encode different values for every source lane.
+    mad.lo.u32 lo, lane, 31, 0x1357;
+    mad.lo.u32 hi, lane, -17, 0xa9c3;
+    shl.b32 hi, hi, 16;
+    or.b32 regbits, lo, hi;
+    stmatrix.sync.aligned.m8n8.x1.shared.b16 [own], {regbits};
+    bar.sync 0;
+
+    // Read a different thread's pair. The CPU expects each decoded pair to
+    // equal the same two constants across all lanes.
+    mad.lo.u32 source, lane, 13, 7;
+    and.b32 source, source, 31;
+    shr.u32 row, source, 2;
+    mad.lo.u32 row, row, 5, 3;
+    and.b32 row, row, 7;
+    and.b32 column, source, 3;
+    mad.lo.u32 at, row, 48, base;
+    mad.lo.u32 at, column, 4, at;
+    ld.shared.u32 v, [at+16];
+    and.b32 lo, v, 65535;
+    shr.u32 hi, v, 16;
+    mad.lo.u32 lo, source, -31, lo;
+    mad.lo.u32 hi, source, 17, hi;
+    shl.b32 hi, hi, 16;
+    or.b32 first, lo, hi;
+    bar.sync 0;
+
+    // Exercise the 64-bit address, constant offset, CTA spelling and both outcomes
+    // of a warp-uniform predicate. A disabled store must preserve every word.
+    not.b32 regbits, regbits;
+    setp.eq.u32 valid, lane, lane;
+    @valid stmatrix.sync.aligned.m8n8.x1.shared::cta.b16 [wide+16], {regbits};
+    @!valid stmatrix.sync.aligned.m8n8.x1.shared.b16 [wide+16], {lo};
+    bar.sync 0;
+    ld.shared.u32 v, [at+16];
+    not.b32 v, v;
+    and.b32 lo, v, 65535;
+    shr.u32 hi, v, 16;
+    mad.lo.u32 lo, source, -31, lo;
+    mad.lo.u32 hi, source, 17, hi;
+    shl.b32 hi, hi, 16;
+    or.b32 second, lo, hi;
+
+    // Check every one of the remaining 128 shared words, including the addresses
+    // supplied by the 24 lanes that do not contribute a row pointer.
+    mov.u32 i, lane;
+    mov.u32 guards, 0;
+check:
+    rem.u32 column, i, 12;
+    setp.ge.u32 valid, i, 96;
+    setp.lt.or.u32 valid, column, 4, valid;
+    setp.ge.or.u32 valid, column, 8, valid;
+    mad.lo.u32 at, i, 4, base;
+    ld.shared.u32 v, [at];
+    setp.ne.and.u32 more, v, 0x6b1df147, valid;
+    @more add.u32 guards, guards, 1;
+    add.u32 i, i, 32;
+    setp.lt.u32 more, i, 160;
+    @more bra check;
+    ld.param.u64 out, [output];
+    mul.wide.u32 delta, lane, 16;
+    add.u64 out, out, delta;
+    st.global.u32 [out], first;
+    st.global.u32 [out+4], second;
+    st.global.u32 [out+8], guards;
+    ret;
+}

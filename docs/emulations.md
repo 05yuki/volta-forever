@@ -220,7 +220,7 @@ preamble, 3 or 4 per matrix). Transposed: 38 (3 + 9 per matrix).
 **movmatrix.** `movmatrix.sync.aligned.m8n8.trans.b16` transposes a matrix fragment across
 lanes. It becomes two warp shuffles.
 
-**stmatrix.** Refused: no Volta sequence. No library of the census uses it.
+**stmatrix.** For `stmatrix.sync.aligned.m8n8.x1.shared.b16`, lanes 0 through 7 supply the eight row addresses. Each group of four lanes stores one row, with each lane writing its pair of 16-bit elements. The lowering also accepts `.shared::cta`.
 
 **Test cases.** `tests/gpu/run.sh`: the `tensor-core` and `ampere` cases load every
 operand with `ldmatrix` and check every register of every thread against the host model.
@@ -626,7 +626,7 @@ the reason (on the console and in the error returned to the program, error 218).
 
 **Instructions without a sequence** (from the PTX census of NVIDIA's libraries): clusters
 of blocks (`barrier.cluster`, `mapa`, `getctarank`), barrier operations with transactions or changing counts (`mbarrier.expect_tx`, `mbarrier.arrive_drop`),
-tensor maps (`tensormap`), multicast memory (`multimem`), and `stmatrix`. These forms are refused on Volta.
+tensor maps (`tensormap`), multicast memory (`multimem`), and other `stmatrix` shapes and layouts. These forms are refused on Volta.
 
 **What the driver's compiler refuses.** The lowering rewrites or traps the instructions it
 knows. The driver may still refuse what remains: a function whose compiler error is

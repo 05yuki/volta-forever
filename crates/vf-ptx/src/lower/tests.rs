@@ -422,6 +422,33 @@ fn refuses_what_it_has_no_sequence_for() {
 }
 
 #[test]
+fn x1_matrix_store_preserves_guards_and_materializes_loaded_fragments() {
+    let store = "stmatrix.sync.aligned.m8n8.x1.shared.b16";
+    let text = format!(
+        "{{\n.reg .u64 %rd<2>;\n.reg .u32 %r<2>;\n.reg .pred %p;\n\
+         ldmatrix.sync.aligned.m8n8.x1.shared.b16 {{%r0}}, [%rd0];\n\
+         @!%p {store} [%rd1+16], {{%r0}};\n}}"
+    );
+    let result = lower(&text);
+    assert!(result.contains("ld.shared.u32 %r0, ["), "{result}");
+    for instruction in ["shfl.sync.idx.b32", "add.u32", "st.shared.b32", "bar.warp.sync"] {
+        assert!(result.contains(&format!("@!%p {instruction}")), "{result}");
+    }
+    assert!(undeclared(&result).is_empty(), "{result}");
+
+    for (opcode, operands) in [
+        ("stmatrix.sync.aligned.m8n8.x2.shared.b16", "[%r1], {%r0, %r2}"),
+        ("stmatrix.sync.aligned.m8n8.x1.trans.shared.b16", "[%r1], {%r0}"),
+        ("stmatrix.sync.aligned.m8n8.x1.shared.b8", "[%r1], {%r0}"),
+        (store, "[%r1], {%r0, %r2}"),
+        (store, "[%r1+%r2], {%r0}"),
+    ] {
+        let result = refusal(&format!("{{\n{opcode} {operands};\n}}"));
+        assert!(result.contains(opcode), "{result}");
+    }
+}
+
+#[test]
 fn tanh_is_expanded_where_it_stands() {
     let (lowered, counts) = body("{\n\ttanh.approx.f32 %f2, %f1;\n\tret;\n}", 64, Options::default()).unwrap();
     assert_eq!(

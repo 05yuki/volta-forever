@@ -246,6 +246,9 @@ impl<'a> Plan<'a> {
                 Some(Tensor::Load { base, .. }) => {
                     plan.plain.insert(base);
                 }
+                Some(Tensor::Store { src, base, .. }) => {
+                    plan.plain.extend([src, base]);
+                }
                 Some(Tensor::Transpose { d, a }) => {
                     plan.plain.insert(a);
                     plan.transposed.insert(d);
