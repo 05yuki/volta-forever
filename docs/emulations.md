@@ -273,10 +273,13 @@ bf16 x bf16 has at most 14 significant bits, well within f32).
 
 | Instruction | On Volta |
 |---|---|
-| `neg.bf16` | Flip the sign bit |
-| `add.bf16`, `add.bf16x2` | Operands as f32 (a shift), `add.rn.f32`, rounded to bf16 |
-| `sub{.rn}.bf16x2` | Subtract each pair of widened f32 operands and round each result to bf16 |
-| `mul.bf16` | Same with `mul.rn.f32` |
+| `neg.bf16`, `abs.bf16` | Flip or clear the sign bit |
+| `add{.rn}.bf16`, `add{.rn}.bf16x2` | Operands as f32 (a shift), `add.rn.f32`, rounded to bf16 |
+| `sub{.rn}.bf16`, `sub{.rn}.bf16x2` | Subtract widened operands and round each result to bf16 |
+| `mul{.rn}.bf16`, `mul{.rn}.bf16x2` | Multiply widened operands and round each result to bf16 |
+| `add.rn.f32.bf16`, `sub.rn.f32.bf16` | Widen the first operand and add or subtract in f32 |
+| `min.NaN.bf16`, `max.NaN.bf16` | Compare the widened inputs, propagating a NaN from either operand |
+| `cvt.rn.bf16.f16` | Widen exactly to f32, then round to bf16 |
 | `fma.rn.bf16`, `fma.rn.bf16x2` | Rounded to odd in f32 first (from `fma.rm.f32` and `fma.rp.f32`), then to bf16 |
 | `cvt.rn.bf16.f64` | f32 rounded to odd (from `cvt.rm.f32.f64` and `cvt.rp.f32.f64`), then to bf16 |
 | `cvt.rn.f16.bf16` | Widen exactly to f32, then round to f16 |
@@ -607,7 +610,8 @@ The reference vectors are in `tests/kernels/blackwell/ref_scaled/`.
 | `cvt.rn.bf16x2.f32` | The same with bf16 (a shift to f32, `cvt.rn.f16.f32` of that, shifts to assemble). |
 | `cvt.rn.tf32.f32` | The 10-bit mantissa (zero the low 13 bits), ties to even: 9 instructions. |
 | `redux.sync.{add,min,max}.{s32,u32}` | A ballot identifies the participating lanes. A full warp uses five butterfly shuffles. A partial warp gathers each remaining lane once. |
-| `{min,max}.NaN.f32` | The comparison with the standard `min`/`max` does not propagate NaN; this form does. It is a comparison and a `selp`. |
+| `redux.sync.{min,max}.NaN.f32` | Reduce the active lanes and use a warp vote to propagate a NaN from any participating lane. |
+| `{min,max}.NaN.f32` | Compare two or three operands and propagate a NaN from any operand. |
 | `{min,max,add,mul,...}.relu.{s32,f32,...}` | The operation followed by a clamp to zero. |
 | `fma.rn.f32x2`, `add.rn.f32x2`, ... | Arithmetic on pairs of f32, packed in a 64-bit register. Each is two scalar operations. |
 | `ld.global.L2::cache_hint` | The cache hint is dropped; the load is otherwise unchanged. |

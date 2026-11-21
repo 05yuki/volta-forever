@@ -126,6 +126,15 @@ impl<'a> Body<'a> {
             emit!(self, "shl.b32 {bits}, {bits}, 16;");
             self.written(d);
             emit!(self, "{guard}mov.b32 {d}, {bits};");
+        } else if let ["cvt", "rn", "bf16", "f16"] = words[..] {
+            let [d, a] = parts[..] else {
+                return Err(unsupported("operands not recognised"));
+            };
+            let widened = self.fresh();
+            emit!(self, "cvt.f32.f16 {widened}, {a};");
+            let bits = self.bf16("rn", &widened);
+            self.written(d);
+            emit!(self, "{guard}cvt.u16.u32 {d}, {bits};");
         } else if let ["cvt", "rn", "f16", "bf16"] = words[..] {
             let [d, a] = parts[..] else {
                 return Err(unsupported("operands not recognised"));
@@ -285,21 +294,48 @@ impl<'a> Body<'a> {
             emit!(self, "xor.b32 {bits}, {bits}, 0x8000;");
             self.written(d);
             emit!(self, "{guard}cvt.u16.u32 {d}, {bits};");
-        } else if let ["add", "bf16"] = words[..] {
-            // Added as f32, then rounded to bf16. The f32 sum is exact unless one operand is more
-            // than 2^16 times the other, and then it is next to the larger one, far from the halfway
-            // points of bf16: the second rounding sees what a single one would.
+        } else if let [op @ ("max" | "min"), "NaN", "bf16"] = words[..] {
+            let [d, a, b] = parts[..] else {
+                return Err(unsupported("operands not recognised"));
+            };
+            let a = self.bf16_to_f32(a);
+            let b = self.bf16_to_f32(b);
+            let result = self.fresh();
+            self.bound(&format!("{op}.f32"), &result, &a, &b);
+            emit!(self, "shr.u32 {result}, {result}, 16;");
+            self.written(d);
+            emit!(self, "{guard}cvt.u16.u32 {d}, {result};");
+        } else if let ["abs", "bf16"] = words[..] {
+            let [d, a] = parts[..] else {
+                return Err(unsupported("operands not recognised"));
+            };
+            self.written(d);
+            emit!(self, "{guard}and.b16 {d}, {a}, 0x7fff;");
+        } else if let [op @ ("add" | "sub"), "rn", "f32", "bf16"] = words[..] {
+            // Only the first input is bf16. The accumulator and destination are f32.
+            let [d, a, b] = parts[..] else {
+                return Err(unsupported("operands not recognised"));
+            };
+            let widened = self.bf16_to_f32(a);
+            self.written(d);
+            emit!(self, "{guard}{op}.rn.f32 {d}, {widened}, {b};");
+        } else if let [op @ ("add" | "sub" | "mul"), "bf16"] | [op @ ("add" | "sub" | "mul"), "rn", "bf16"] = words[..]
+        {
+            // The wider precision holds all significant product bits, and all sum bits that can
+            // change a bf16 rounding decision.
             let [d, a, b] = parts[..] else {
                 return Err(unsupported("operands not recognised"));
             };
             let a_f32 = self.bf16_to_f32(a);
             let b_f32 = self.bf16_to_f32(b);
-            let sum = self.fresh();
-            emit!(self, "add.rn.f32 {sum}, {a_f32}, {b_f32};");
-            let bits = self.bf16("rn", &sum);
+            let result = self.fresh();
+            emit!(self, "{op}.rn.f32 {result}, {a_f32}, {b_f32};");
+            let bits = self.bf16("rn", &result);
             self.written(d);
             emit!(self, "{guard}cvt.u16.u32 {d}, {bits};");
-        } else if let [op @ ("add" | "sub"), "bf16x2"] | [op @ ("add" | "sub"), "rn", "bf16x2"] = words[..] {
+        } else if let [op @ ("add" | "sub" | "mul"), "bf16x2"] | [op @ ("add" | "sub" | "mul"), "rn", "bf16x2"] =
+            words[..]
+        {
             let [d, a, b] = parts[..] else {
                 return Err(unsupported("operands not recognised"));
             };
@@ -313,19 +349,6 @@ impl<'a> Body<'a> {
             emit!(self, "shl.b32 {hi_bits}, {hi_bits}, 16;");
             self.written(d);
             emit!(self, "{guard}or.b32 {d}, {hi_bits}, {lo_bits};");
-        } else if let ["mul", "bf16"] = words[..] {
-            // The product of two bf16 has 16 bits of mantissa at most: exact as an f32, or below
-            // half the smallest bf16 where an f32 cannot hold it, which rounds to zero either way.
-            let [d, a, b] = parts[..] else {
-                return Err(unsupported("operands not recognised"));
-            };
-            let a_f32 = self.bf16_to_f32(a);
-            let b_f32 = self.bf16_to_f32(b);
-            let product = self.fresh();
-            emit!(self, "mul.rn.f32 {product}, {a_f32}, {b_f32};");
-            let bits = self.bf16("rn", &product);
-            self.written(d);
-            emit!(self, "{guard}cvt.u16.u32 {d}, {bits};");
         } else if let ["fma", "rn", "bf16"] = words[..] {
             // a * b can be a halfway point of bf16 and c anything, however small: the f32 result is
             // rounded to odd before the rounding to bf16 (`odd`).
@@ -452,8 +475,10 @@ impl<'a> Body<'a> {
             "redux",
             "sync",
             operation @ ("add" | "min" | "max" | "and" | "or" | "xor"),
+            ref qualifiers @ ..,
             kind,
         ] = words[..]
+            && (qualifiers.is_empty() || (qualifiers == ["NaN"] && kind == "f32" && matches!(operation, "min" | "max")))
         {
             // The member mask names the whole warp. Some of its threads may have exited.
             let [d, a, mask] = parts[..] else {
@@ -499,7 +524,14 @@ impl<'a> Body<'a> {
             let _ = write!(self.out, "\n$vf_reduced{n}:");
             self.shuffles = 0;
             self.written(d);
-            emit!(self, "mov.b32 {d}, {value};");
+            if qualifiers.is_empty() {
+                emit!(self, "mov.b32 {d}, {value};");
+            } else {
+                // The reduction above ignores NaNs. The .NaN form propagates a NaN from any live lane.
+                emit!(self, "setp.nan.f32 %vf_n, {a}, {a};");
+                emit!(self, "vote.sync.any.pred %vf_n, %vf_n, -1;");
+                emit!(self, "selp.f32 {d}, 0f7FFFFFFF, {value}, %vf_n;");
+            }
         } else if memory && wide(&words).is_some() {
             // More than 128 bits at once: two halves, each aligned as the whole was.
             let (count, bytes) = wide(&words).unwrap_or_default();

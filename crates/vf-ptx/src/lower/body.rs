@@ -360,8 +360,14 @@ impl<'a> Body<'a> {
                 self.counts.other += 1;
                 return Ok(());
             }
-            Some(Tensor::Bound { plain, d, a, b }) => {
-                self.bound(plain, d, a, b);
+            Some(Tensor::Bound { plain, d, a, b, third }) => {
+                if let Some(c) = third {
+                    let intermediate = self.fresh();
+                    self.bound(plain, &intermediate, a, b);
+                    self.bound(plain, d, &intermediate, c);
+                } else {
+                    self.bound(plain, d, a, b);
+                }
                 self.counts.other += 1;
                 return Ok(());
             }

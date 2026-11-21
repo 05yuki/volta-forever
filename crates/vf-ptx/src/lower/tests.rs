@@ -1162,7 +1162,7 @@ fn packed_conversions_and_nan_bounds_use_what_volta_has() {
     for statement in [
         "cvt.rn.relu.f16x2.f32 %r1, %f1, %f2;",
         "cvt.rn.satfinite.bf16.f32 %r1, %f1;",
-        "add.rn.bf16 %r1, %r1, %r0;",
+        "add.rp.bf16 %r1, %r1, %r0;",
         "redux.sync.add.s32 %r1, %r0, %r1;",
         "max.NaN.abs.f32 %f3, %f1, %f2, %f0;",
     ] {
@@ -2271,18 +2271,36 @@ fn packed_bf16_atomic_at_any_address() {
 }
 
 #[test]
-fn bf16_instructions_that_remain_refused() {
-    // Forms that the layer has no sequence for are still refused.
-    let abs = refusal("{\n\t.reg .b16 %rs1;\n\tabs.bf16 %rs1, %rs1;\n\tret;\n}");
-    assert!(
-        abs.contains("no Volta sequence for this form"),
-        "abs.bf16 should be refused: {abs}"
+fn xla_bf16_arithmetic_and_three_input_max() {
+    let text = lower(
+        "{\n\t.reg .b16 %h<3>;\n\t.reg .b32 %r<3>;\n\t.reg .pred %p;\n\
+        \t@%p cvt.rn.bf16.f16 %h0, %h1;\n\tabs.bf16 %h0, %h0;\n\
+        \tadd.rn.bf16 %h1, %h0, %h2;\n\tsub.rn.bf16 %h1, %h1, %h2;\n\
+        \tmul.rn.bf16 %h2, %h0, %h1;\n\t@%p mul.rn.bf16x2 %r1, %r0, %r2;\n\
+        \tadd.rn.f32.bf16 %r1, %h2, %r1;\n\tsub.rn.f32.bf16 %r1, %h2, %r1;\n\
+        \tmax.NaN.f32 %r0, %r1, %r0, %r2;\n\tret;\n}",
     );
-    let sub = refusal("{\n\t.reg .b16 %rs1;\n\tsub.bf16 %rs1, %rs1, %rs1;\n\tret;\n}");
-    assert!(
-        sub.contains("no Volta sequence for this form"),
-        "sub.bf16 should be refused: {sub}"
+    assert!(text.contains("@%p cvt.u16.u32 %h0,"));
+    assert!(text.contains("and.b16 %h0, %h0, 0x7fff;"));
+    assert_eq!(count(&text, "mul.rn.f32 "), 3);
+    assert!(text.contains("@%p or.b32 %r1,"));
+    assert_eq!(count(&text, "max.f32 "), 2);
+    assert_eq!(undeclared(&text), Vec::<String>::new());
+    assert!(!text.contains(".bf16"));
+    let invalid = refusal("{\n\t.reg .b16 %h;\n\tabs.ftz.bf16 %h, %h;\n\tret;\n}");
+    assert!(invalid.contains("no Volta sequence for this form"));
+}
+
+#[test]
+fn xla_nan_reductions_and_bf16_bounds() {
+    let text = lower(
+        "{\n\t.reg .b16 %h<3>;\n\t.reg .b32 %r<2>;\n\t.reg .pred %p;\n\
+          \t@%p max.NaN.bf16 %h0, %h1, %h2;\n\tredux.sync.max.NaN.f32 %r0, %r0, -1;\n\tret;\n}",
     );
+    assert!(text.contains("@%p cvt.u16.u32 %h0,"));
+    assert!(text.contains("vote.sync.any.pred %vf_n, %vf_n, -1;"));
+    assert!(text.contains("selp.f32 %r0, 0f7FFFFFFF,"));
+    assert_eq!(undeclared(&text), Vec::<String>::new());
 }
 
 #[test]

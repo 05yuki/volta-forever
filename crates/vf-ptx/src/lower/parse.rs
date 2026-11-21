@@ -109,6 +109,7 @@ pub(super) enum Tensor<'a> {
         d: &'a str,
         a: &'a str,
         b: &'a str,
+        third: Option<&'a str>,
     },
 }
 
@@ -441,7 +442,20 @@ pub(super) fn parse<'a>(opcode: &str, operands: &'a str) -> Result<Tensor<'a>, U
         _ => None,
     } {
         match parts[..] {
-            [d, a, b] if scan::register(d).is_some() => Ok(Tensor::Bound { plain, d, a, b }),
+            [d, a, b] if scan::register(d).is_some() => Ok(Tensor::Bound {
+                plain,
+                d,
+                a,
+                b,
+                third: None,
+            }),
+            [d, a, b, c] if scan::register(d).is_some() => Ok(Tensor::Bound {
+                plain,
+                d,
+                a,
+                b,
+                third: Some(c),
+            }),
             _ => Err(unsupported("operands not recognised")),
         }
     } else if let Some(rounding) = match opcode {
