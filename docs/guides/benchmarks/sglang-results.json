@@ -1,0 +1,115 @@
+{
+  "engine": "SGLang 0.5.23",
+  "volta_forever": "0.1.1 with scripts/triton-ptxas.py",
+  "pytorch": "2.14.1+cu130",
+  "driver": "580.178.04",
+  "gpu": "Tesla V100-SXM2-32GB",
+  "toolkit": "CUDA 13.5",
+  "checkpoint": "QuantTrio/Qwen3.5-35B-A3B-AWQ",
+  "revision": "2f4fac011fc06e736782b0b59394577790da7d79",
+  "execution": "batch one, full CUDA graph for decode, eager prefill, torch_native prefill attention and Triton decode attention, SGLang JIT expert routing and PyTorch expert reduction",
+  "capability": "8.0",
+  "triton_override_arch": "sm75",
+  "activation_dtype": "float16",
+  "mamba_conv_dtype": "float16",
+  "nvcc_append_flags": "-gencode=arch=compute_80,code=compute_80",
+  "context": 512,
+  "cache_salt": "unique for each request",
+  "chat_answer": "Paris",
+  "rows": [
+    {
+      "id": "run1",
+      "input_tokens": 227,
+      "output_tokens": 64,
+      "text": "Kyoto, Japan, is the location where our volunteer group convenes daily to manage visitor interactions. Upon arrival, you will find a shared room situated directly by the entrance where a red notebook is placed on the long table each morning to record our activities. Before the doors open, another team member inspects the signs by",
+      "finish_reason": "length",
+      "first_s": 1.371273776050657,
+      "server_metrics_delta": {
+        "sglang:prefill_effective_tokens_total{engine_type=\"unified\",mode=\"input\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 227.0,
+        "sglang:prefill_effective_tokens_total{engine_type=\"unified\",mode=\"device_hit\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.0,
+        "sglang:prefill_effective_tokens_total{engine_type=\"unified\",mode=\"host_hit\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.0,
+        "sglang:prefill_effective_tokens_total{engine_type=\"unified\",mode=\"storage_hit\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.0,
+        "sglang:forward_execution_seconds_total{category=\"extend\",engine_type=\"unified\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 1.353412597656252,
+        "sglang:forward_execution_seconds_total{category=\"decode\",engine_type=\"unified\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.9356236801147448,
+        "sglang:prompt_tokens_total{engine_type=\"unified\",is_streaming=\"false\",model_name=\"qwen\"}": 0.0,
+        "sglang:prompt_tokens_total{engine_type=\"unified\",is_streaming=\"true\",model_name=\"qwen\"}": 227.0,
+        "sglang:generation_tokens_total{engine_type=\"unified\",is_streaming=\"false\",model_name=\"qwen\"}": 0.0,
+        "sglang:generation_tokens_total{engine_type=\"unified\",is_streaming=\"true\",model_name=\"qwen\"}": 64.0
+      },
+      "prefill_s": 1.353412597656252,
+      "prefill_tokens_per_s": 167.7241665942102,
+      "decode_s": 0.9356236801147448,
+      "decode_tokens_per_s": 67.3347643277623
+    },
+    {
+      "id": "run2",
+      "input_tokens": 227,
+      "output_tokens": 64,
+      "text": "Lyon, France, is the location where our volunteer group convenes daily to serve the community. Upon arrival, you will find a shared room situated directly by the entrance where a green binder is placed on the long table each morning to organize our materials. Before the doors open, please assist by checking the signs near the",
+      "finish_reason": "length",
+      "first_s": 0.37379537080414593,
+      "server_metrics_delta": {
+        "sglang:prefill_effective_tokens_total{engine_type=\"unified\",mode=\"input\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 227.0,
+        "sglang:prefill_effective_tokens_total{engine_type=\"unified\",mode=\"device_hit\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.0,
+        "sglang:prefill_effective_tokens_total{engine_type=\"unified\",mode=\"host_hit\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.0,
+        "sglang:prefill_effective_tokens_total{engine_type=\"unified\",mode=\"storage_hit\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.0,
+        "sglang:forward_execution_seconds_total{category=\"extend\",engine_type=\"unified\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.35253350830078745,
+        "sglang:forward_execution_seconds_total{category=\"decode\",engine_type=\"unified\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.9362053127288807,
+        "sglang:prompt_tokens_total{engine_type=\"unified\",is_streaming=\"false\",model_name=\"qwen\"}": 0.0,
+        "sglang:prompt_tokens_total{engine_type=\"unified\",is_streaming=\"true\",model_name=\"qwen\"}": 227.0,
+        "sglang:generation_tokens_total{engine_type=\"unified\",is_streaming=\"false\",model_name=\"qwen\"}": 0.0,
+        "sglang:generation_tokens_total{engine_type=\"unified\",is_streaming=\"true\",model_name=\"qwen\"}": 64.0
+      },
+      "prefill_s": 0.35253350830078745,
+      "prefill_tokens_per_s": 643.9104217188905,
+      "decode_s": 0.9362053127288807,
+      "decode_tokens_per_s": 67.29293152200303
+    },
+    {
+      "id": "run3",
+      "input_tokens": 227,
+      "output_tokens": 64,
+      "text": "Lima, Peru, is the location where our volunteer group convenes daily to manage our shared operations. Upon arrival, you will find the team gathered in a common room situated directly by the entrance, where a long table serves as the central hub for our activities. Each morning, a designated volunteer places a yellow envelope on",
+      "finish_reason": "length",
+      "first_s": 0.37154053593985736,
+      "server_metrics_delta": {
+        "sglang:prefill_effective_tokens_total{engine_type=\"unified\",mode=\"input\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 227.0,
+        "sglang:prefill_effective_tokens_total{engine_type=\"unified\",mode=\"device_hit\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.0,
+        "sglang:prefill_effective_tokens_total{engine_type=\"unified\",mode=\"host_hit\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.0,
+        "sglang:prefill_effective_tokens_total{engine_type=\"unified\",mode=\"storage_hit\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.0,
+        "sglang:forward_execution_seconds_total{category=\"extend\",engine_type=\"unified\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.3519487915039008,
+        "sglang:forward_execution_seconds_total{category=\"decode\",engine_type=\"unified\",model_name=\"qwen\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}": 0.9360865268707288,
+        "sglang:prompt_tokens_total{engine_type=\"unified\",is_streaming=\"false\",model_name=\"qwen\"}": 0.0,
+        "sglang:prompt_tokens_total{engine_type=\"unified\",is_streaming=\"true\",model_name=\"qwen\"}": 227.0,
+        "sglang:generation_tokens_total{engine_type=\"unified\",is_streaming=\"false\",model_name=\"qwen\"}": 0.0,
+        "sglang:generation_tokens_total{engine_type=\"unified\",is_streaming=\"true\",model_name=\"qwen\"}": 64.0
+      },
+      "prefill_s": 0.3519487915039008,
+      "prefill_tokens_per_s": 644.9801945050408,
+      "decode_s": 0.9360865268707288,
+      "decode_tokens_per_s": 67.3014707418176
+    }
+  ],
+  "prefill_chunk_tokens": 256,
+  "static_memory_fraction": 0.85,
+  "graph_capture_gib": 0.6,
+  "diagnostics": {
+    "eager_chunk8": {
+      "prefill_tokens_per_s": [
+        48.583432292103254,
+        71.60335353375388,
+        71.1428691830087
+      ],
+      "decode_tokens_per_s": [
+        11.674267744662226,
+        12.339509648778279,
+        12.181522598006683
+      ]
+    }
+  },
+  "median": {
+    "prefill_tokens_per_s": 643.9104217188905,
+    "decode_tokens_per_s": 67.3014707418176,
+    "first_s": 0.37379537080414593
+  }
+}
