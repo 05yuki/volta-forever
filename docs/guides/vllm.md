@@ -12,7 +12,22 @@ fi
 
 If you installed the driver, reboot and repeat the check. It should print your V100 and driver version.
 
-The Python wheels in step 3 supply CUDA 13, including the compiler.
+The 35B model compiles FlashInfer kernels on first launch. Use a complete CUDA 13 toolkit so the compiler and headers come from the same installation. The check verifies the CUDA 13 compiler and headers before installing the toolkit. [NVIDIA installation guide](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#ubuntu)
+
+```bash
+export PATH="$PATH:${CUDA_HOME:-/usr/local/cuda}/bin"
+if ! nvcc --version 2>/dev/null | grep -q 'release 13[.]' ||
+   ! nvcc -E -x cu --pre-include cublas_v2.h /dev/null >/dev/null 2>&1; then
+  sudo apt update && sudo apt install -y ca-certificates curl
+  repo=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64
+  curl -fsSL "$repo/cuda-archive-keyring.gpg" | sudo tee /usr/share/keyrings/cuda-archive-keyring.gpg >/dev/null
+  echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] $repo/ /" | sudo tee /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.list
+  sudo apt update && sudo apt install -y cuda-toolkit-13
+  export PATH="/usr/local/cuda-13/bin:$PATH"
+fi
+nvcc_path=$(readlink -f "$(command -v nvcc)")
+export CUDA_HOME="${nvcc_path%/bin/nvcc}"
+```
 
 ## 2. VF
 
@@ -39,37 +54,38 @@ pip install vllm
 
 ## 4. Test
 
-Start the server. On the first launch it downloads Qwen2.5-0.5B-Instruct and compiles kernels.
+Use the full CUDA 13 toolkit from step 1. Start the server in the active environment. vLLM downloads the 4-bit AWQ checkpoint on first launch. This diagnostic configuration serves one text request at a time on a 32 GiB V100. It uses eager execution and disables assembler optimizations to establish a correctness baseline. [Qwen3.5-35B-A3B-AWQ](https://huggingface.co/QuantTrio/Qwen3.5-35B-A3B-AWQ)
 
 ```sh
-export CUDA_HOME="$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cu13"
 export PATH="$CUDA_HOME/bin:$PATH"
-vllm serve Qwen/Qwen2.5-0.5B-Instruct \
-  --dtype float16 --max-model-len 512 --enforce-eager \
+export PTXAS_OPTIONS='--override-directive-values --maxrregcount=192 --opt-level=0'
+export TORCH_COMPILE_DISABLE=1
+vllm serve QuantTrio/Qwen3.5-35B-A3B-AWQ --served-model-name qwen \
+  --dtype float16 --language-model-only --safetensors-load-strategy eager \
+  --max-model-len 512 --max-num-seqs 1 --gpu-memory-utilization 0.9 --enforce-eager \
   --host 127.0.0.1 --port 8000
 ```
 
-From a second terminal on the same machine, send the request. The tested server returned `Paris` in `choices[0].message.content`.
+Once the server is ready, send a request from a second terminal. The tested server returned **Paris** in two output tokens.
 
 ```sh
 curl -fsS http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"What is the capital of France? Answer with just the city."}],"temperature":0,"max_tokens":32}'
+  -d '{"model":"qwen","messages":[{"role":"user","content":"What is the capital of France? Answer with just the city."}],"temperature":0,"max_tokens":32,"chat_template_kwargs":{"enable_thinking":false}}'
 ```
 
 ## 5. Benchmarks
 
-After startup, send one warm-up request and time three more on loopback. The prompt is `The capital of France is`, temperature is zero and the completion limit is 32 tokens.
+With the server running, use the [benchmark client and prompts](./benchmarks/). Run one warm-up and three different chats in sequence, at temperature zero with thinking disabled. Each measured chat used 227 input tokens and generated 64 tokens. vLLM reported a 0% prefix-cache hit rate.
 
-```sh
-body='{"model":"Qwen/Qwen2.5-0.5B-Instruct","prompt":"The capital of France is","temperature":0,"max_tokens":32}'
-for i in 0 1 2 3; do
-  curl -fsS -o /dev/null -w "%{time_total} s\n" http://127.0.0.1:8000/v1/completions \
-    -H 'Content-Type: application/json' -d "$body"
-done
-```
+| Phase | Three runs (tokens/s) | Median (tokens/s) |
+| --- | --- | ---: |
+| Prefill | 211.52, 210.54, 211.74 | **211.52** |
+| Decode | 9.22, 9.23, 9.23 | **9.23** |
 
-On a Tesla V100-SXM2-32GB with driver 580.178.04, vLLM 0.34.0 and PyTorch 2.14.0+cu130 returned 32 tokens in 0.955, 0.970 and 0.958 seconds. Median end-to-end throughput was **33.4 tokens/s** for one request at a time with float16 weights.
+Each rate uses the change in vLLM’s own phase timer for one request. Prefill counts all 227 input tokens. Decode counts the 63 output tokens after the first token. These rates are the baseline for testing optimized execution. Median time to first token over loopback was 1.086 seconds. The test used a Tesla V100-SXM2-32GB, driver 580.178.04, VF 0.1.1, CUDA toolkit 13.5, vLLM 0.34.0 and PyTorch 2.14.0+cu130.
 
 ## 6. Additional notes
 
-VF 0.1.0 reported capability 7.0 to vLLM's NVML check, below the 7.5 required by `QuantTrio/Qwen3.5-35B-A3B-AWQ`. VF 0.1.1 reports 7.5 by default. Testing the NVML fix loaded all nine weight files on one V100 (21.3 GiB of GPU memory). This model's FlashInfer RMSNorm also needed a complete CUDA 13.5 toolkit with matching headers. A two-block diagnostic completed prefill and decoding with synthetic weights. Generation from the full checkpoint is still unverified.
+VF 0.1.1 reports the capability 7.5 required by vLLM’s NVML check. The 35B run used all nine checkpoint shards, automatic quantization selection and CUDA 13.5 headers for FlashInfer RMSNorm. VF 0.1.0 reported 7.0 to this check. [VF 0.1.1 release](https://github.com/nbald/volta-forever/releases/tag/v0.1.1)
+
+For a smaller model, Qwen2.5-0.5B-Instruct with float16 weights also answered **Paris**. Three warm 32-token completions had a median end-to-end throughput of 33.4 tokens/s.
