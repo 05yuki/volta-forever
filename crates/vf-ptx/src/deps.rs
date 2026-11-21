@@ -28,6 +28,7 @@ fn is_name_byte(b: u8) -> bool {
 enum Linkage {
     Private,
     Weak,
+    DynamicShared,
     External,
 }
 
@@ -392,6 +393,19 @@ fn find_header_end(text: &[u8]) -> usize {
     last_header_end
 }
 
+/// Recognise a launch-supplied shared array declared as `name[];`.
+fn is_unsized_array(declaration: &str, name: &str) -> bool {
+    declaration.split_once('[').is_some_and(|(prefix, suffix)| {
+        !prefix.contains('=')
+            && prefix.split_ascii_whitespace().any(|token| token == ".shared")
+            && prefix.split_ascii_whitespace().next_back() == Some(name)
+            && suffix
+                .bytes()
+                .filter(|b| !b.is_ascii_whitespace())
+                .eq(b"];".iter().copied())
+    })
+}
+
 /// Extract the variable name from a declaration like `.global .align 4 .b8 table[4] = {...};`.
 fn extract_variable_name(decl: &str) -> Option<String> {
     let bytes = decl.as_bytes();
@@ -580,19 +594,24 @@ fn find_module_level_items(text: &[u8], header_end: usize, func_defs: &[FuncDef]
                 }
                 let decl_text = std::str::from_utf8(&text[start..at]).unwrap_or("");
                 let shared = after.starts_with(b".shared");
-                let linkage = if has_visible || has_extern || after.starts_with(b".common") {
-                    Linkage::External
-                } else if has_weak {
-                    Linkage::Weak
-                } else {
-                    Linkage::Private
-                };
                 // The scanner records one name per declaration. Never infer shared-memory
                 // bindings from a variable list or a declaration it could not finish.
                 if shared && (decl_text.contains(',') || !decl_text.trim_end().ends_with(';')) {
                     result.has_unindexed_shared = true;
                 }
                 if let Some(name) = extract_variable_name(decl_text) {
+                    // An unsized extern shared array denotes the storage supplied at launch.
+                    // Externs with fixed extents and definitions in other inputs need the linker.
+                    let linkage =
+                        if shared && has_extern && !has_visible && !has_weak && is_unsized_array(decl_text, &name) {
+                            Linkage::DynamicShared
+                        } else if has_visible || has_extern || after.starts_with(b".common") {
+                            Linkage::External
+                        } else if has_weak {
+                            Linkage::Weak
+                        } else {
+                            Linkage::Private
+                        };
                     result.vars.push(VarDecl {
                         range: start..at,
                         name,
@@ -868,8 +887,8 @@ fn module_structure(text_str: &str) -> (usize, Vec<FuncDef>, Vec<String>, Module
     (header_end, func_defs, entries, module_items)
 }
 
-/// Link-visible variables across *all* the objects of a device link. Only identical weak
-/// shared definitions may be materialized in an isolated kernel.
+/// Link-visible variables across all the objects of a device link. Identical weak shared
+/// definitions and matching declarations of launch-supplied shared memory can be isolated.
 #[derive(Default)]
 pub struct LinkedShared {
     definitions: HashMap<String, Option<Vec<u8>>>,
@@ -889,24 +908,28 @@ impl LinkedShared {
             if var.linkage == Linkage::Private {
                 continue;
             }
-            let weak = (!var.persistent && var.linkage == Linkage::Weak).then(|| source[var.range].trim_ascii());
+            let binding = (!var.persistent && matches!(var.linkage, Linkage::Weak | Linkage::DynamicShared))
+                .then(|| source[var.range].trim_ascii());
             self.definitions
                 .entry(var.name)
                 .and_modify(|existing| {
-                    if existing.as_deref() != weak {
+                    if existing.as_deref() != binding {
                         *existing = None;
                     }
                 })
-                .or_insert_with(|| weak.map(<[u8]>::to_vec));
+                .or_insert_with(|| binding.map(<[u8]>::to_vec));
         }
         Some(entries)
     }
 
-    fn allows(&self, var: &VarDecl) -> bool {
+    fn allows(&self, var: &VarDecl, source: &[u8]) -> bool {
         !var.persistent
             && match var.linkage {
                 Linkage::Private => true,
-                Linkage::Weak => matches!(self.definitions.get(&var.name), Some(Some(_))),
+                Linkage::Weak | Linkage::DynamicShared => {
+                    self.definitions.get(&var.name).and_then(Option::as_deref)
+                        == Some(source[var.range.clone()].trim_ascii())
+                }
                 Linkage::External => false,
             }
     }
@@ -1159,7 +1182,7 @@ impl ModuleInfo {
             || self.var_refs.get(name).is_some_and(|refs| {
                 self.variables
                     .iter()
-                    .any(|v| refs.contains(&v.name) && !shared.allows(v))
+                    .any(|v| refs.contains(&v.name) && !shared.allows(v, &self.text))
             })
             || scan::items(&self.text, entry.body.clone())?.iter().any(|item| {
                 matches!(&item.kind, scan::Kind::Statement { opcode, .. }
@@ -1550,6 +1573,39 @@ mod tests {
                 .extract_linked_leaf("other", &shared)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn linked_dynamic_shared_accepts_only_matching_unsized_externs() {
+        let header = ".version 8.0\n.target sm_70\n.address_size 64\n";
+        let dynamic = ".extern .shared .align 16 .b8 scratch[];";
+        let kernel = format!("{header}{dynamic}\n.weak .entry k() {{ .reg .u32 r; mov.u32 r, scratch; ret; }}\n");
+        let module = ModuleInfo::analyse(kernel.as_bytes());
+        for decl in [
+            ".extern .shared .b8 scratch[4][];",
+            ".extern .shared::cluster .b8 scratch[];",
+        ] {
+            assert!(!is_unsized_array(decl, "scratch"));
+        }
+        for (other, allowed) in [
+            (dynamic, true),
+            (".extern .shared .align 8 .b8 scratch[];", false),
+            (".extern .shared .align 16 .b8 scratch[16];", false),
+            (".visible .shared .align 16 .b8 scratch[16];", false),
+            (".weak .shared .align 16 .b8 scratch[16];", false),
+            (".visible .global .align 16 .b8 scratch[16];", false),
+            (".shared .align 4 .b8 scratch[32];", true), // Private to the other object.
+        ] {
+            let other = format!("{header}{other}\n");
+            for inputs in [[&kernel, &other], [&other, &kernel]] {
+                let mut shared = LinkedShared::default();
+                for input in inputs {
+                    shared.add_object(input.as_bytes()).unwrap();
+                }
+                assert_eq!(module.extract_linked_leaf("k", &shared).is_some(), allowed);
+                assert_eq!(module.weak_leaf_definition("k", &shared).is_some(), allowed);
+            }
+        }
     }
 
     #[test]
