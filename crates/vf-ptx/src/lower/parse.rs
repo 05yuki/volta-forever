@@ -83,9 +83,9 @@ pub(super) enum Tensor<'a> {
         base: &'a str,
         offset: Option<&'a str>,
     },
-    /// One untransposed 8x8 matrix stored in CTA shared memory.
+    /// One 32-bit fragment per untransposed 8x8 matrix stored in CTA shared memory.
     Store {
-        src: &'a str,
+        src: Vec<&'a str>,
         base: &'a str,
         offset: Option<&'a str>,
     },
@@ -294,6 +294,15 @@ fn float_literal(text: &str) -> bool {
     unsigned.starts_with(|c: char| c.is_ascii_digit() || c == '.') && unsigned.parse::<f64>().is_ok()
 }
 
+fn matrix_count(qualifier: &str) -> Option<usize> {
+    match qualifier {
+        "x1" => Some(1),
+        "x2" => Some(2),
+        "x4" => Some(4),
+        _ => None,
+    }
+}
+
 pub(super) fn parse<'a>(opcode: &str, operands: &'a str) -> Result<Tensor<'a>, Unsupported> {
     let unsupported = |what: &str| Unsupported(format!("{opcode}: {what}"));
     let parts = scan::split_operands(operands);
@@ -412,13 +421,14 @@ pub(super) fn parse<'a>(opcode: &str, operands: &'a str) -> Result<Tensor<'a>, U
                 })
             }
         }
-    } else if matches!(
-        opcode,
-        "stmatrix.sync.aligned.m8n8.x1.shared.b16" | "stmatrix.sync.aligned.m8n8.x1.shared::cta.b16"
-    ) {
+    } else if opcode.starts_with("stmatrix.sync.aligned.") {
+        let ["m8n8", count, "shared" | "shared::cta", "b16"] = qualifiers[..] else {
+            return Err(unsupported("no Volta sequence for this form"));
+        };
+        let count = matrix_count(count).ok_or_else(|| unsupported("matrix count not recognised"))?;
         if let [place, vector] = parts.as_slice()
-            && let (Some((base, offset)), Some(words)) = (address(place), scan::vector(vector))
-            && let [src] = words.as_slice()
+            && let (Some((base, offset)), Some(src)) = (address(place), scan::vector(vector))
+            && src.len() == count
         {
             Ok(Tensor::Store { src, base, offset })
         } else {
@@ -441,12 +451,7 @@ pub(super) fn parse<'a>(opcode: &str, operands: &'a str) -> Result<Tensor<'a>, U
             ["m8n8", count, "trans", "shared" | "shared::cta", "b16"] => (count, true, true),
             _ => return Err(unsupported("no Volta sequence for this form")),
         };
-        let count = match count {
-            "x1" => 1,
-            "x2" => 2,
-            "x4" => 4,
-            _ => return Err(unsupported("matrix count not recognised")),
-        };
+        let count = matrix_count(count).ok_or_else(|| unsupported("matrix count not recognised"))?;
         match parts[..] {
             [r, p] => match (scan::vector(r), address(p)) {
                 (Some(r), Some((base, offset))) if r.len() == count => Ok(Tensor::Load {

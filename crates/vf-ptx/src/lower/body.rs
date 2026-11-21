@@ -444,7 +444,7 @@ impl<'a> Body<'a> {
                 base,
                 offset,
             }) => self.ldmatrix(opcode, transposed, shared, &r, base, offset, followed)?,
-            Some(Tensor::Store { src, base, offset }) => self.stmatrix(opcode, &guard, src, base, offset)?,
+            Some(Tensor::Store { src, base, offset }) => self.stmatrix(opcode, &guard, &src, base, offset)?,
             Some(Tensor::Transpose { d, a }) => self.movmatrix(d, a),
         }
         self.counts.tensor += 1;

@@ -1,0 +1,95 @@
+.version 8.0
+.target sm_90
+.address_size 64
+
+// Each matrix has eight separately addressed rows with padding before and after the data.
+// For the x2 store, lanes 16..31 point to an extra row which must remain untouched.
+.visible .entry k(.param .u64 output)
+{
+    .reg .b32 lane, base, i, at, slot, col, row, matrix, source, expected, got;
+    .reg .b32 v0, v1, v2, v3, addr, phase, bad, x4_bad;
+    .reg .u64 wide, out, delta;
+    .reg .pred more, payload, other, inversion, uniform;
+    .shared .align 16 .b32 memory[400];
+    mov.u32 lane, %laneid;
+    mov.u32 base, memory;
+    mov.u32 i, lane;
+fill:
+    mad.lo.u32 at, i, 4, base;
+    st.shared.b32 [at], 0x67feaa01;
+    add.u32 i, i, 32;
+    setp.lt.u32 more, i, 400;
+    @more bra fill;
+    bar.sync 0;
+
+    // Four different register values per thread, with distinct upper and lower halves.
+    mad.lo.u32 v0, lane, 0x00210755, 0x51123417;
+    add.u32 v1, v0, 0x163a8291;
+    add.u32 v2, v1, 0x163a8291;
+    add.u32 v3, v2, 0x163a8291;
+    mad.lo.u32 slot, lane, 13, 5;
+    and.b32 slot, slot, 31;
+    mad.lo.u32 addr, slot, 48, base;
+    add.u32 addr, addr, 16;
+    stmatrix.sync.aligned.m8n8.x4.shared.b16 [addr], {v0, v1, v2, v3};
+    setp.lt.u32 uniform, lane, 32;
+    @!uniform stmatrix.sync.aligned.m8n8.x4.shared.b16 [addr], {v3, v2, v1, v0};
+    bar.sync 0;
+    mov.u32 phase, 0;
+
+verify:
+    mov.u32 bad, 0;
+    mov.u32 i, lane;
+next:
+    // Invert the permutation of all 32 row pointers (13 * 5 = 1 modulo 32).
+    div.u32 slot, i, 12;
+    rem.u32 col, i, 12;
+    setp.lt.u32 payload, slot, 32;
+    setp.ge.and.u32 payload, col, 4, payload;
+    setp.lt.and.u32 payload, col, 8, payload;
+    sub.u32 row, slot, 5;
+    mul.lo.u32 row, row, 5;
+    and.b32 row, row, 31;
+    shr.u32 matrix, row, 3;
+    and.b32 row, row, 7;
+    mad.lo.u32 source, row, 4, col;
+    sub.u32 source, source, 4;
+    mad.lo.u32 expected, source, 0x00210755, 0x51123417;
+    mad.lo.u32 expected, matrix, 0x163a8291, expected;
+    setp.ne.u32 inversion, phase, 0;
+    setp.lt.and.u32 inversion, matrix, 2, inversion;
+    @inversion not.b32 expected, expected;
+    @!payload mov.b32 expected, 0x67feaa01;
+    mad.lo.u32 at, i, 4, base;
+    ld.shared.b32 got, [at];
+    setp.ne.u32 more, got, expected;
+    @more add.u32 bad, bad, 1;
+    add.u32 i, i, 32;
+    setp.lt.u32 more, i, 400;
+    @more bra next;
+    setp.ne.u32 more, phase, 0;
+    @more bra done;
+
+    mov.u32 x4_bad, bad;
+    bar.sync 0;
+    setp.ge.u32 other, lane, 16;
+    mad.lo.u32 slot, lane, 13, 5;
+    and.b32 slot, slot, 31;
+    @other mov.u32 slot, 32;
+    mad.lo.u32 addr, slot, 48, base;
+    cvt.u64.u32 wide, addr;
+    not.b32 v0, v0;
+    not.b32 v1, v1;
+    @uniform stmatrix.sync.aligned.m8n8.x2.shared::cta.b16 [wide+16], {v0, v1};
+    bar.sync 0;
+    mov.u32 phase, 1;
+    bra verify;
+
+done:
+    ld.param.u64 out, [output];
+    mul.wide.u32 delta, lane, 16;
+    add.u64 out, out, delta;
+    st.global.b32 [out], x4_bad;
+    st.global.b32 [out+4], bad;
+    ret;
+}

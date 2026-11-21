@@ -219,26 +219,28 @@ impl<'a> Body<'a> {
         Ok(start)
     }
 
-    /// PTX stmatrix.m8n8.x1: lanes 0..7 supply independent row addresses. Lane 4r+c
-    /// stores both 16-bit elements in its register at byte offset 4c in row r.
+    /// For matrix m, lane 8m+r supplies its row r address, and lane 4r+c stores two
+    /// 16-bit elements from its register m at byte offset 4c within that row.
     pub(super) fn stmatrix(
         &mut self,
         opcode: &str,
         guard: &str,
-        src: &str,
+        src: &[&str],
         base: &str,
         offset: Option<&str>,
     ) -> Result<(), Unsupported> {
         let start = self.matrix_address(opcode, base, offset, true)?;
         let at = self.fresh();
-        let group = self.lane(Lane::Group);
         let pair = self.lane(Lane::PairOffset);
         // All threads that execute an aligned store participate. Keep a uniform guard on the
         // collective as well as on the store, including on paths where the instruction is skipped.
-        emit!(self, "{guard}shfl.sync.idx.b32 {at}, {start}, {group}, 31, -1;");
-        self.shuffles += 1;
-        emit!(self, "{guard}add.u32 {at}, {at}, {pair};");
-        emit!(self, "{guard}st.shared.b32 [{at}], {src};");
+        for (matrix, source) in src.iter().enumerate() {
+            let row = self.lane(Lane::RowOf(matrix as u32));
+            emit!(self, "{guard}shfl.sync.idx.b32 {at}, {start}, {row}, 31, -1;");
+            self.shuffles += 1;
+            emit!(self, "{guard}add.u32 {at}, {at}, {pair};");
+            emit!(self, "{guard}st.shared.b32 [{at}], {source};");
+        }
         emit!(self, "{guard}bar.warp.sync -1;");
         Ok(())
     }

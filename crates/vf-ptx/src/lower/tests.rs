@@ -437,7 +437,9 @@ fn x1_matrix_store_preserves_guards_and_materializes_loaded_fragments() {
     assert!(undeclared(&result).is_empty(), "{result}");
 
     for (opcode, operands) in [
-        ("stmatrix.sync.aligned.m8n8.x2.shared.b16", "[%r1], {%r0, %r2}"),
+        ("stmatrix.sync.aligned.m8n8.x2.shared.b16", "[%r1], {%r0}"),
+        ("stmatrix.sync.aligned.m8n8.x4.shared.b16", "[%r1], {%r0, %r2}"),
+        ("stmatrix.sync.aligned.m8n8.x3.shared.b16", "[%r1], {%r0, %r1, %r2}"),
         ("stmatrix.sync.aligned.m8n8.x1.trans.shared.b16", "[%r1], {%r0}"),
         ("stmatrix.sync.aligned.m8n8.x1.shared.b8", "[%r1], {%r0}"),
         (store, "[%r1], {%r0, %r2}"),
@@ -445,6 +447,32 @@ fn x1_matrix_store_preserves_guards_and_materializes_loaded_fragments() {
     ] {
         let result = refusal(&format!("{{\n{opcode} {operands};\n}}"));
         assert!(result.contains(opcode), "{result}");
+    }
+}
+
+#[test]
+fn each_matrix_store_fragment_uses_its_own_eight_row_addresses() {
+    for (count, registers) in [(2, "%r0, %r1"), (4, "%r0, %r1, %r2, %r3")] {
+        let text = format!(
+            "{{\n.reg .u32 %r<6>;\n\
+             ldmatrix.sync.aligned.m8n8.x{count}.shared.b16 {{{registers}}}, [%r4];\n\
+             stmatrix.sync.aligned.m8n8.x{count}.shared.b16 [%r5], {{{registers}}};\n}}"
+        );
+        let lowered = lower(&text);
+        let stores: Vec<_> = lowered.lines().filter(|l| l.contains("st.shared.b32")).collect();
+        assert_eq!(stores.len(), count);
+        for (m, line) in stores.iter().enumerate() {
+            assert!(lowered.contains(&format!("ld.shared.u32 %r{m}, [")), "{lowered}");
+            assert!(line.ends_with(&format!(", %r{m};")), "{line}");
+            let row = if m == 0 {
+                "%vf_g".to_string()
+            } else {
+                format!("%vf_lm{m}")
+            };
+            assert!(lowered.contains(&format!(", {row}, 31, -1;")), "{lowered}");
+        }
+        assert_eq!(lowered.matches("bar.warp.sync").count(), 1);
+        assert!(undeclared(&lowered).is_empty());
     }
 }
 
