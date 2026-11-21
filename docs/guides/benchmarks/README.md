@@ -40,8 +40,5 @@ The client sets a fresh cache salt on every chat. It verifies the input and outp
 
 ## FreeToken
 
-Use the scheduler timing report in the [FreeToken guide](../freetoken.md#5-benchmarks).
-The initial eager run measured 704.55 prefill and 14.85 decode tokens/s. Native llama.cpp
-on the same V100 and Q4_K_M checkpoint measured 468.67 and 99.67 tokens/s with the same
-three prompts, one request at a time. Each generated 64 tokens from 227 uncached input
-tokens. [FreeToken measurements](freetoken-results.json) · [Native reference and reproduction commands](llamacpp-reference.json)
+Run the streaming client and read the scheduler timings as described in the [FreeToken guide](../freetoken.md#5-benchmarks).
+With batch-one CUDA graphs, FreeToken measured **884.56 prefill** and **109.26 decode** tokens/s. Native llama.cpp on the same V100 and Q4_K_M checkpoint measured **474.57** and **99.77** tokens/s. Each of the three measured requests read 227 uncached tokens and generated 64. [FreeToken measurements](freetoken-graphs.json) · [Native reference and commands](llamacpp-reference.json) · [Earlier eager run](freetoken-results.json)

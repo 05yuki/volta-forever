@@ -105,7 +105,7 @@ Start with Ubuntu 24.04 and a Tesla V100. Each guide checks for the NVIDIA R580 
 |---|---|---|
 | [vLLM](docs/guides/vllm.md) | Qwen3.5-35B-A3B, 4-bit AWQ | The official server answered “Paris”. Eager diagnostic baseline with assembler optimization disabled, **211.52 tokens/s** prefill and **9.23 tokens/s** decode. [Benchmark](docs/guides/benchmarks/) |
 | [SGLang](docs/guides/sglang.md) | Qwen2.5-0.5B-Instruct, FP16 | The local chat API answered “Paris” with FlashInfer and the CUDA 13 toolkit. |
-| [FreeToken](docs/guides/freetoken.md) | Qwen3.5-35B-A3B, GGUF Q4_K_M | All 40 expert banks loaded on the V100. The embedding and first expert matched CPU references. A full generation result is pending. |
+| [FreeToken](docs/guides/freetoken.md) | Qwen3.5-35B-A3B, GGUF Q4_K_M | The server answered “Paris”. Batch-one CUDA graphs reached **884.56 tokens/s** prefill and **109.26 tokens/s** decode. [Benchmark](docs/guides/benchmarks/freetoken-graphs.json) |
 | [ZML](docs/guides/zml.md) | Qwen3.5-0.8B | The CUDA example answered “Paris”. The 35B AWQ loader stopped on a missing expert tensor. |
 | [Strata](docs/guides/strata.md) | Qwen 35B, GGUF with an MTP head | The regular Qwen3.5 file lacks the MTP head. The Qwen3.6 MTP file passed the tensor check and stopped at cuBLAS with eager loading. |
 | [NInfer](docs/guides/ninfer.md) | Qwen3.6-35B-A3B, upstream `.ninfer` | The official CLI answered “Paris” using the published Q4/Q5/Q6 weights and `VF_CAPABILITY=12.0`. |

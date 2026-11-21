@@ -1,0 +1,207 @@
+{
+  "engine": "FreeToken 0.2.2",
+  "volta_forever": "0.1.1",
+  "gpu": "Tesla V100-SXM2-32GB",
+  "driver": "580.178.04",
+  "pytorch": "2.14.1+cu130",
+  "cuda_toolkit": "13.5",
+  "checkpoint": "unsloth/Qwen3.5-35B-A3B-GGUF",
+  "filename": "Qwen3.5-35B-A3B-Q4_K_M.gguf",
+  "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+  "sha256": "3b46d1066bc91cc2d613e3bc22ce691dd77e6f0d33c9060690d24ce6de494375",
+  "concurrency": 1,
+  "gpu_uuid": "GPU-09a31760-d33d-5df5-9c98-2696d7860948",
+  "graph_max_batch_size": 1,
+  "requests": [
+    {
+      "id": "warmup",
+      "input_tokens": 228,
+      "output_tokens": 64,
+      "text": "Lisbon, Portugal, serves as the meeting point for our volunteer group, where a shared room located by the entrance facilitates our daily operations. Each morning, one volunteer places a blue folder on the long table, while another inspects the signs by the stairs to report any changes before the doors open. Our records are",
+      "finish_reason": "length",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 228,
+        "prompt_ms": 297.9677030816674,
+        "prompt_per_token_ms": 1.3068758907090676,
+        "prompt_per_second": 765.1836009136515,
+        "predicted_n": 64,
+        "predicted_ms": 576.8416388891637,
+        "predicted_per_token_ms": 9.156216490304185,
+        "predicted_per_second": 109.21541676727854,
+        "queue_ms": 2184.0617100242525
+      },
+      "first_s": 2.527328833937645,
+      "output_span_s": 0.5763770381454378,
+      "request_s": 3.1060819991398603,
+      "prefill_tokens_per_s": 765.1836009136515,
+      "decode_tokens_per_s": 109.21541676727853,
+      "client_input_tokens_per_ttft_s": 90.21382454801893,
+      "client_decode_tokens_per_s": 109.30345213388452,
+      "server_ttft_ms": 2487,
+      "server_request_ms": 3065
+    },
+    {
+      "id": "run1",
+      "input_tokens": 227,
+      "output_tokens": 64,
+      "text": "Kyoto, Japan, serves as the meeting place for our volunteer group, where you will find a shared room located directly by the entrance. Each morning, a volunteer places a red notebook on the long table to record daily activities, while another checks the signs by the stairs to report any changes before the doors open. All",
+      "finish_reason": "length",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 227,
+        "prompt_ms": 256.62582204677165,
+        "prompt_per_token_ms": 1.1305102292809324,
+        "prompt_per_second": 884.5563481863015,
+        "predicted_n": 64,
+        "predicted_ms": 576.4016380999237,
+        "predicted_per_token_ms": 9.14923235079244,
+        "predicted_per_second": 109.29878722703847,
+        "queue_ms": 0.4017788451164961
+      },
+      "first_s": 0.2693442921154201,
+      "output_span_s": 0.5758937869686633,
+      "request_s": 0.8476753989234567,
+      "prefill_tokens_per_s": 884.5563481863015,
+      "decode_tokens_per_s": 109.29878722703847,
+      "client_input_tokens_per_ttft_s": 842.787490379508,
+      "client_decode_tokens_per_s": 109.39517220981597,
+      "server_ttft_ms": 262,
+      "server_request_ms": 840
+    },
+    {
+      "id": "run2",
+      "input_tokens": 227,
+      "output_tokens": 64,
+      "text": "Lyon, France, serves as the meeting place for our volunteer group, where a shared room located by the entrance facilitates our daily operations. Each morning, one volunteer places a green binder on the long table to organize our work, while another checks the signs by the stairs to report any changes before the doors open. We",
+      "finish_reason": "length",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 227,
+        "prompt_ms": 259.71841998398304,
+        "prompt_per_token_ms": 1.1441340087400134,
+        "prompt_per_second": 874.0234905710546,
+        "predicted_n": 64,
+        "predicted_ms": 576.6007250640541,
+        "predicted_per_token_ms": 9.152392461334193,
+        "predicted_per_second": 109.26104887051847,
+        "queue_ms": 0.3810590133070946
+      },
+      "first_s": 0.27155071892775595,
+      "output_span_s": 0.576977867167443,
+      "request_s": 0.8512776279821992,
+      "prefill_tokens_per_s": 874.0234905710546,
+      "decode_tokens_per_s": 109.26104887051847,
+      "client_input_tokens_per_ttft_s": 835.9396023561685,
+      "client_decode_tokens_per_s": 109.18963028735547,
+      "server_ttft_ms": 264,
+      "server_request_ms": 843
+    },
+    {
+      "id": "run3",
+      "input_tokens": 227,
+      "output_tokens": 64,
+      "text": "Lima, Peru, serves as the meeting point for our volunteer group, where you will join us in a shared room located directly by the entrance. Each morning, a volunteer places a yellow envelope on the long table, while another checks the signs by the stairs to report any changes before the doors open. Our records are",
+      "finish_reason": "length",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 227,
+        "prompt_ms": 256.46037398837507,
+        "prompt_per_token_ms": 1.1297813832087007,
+        "prompt_per_second": 885.12699435699,
+        "predicted_n": 64,
+        "predicted_ms": 646.0070488974452,
+        "predicted_per_token_ms": 10.25408014122929,
+        "predicted_per_second": 97.52215569090696,
+        "queue_ms": 0.34722895361483097
+      },
+      "first_s": 0.2701988439075649,
+      "output_span_s": 0.6454370440915227,
+      "request_s": 0.9182242930401117,
+      "prefill_tokens_per_s": 885.1269943569899,
+      "decode_tokens_per_s": 97.52215569090697,
+      "client_input_tokens_per_ttft_s": 840.1220253838569,
+      "client_decode_tokens_per_s": 97.60828043062652,
+      "server_ttft_ms": 262,
+      "server_request_ms": 909
+    }
+  ],
+  "median": {
+    "id": "median",
+    "prefill_tokens_per_s": 884.5563481863015,
+    "decode_tokens_per_s": 109.26104887051847,
+    "client_input_tokens_per_ttft_s": 840.1220253838569,
+    "client_decode_tokens_per_s": 109.18963028735547,
+    "server_ttft_ms": 262,
+    "client_ttft_ms": 270.1988439075649
+  },
+  "graph_diagnostic": {
+    "capture": {
+      "configured": [
+        1
+      ],
+      "captured": [
+        1
+      ],
+      "max": 1
+    },
+    "successful_replays_observed_at_least": 320,
+    "semantic_response": "Paris",
+    "benchmark_outputs_match_eager": true,
+    "graph_and_eager_response": "Here are the months of the year in order, written with their full English names:\n\n1.  January\n2.  February\n3.  March\n4.  April\n5.  May\n6",
+    "comparison": "The same live server ran the same extra prompt twice; the second request selected the existing eager forward. The first eight decode steps were timed with CUDA events on the model stream, separately from the benchmark. Host times measure the duration of the scheduler worker call to Engine.forward_batch. CUDA event spans may include host submission bubbles.",
+    "with_replay": {
+      "decode_steps": 8,
+      "completed_graph_replays": 8,
+      "cuda_event_ms": [
+        9.10745620727539,
+        8.968192100524902,
+        8.995840072631836,
+        8.974335670471191,
+        8.955904006958008,
+        8.987808227539062,
+        8.958975791931152,
+        8.688447952270508
+      ],
+      "host_enqueue_ms": [
+        0.9619309566915035,
+        6.561412941664457,
+        0.7655681110918522,
+        0.7245829328894615,
+        0.7044901140034199,
+        0.7027299143373966,
+        0.6970178801566362,
+        0.7029038388282061
+      ],
+      "median_cuda_event_ms": 8.971263885498047,
+      "median_host_enqueue_ms": 0.7145365234464407
+    },
+    "without_replay": {
+      "decode_steps": 8,
+      "completed_graph_replays": 0,
+      "cuda_event_ms": [
+        59.02067184448242,
+        59.21529769897461,
+        58.9317741394043,
+        59.079105377197266,
+        58.587486267089844,
+        58.92451095581055,
+        60.64588928222656,
+        58.79238510131836
+      ],
+      "host_enqueue_ms": [
+        58.64235106855631,
+        58.829182060435414,
+        58.54880693368614,
+        58.69596707634628,
+        58.192641008645296,
+        58.536418015137315,
+        60.32384396530688,
+        58.40562703087926
+      ],
+      "median_cuda_event_ms": 58.97622299194336,
+      "median_host_enqueue_ms": 58.59557900112122
+    },
+    "per_kernel_profile": "Kineto reported CUPTI_ERROR_INVALID_DEVICE and returned no device events. No per-kernel attribution was available."
+  }
+}

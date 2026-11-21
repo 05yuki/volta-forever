@@ -61,7 +61,7 @@ model=Qwen3.5-35B-A3B-Q4_K_M.gguf
 curl -fL -C - -o "$model" "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/$model"
 export PTXAS_OPTIONS='--override-directive-values --maxrregcount=192'
 ft serve --model "$model" --served-model-name qwen --text-model-only --enable-timings-report \
-  --moe-strategy fused --dtype float16 --attn triton --num-tokens 1024 --graph 0
+  --moe-strategy fused --dtype float16 --attn triton --num-tokens 1024 --graph 1
 ```
 
 In a second terminal, wait for `curl -s http://127.0.0.1:1919/health` to report `"status":"ok"`. Then send a short request.
@@ -84,16 +84,18 @@ curl -fsSLO "$base/freetoken.py" && curl -fsSLO "$base/prompts.json"
 python3 freetoken.py
 ```
 
-Each measured request read 227 uncached tokens and generated 64. The responses started with the requested cities, Kyoto, Lyon and Lima. Median time to the first token was 328 ms at the server and 335 ms over loopback. [Measurements and generated text](./benchmarks/freetoken-results.json)
+Each measured request read 227 uncached tokens and generated 64. The responses started with the requested cities, Kyoto, Lyon and Lima. Median time to the first token was 262 ms at the server and 270 ms over loopback. [Measurements, generated text and graph counters](./benchmarks/freetoken-graphs.json)
 
 | Scheduler phase | Three runs (tokens/s) | Median (tokens/s) |
 | --- | --- | ---: |
-| Prefill | 675.64, 704.55, 705.06 | **704.55** |
-| Decode | 14.09, 14.87, 14.85 | **14.85** |
+| Prefill | 884.56, 874.02, 885.13 | **884.56** |
+| Decode | 109.30, 109.26, 97.52 | **109.26** |
 
-FreeToken’s `prompt_ms` spans the first prefill batch through the first sampled token. Its `predicted_ms` covers the following 63 tokens. Both exclude time in the request queue. Repeating all four chats on the same server gave medians of 733.68 and 17.08 tokens/s.
+FreeToken’s `prompt_ms` spans the first prefill batch through the first sampled token. Its `predicted_ms` covers the following 63 tokens. Both exclude time in the request queue.
 
-On the same V100, native llama.cpp processed the same file and prompts at 468.67 prefill and 99.67 decode tokens/s. These are the comparison targets for FreeToken. The FreeToken measurement above used `--graph 0`. [Reference measurements and commands](./benchmarks/llamacpp-reference.json)
+On the same physical V100, native llama.cpp built for sm_70 processed the same GGUF file and prompts at **474.57 prefill** and **99.77 decode** tokens/s. FreeToken with VF was 1.86× as fast in prefill and 1.10× as fast in decode for this workload. [Native reference and commands](./benchmarks/llamacpp-reference.json)
+
+`--graph 1` captures the batch-one decode and replays it for each new token. All four answers matched the earlier eager run verbatim. In a separate eight-step comparison on the same server, median time spent submitting the forward pass fell from 58.60 ms to 0.71 ms with CUDA graphs. The corresponding CUDA stream spans were 58.98 and 8.97 ms. [Eager baseline](./benchmarks/freetoken-results.json) · [Graph measurements](./benchmarks/freetoken-graphs.json)
 
 ## 6. Additional notes
 
