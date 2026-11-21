@@ -67,10 +67,25 @@ The test returned **Paris** on a Tesla V100-SXM2-32GB with driver 580.178.04, VF
 
 ## 5. Benchmarks
 
-The CLI prints separate prefill and decode speeds when a request finishes. For repeated requests on a warm model, use the official `ninfer-serve` binary with `--no-prefix-reuse`. Each chat response reports `timings.prompt_per_second`, `timings.predicted_per_second` and the actual token counts. [NInfer request timings](https://github.com/Neroued/ninfer/blob/master/docs/serving.md#llamacpp-compatible-request-observations)
+The CLI prints prefill and decode speeds after each request. For a warm benchmark, start the official server and send requests to `/v1/chat/completions`. Each response includes `timings.prompt_per_second`, `timings.predicted_per_second` and the token counts. [NInfer request timings](https://github.com/Neroued/ninfer/blob/master/docs/serving.md#llamacpp-compatible-request-observations)
+
+```sh
+cmake --build build/rtx5090-release --parallel 4 --target ninfer-serve
+VF_CAPABILITY=12.0 vf ./build/rtx5090-release/apps/ninfer-serve qwen3_6_35b_a3b.ninfer \
+  --host 127.0.0.1 --port 9086 --max-context 512 --no-thinking --no-prefix-reuse
+```
+
+In a second terminal, run the shared warm-up and three measured chats. The client records the server’s prefill and decode times for each reply.
+
+```sh
+base=https://raw.githubusercontent.com/nbald/volta-forever/main/docs/guides/benchmarks
+curl -fsSLO "$base/strata-ninfer.py"
+curl -fsSLO "$base/prompts.json"
+python3 strata-ninfer.py ninfer
+```
 
 ## 6. Additional notes
 
 This demo needs the linked-kernel fixes included in VF 0.1.1. VF 0.1.0 stopped with `cudaErrorSymbolNotFound` in NInfer’s token-count test even with the 12.0 profile. [VF release](https://github.com/nbald/volta-forever/releases/tag/v0.1.1)
 
-The CLI rejected Qwen3.5-35B-A3B Q4_K_M with `NInfer accepts only .ninfer artifacts`. Upstream publishes Qwen3.6-35B-A3B as a separate checkpoint in its own format. [Registered models](https://github.com/Neroued/ninfer#supported-models-and-deployments)
+Qwen3.5-35B-A3B Q4_K_M GGUF was rejected with `NInfer accepts only .ninfer artifacts`. The official `qwen3_6_35b_a3b` conversion recipe accepted the Qwen3.5 BF16 tensor names and shapes across all 14 source shards. Inference was verified with the published Qwen3.6 artifact. [NInfer conversion recipes](https://github.com/Neroued/ninfer/blob/master/docs/weight-conversion.md)

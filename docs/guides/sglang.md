@@ -53,26 +53,43 @@ pip install sglang
 
 ## 4. Test
 
-The following command checks the stock SGLang installation with a small model on one V100. Use the same shell so `CUDA_HOME` points to the toolkit from step 1. On first launch the server downloads Qwen2.5-0.5B-Instruct and compiles kernels.
+Start the official SGLang server in the active environment on a 32 GiB V100. It downloads the 4-bit AWQ checkpoint on first use. The checkpoint keeps attention projections in floating point. SGLang's model override names those projections so its WNA16 loader can initialize the attention layers. [Tested checkpoint](https://huggingface.co/QuantTrio/Qwen3.5-35B-A3B-AWQ/tree/2f4fac011fc06e736782b0b59394577790da7d79)
 
 ```sh
 export PATH="$CUDA_HOME/bin:$PATH"
-python -m sglang.launch_server --model-path Qwen/Qwen2.5-0.5B-Instruct \
-  --dtype float16 --attention-backend flashinfer --mem-fraction-static 0.7 \
+export PTXAS_OPTIONS='--override-directive-values --maxrregcount=192 --opt-level=3'
+export NVCC_APPEND_FLAGS='-gencode=arch=compute_75,code=compute_75'
+export SGLANG_MAMBA_CONV_DTYPE=float16 FLASHINFER_USE_CUDA_NORM=1
+export TORCH_COMPILE_DISABLE=1 SGLANG_ENABLE_METRICS_DEVICE_TIMER=1
+export OMP_NUM_THREADS=4 MAX_JOBS=4
+awq='{"quantization_config":{"quant_method":"awq","bits":4,"group_size":128,"version":"gemm","zero_point":true,"modules_to_not_convert":["visual","linear_attn","self_attn.qkv_proj","self_attn.o_proj","shared_expert","mlp.gate","model.layers.0.","mtp"]}}'
+python -m sglang.launch_server --model-path QuantTrio/Qwen3.5-35B-A3B-AWQ \
+  --served-model-name qwen --dtype float16 --quantization moe_wna16 \
+  --json-model-override-args "$awq" --attention-backend triton --sampling-backend pytorch \
+  --context-length 512 --max-running-requests 1 --chunked-prefill-size 8 \
+  --mem-fraction-static 0.85 --model-loader-extra-config '{"enable_multithread_load":false}' \
+  --disable-cuda-graph --enable-metrics --skip-server-warmup --watchdog-timeout 3600 \
   --host 127.0.0.1 --port 8000
 ```
 
-From a second terminal on the same machine, send the request. The tested server returned `Paris` in `choices[0].message.content`.
+The first request compiles kernels. From a second terminal, send the question below. The V100 returned **Paris** in two output tokens.
 
 ```sh
 curl -fsS http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"What is the capital of France? Answer with just the city."}],"temperature":0,"max_tokens":32}'
+  -d '{"model":"qwen","messages":[{"role":"user","content":"What is the capital of France? Answer with just the city."}],"temperature":0,"max_tokens":32,"chat_template_kwargs":{"enable_thinking":false}}'
 ```
 
 ## 5. Benchmarks
 
-An experimental Qwen3.5-35B-A3B AWQ run on one V100 measured **643.91 tokens/s in prefill** and **67.30 tokens/s in decode**. It used a separate SGLang adapter and preserved Triton's PTX. These measurements apply to that earlier configuration. Each request processed 227 uncached tokens, generated 64 tokens and returned the requested city. Decode used a batch-one CUDA graph. [Results and server counters](benchmarks/sglang-results.json) · [Archived configuration](https://github.com/nbald/volta-forever/blob/7ead7334d0909483b63139d253aead22cf97820a/docs/guides/sglang.md)
+With the server running, run `python3 docs/guides/benchmarks/sglang.py` from a checkout of this project. The client sends one warm-up and three distinct requests. Each measured request processed 227 uncached input tokens and generated 64 output tokens. The rates use SGLang’s GPU forward timers and count the 63 decode tokens after the first output token. [Client and prompts](./benchmarks/) · [Results and configuration](./benchmarks/sglang-stock-results.json)
+
+| Phase | Three requests (tokens/s) | Median (tokens/s) |
+| --- | --- | ---: |
+| Prefill | 72.24, 71.04, 70.28 | **71.04** |
+| Decode | 12.04, 11.97, 11.98 | **11.98** |
 
 ## 6. Additional notes
 
-The stock 35B path is under validation. The tested SGLang 0.5.23 wheel ships the expert router and reduction as sm80-or-later machine code without PTX. In the alternative WNA16 path, the loader selects a linear-layer weight method for an attention module. Results for the standard installation above cover Qwen2.5-0.5B-Instruct.
+The stock run used VF 0.1.1, SGLang 0.5.23, PyTorch 2.14.1+cu130, CUDA toolkit 13.5 and driver 580.178.04. The command selects WNA16 at VF’s default capability of 7.5. Eight-token chunks use the expert router that the wheel can run on this card.
+
+An earlier experiment with an SGLang adapter, larger chunks and CUDA graph decode measured 643.91 tokens/s in prefill and 67.30 in decode. [Archived measurements](./benchmarks/sglang-results.json) · [Archived configuration](https://github.com/nbald/volta-forever/blob/7ead7334d0909483b63139d253aead22cf97820a/docs/guides/sglang.md)

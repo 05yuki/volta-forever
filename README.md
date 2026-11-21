@@ -103,12 +103,13 @@ Start with Ubuntu 24.04 and a Tesla V100. Each guide checks for the NVIDIA R580 
 
 | Ubuntu guide | Model in the example | V100 result |
 |---|---|---|
-| [vLLM](docs/guides/vllm.md) | Qwen3.5-35B-A3B, 4-bit AWQ | The official server answered “Paris”. Eager diagnostic baseline with assembler optimization disabled, **211.52 tokens/s** prefill and **9.23 tokens/s** decode. [Benchmark](docs/guides/benchmarks/) |
-| [SGLang](docs/guides/sglang.md) | Qwen2.5-0.5B-Instruct, FP16 | The local chat API answered “Paris” with FlashInfer and the CUDA 13 toolkit. |
+| [vLLM](docs/guides/vllm.md) | Qwen3.5-35B-A3B, 4-bit AWQ | The official server answered “Paris”. With CUDA graphs and Marlin experts, **1014.26 tokens/s** prefill and **72.13 tokens/s** decode. [Benchmark](docs/guides/benchmarks/) |
+| [SGLang](docs/guides/sglang.md) | Qwen3.5-35B-A3B, 4-bit AWQ | The official PyPI server answered “Paris” with VF 0.1.1. In eager mode it reached **71.04 tokens/s** prefill and **11.98 tokens/s** decode. [Benchmark](docs/guides/benchmarks/sglang-stock-results.json) |
 | [FreeToken](docs/guides/freetoken.md) | Qwen3.5-35B-A3B, GGUF Q4_K_M | The server answered “Paris”. Batch-one CUDA graphs reached **884.56 tokens/s** prefill and **109.26 tokens/s** decode. [Benchmark](docs/guides/benchmarks/freetoken-graphs.json) |
 | [ZML](docs/guides/zml.md) | Qwen3.5-0.8B | The CUDA example answered “Paris”. The 35B AWQ loader stopped on a missing expert tensor. |
-| [Strata](docs/guides/strata.md) | Qwen 35B, GGUF with an MTP head | The regular Qwen3.5 file lacks the MTP head. The Qwen3.6 MTP file passed the tensor check and stopped at cuBLAS with eager loading. |
+| [Strata](docs/guides/strata.md) | Qwen3.5-35B-A3B-MTP, GGUF UD-Q4_K_XL | The CUDA 13 server answered “Paris”. With VF, **1866.8 tokens/s** prefill and **152.0 tokens/s** decode. [Native CUDA 12 comparison](docs/guides/benchmarks/strata-results.json) |
 | [NInfer](docs/guides/ninfer.md) | Qwen3.6-35B-A3B, upstream `.ninfer` | The official CLI answered “Paris” using the published Q4/Q5/Q6 weights and `VF_CAPABILITY=12.0`. |
+| [TensorFold](docs/guides/tensorfold.md) | Qwen3.5-35B-A3B, MLX 4-bit experts and 8-bit routers | The server answered “Paris”. INT8 prompt processing reached **327.37 tokens/s** prefill and **17.03 tokens/s** decode. [Benchmark](docs/guides/benchmarks/tensorfold-results.json) |
 
 ## What runs
 

@@ -25,33 +25,50 @@ vf doctor
 
 ## 3. Engine
 
-Run the upstream Linux installer. It installs the terminal in your home directory and checks its signature. [Strata installation](https://github.com/Niko1221/Strata#install)
+Install the upstream terminal, then use its signed update feed to install the CUDA 13 engine. [Strata installation](https://github.com/Niko1221/Strata#install)
 
 ```sh
 curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install-strata.sh
 sh install-strata.sh
 strata --version
+STRATA_CUDA=13 vf strata update --backend cuda --no-control
 ```
 
 ## 4. Test
 
-Strata registers Unsloth's Qwen3.6-35B-A3B MTP GGUF in the `UD-Q4_K_XL` profile. Allow 22.9 GB for the weights and at least 32 GB of system RAM. The command selects the CUDA 13 engine, enables lazy kernel loading and requests an 8,192-token context. A successful launch prints a local chat URL where you can ask “What is the capital of France?” [Strata model catalog](https://github.com/Niko1221/Strata/blob/main/docs/MODELS.md#qwen36-35b-a3b)
+Download the 22.85 GB Qwen3.5-35B-A3B MTP GGUF. Strata calls the compatible engine profile `qwen36`. The explicit file path selects the Qwen3.5 weights. [Checkpoint](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-MTP-GGUF)
 
 ```sh
+model=Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+curl -fL --retry 3 -o "$model" \
+  "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-MTP-GGUF/resolve/main/$model"
 CUDA_MODULE_LOADING=LAZY STRATA_CUDA=13 vf strata launch --family qwen36 --model UD-Q4_K_XL \
-  --context 8k --vision off --access local --port 9085 --no-api-key
+  --model-path "$PWD/$model" --context 8k --vision off --tune skip \
+  --set prompt-cache=0 --set conversation-cache-mib=0 --access local --port 9085 \
+  --no-api-key --yes --no-tui
 ```
+
+Ask “What is the capital of France? Answer in one word.” in the local chat. The unpinned installation selected the signed Strata 0.2.18 terminal and CUDA 13 engine 0.1.64. It answered **Paris** on a Tesla V100-SXM2-32GB with driver 580.178.04 and VF 0.1.1.
 
 ## 5. Benchmarks
 
-Once the server answers a prompt, run Strata’s smoke benchmark in a second terminal to measure request latency and answer tokens per second.
+With that server running, download the client and prompts to the same directory. The client runs a warm-up and three different chats at temperature zero with thinking disabled.
 
 ```sh
-strata bench run --url http://127.0.0.1:9085 --suite serving-smoke --out "strata-benchmark-$(date +%s)"
+base=https://raw.githubusercontent.com/nbald/volta-forever/main/docs/guides/benchmarks
+curl -fsSLO "$base/strata-ninfer.py"
+curl -fsSLO "$base/prompts.json"
+python3 strata-ninfer.py strata
 ```
 
-With default eager loading and a 512-token context, Qwen3.6-35B-A3B produced no tokens on a Tesla V100-SXM2-32GB, driver 580.178.04, VF 0.1.0 and Strata CUDA 13 engine 0.1.63. Strata checked all 753 tensors and uploaded 4.40 GiB before reporting `cuBLAS handle failed`. An isolated cuBLAS check returned `CUBLAS_STATUS_ALLOC_FAILED` in eager mode and succeeded in lazy mode. [Strata’s loading default](https://github.com/Niko1221/Strata/blob/v0.2.17/engine/src/program/generate.cpp#L3702-L3711)
+| Strata engine | Tokens read / generated per request | Median prefill | Median decode |
+| --- | ---: | ---: | ---: |
+| Native CUDA 12.9 0.1.63 | 227 / 64 | 1,872.9 tok/s | 151.1 tok/s |
+| CUDA 13 0.1.63 with VF 0.1.1 | 227 / 64 | 1,868.3 tok/s | 151.6 tok/s |
+| CUDA 13 0.1.64 with VF 0.1.1 | 227 / 64 | 1,866.8 tok/s | 152.0 tok/s |
+
+All runs used the same physical V100 with the same checkpoint and MTP speculative decoding. Each measured reply started with its requested city. All three configurations reported zero cached prompt tokens. The engine reported its own prompt and generation times. [Per-request measurements and responses](./benchmarks/strata-results.json)
 
 ## 6. Additional notes
 
-The standard Qwen3.5-35B-A3B Q4_K_M file has 733 tensors. Strata rejected it with `missing qwen35moe.nextn_predict_layers`. Unsloth also publishes a 753-tensor Qwen3.5 file with the MTP layer. [Qwen3.5 MTP weights](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-MTP-GGUF)
+The standard Qwen3.5-35B-A3B Q4_K_M file has 733 tensors. Strata rejected it with `missing qwen35moe.nextn_predict_layers`. The MTP file used above includes 753 tensors. Strata also registers Qwen3.6-35B-A3B under the same profile; omitting `--model-path` selects that separate checkpoint. [Strata model catalog](https://github.com/Niko1221/Strata/blob/main/docs/MODELS.md#qwen36-35b-a3b)

@@ -17,16 +17,16 @@ Each request produces one new observation in each vLLM phase histogram. The clie
 
 | Prompt | Input tokens | Output tokens | Prefill (tokens/s) | Decode (tokens/s) |
 | --- | ---: | ---: | ---: | ---: |
-| Kyoto | 227 | 64 | 211.52 | 9.22 |
-| Lyon | 227 | 64 | 210.54 | 9.23 |
-| Lima | 227 | 64 | 211.74 | 9.23 |
-| **Median** | | | **211.52** | **9.23** |
+| Kyoto | 227 | 64 | 1014.16 | 72.09 |
+| Lyon | 227 | 64 | 1016.32 | 72.13 |
+| Lima | 227 | 64 | 1014.26 | 72.17 |
+| **Median** | | | **1014.26** | **72.13** |
 
-This diagnostic run used eager execution with assembler optimization disabled on a Tesla V100-SXM2-32GB using vLLM 0.34.0, Volta-Forever 0.1.1 and CUDA Toolkit 13.5. Each rate uses vLLM's native counters. The recorded responses and phase durations are available with the checkpoint revision. [Measurement data](vllm-results.json) · [Checkpoint](https://huggingface.co/QuantTrio/Qwen3.5-35B-A3B-AWQ/tree/2f4fac011fc06e736782b0b59394577790da7d79)
+The official vLLM 0.34.0 server used its compiler, Marlin experts and full and piecewise CUDA graphs on a Tesla V100-SXM2-32GB. The diagnostic run with eager execution and assembler optimization disabled measured 211.52 prefill and 9.23 decode tokens/s. [Graph run, responses and configuration](vllm-graphs.json) · [Diagnostic baseline](vllm-results.json) · [Checkpoint](https://huggingface.co/QuantTrio/Qwen3.5-35B-A3B-AWQ/tree/2f4fac011fc06e736782b0b59394577790da7d79)
 
 ## SGLang
 
-The recorded 35B measurement used an experimental SGLang adapter. For a compatible 35B server that exposes GPU forward timers and serves the model as `qwen`, run the following client. [Archived benchmark configuration](https://github.com/nbald/volta-forever/blob/7ead7334d0909483b63139d253aead22cf97820a/docs/guides/sglang.md)
+Run the client against the official SGLang server started by the Ubuntu guide. On the published VF 0.1.1 release, the three measured requests reached a median of **71.04 prefill** and **11.98 decode** tokens/s with eight-token prefill chunks and eager execution. Each response started with its requested city. [Stock server and per-request data](sglang-stock-results.json)
 
 ```sh
 mkdir -p ~/sglang-v100/benchmark && cd ~/sglang-v100/benchmark
@@ -35,10 +35,17 @@ curl -fsSLO "$base/sglang.py" && curl -fsSLO "$base/prompts.json"
 python3 sglang.py
 ```
 
-The client sets a fresh cache salt on every chat. It verifies the input and output token counts and the absence of device, host and storage cache hits. Prefill divides the input tokens by the GPU timer for `extend`. Decode uses the output tokens after the first token and the GPU timer for `decode`. [SGLang Ubuntu guide](../sglang.md) · [Measurement data and configuration](sglang-results.json)
-
+The client sets a fresh cache salt on every chat. It verifies the input and output token counts and the absence of device, host and storage cache hits. Prefill divides the input tokens by the GPU timer for `extend`. Decode uses the output tokens after the first token and the GPU timer for `decode`. [SGLang Ubuntu guide](../sglang.md) · [Historical adapter experiment](sglang-results.json)
 
 ## FreeToken
 
 Run the streaming client and read the scheduler timings as described in the [FreeToken guide](../freetoken.md#5-benchmarks).
 With batch-one CUDA graphs, FreeToken measured **884.56 prefill** and **109.26 decode** tokens/s. Native llama.cpp on the same V100 and Q4_K_M checkpoint measured **474.57** and **99.77** tokens/s. Each of the three measured requests read 227 uncached tokens and generated 64. [FreeToken measurements](freetoken-graphs.json) · [Native reference and commands](llamacpp-reference.json) · [Earlier eager run](freetoken-results.json)
+
+## Strata
+
+The CUDA 13 engine with VF and the native CUDA 12.9 engine served the same Qwen3.5-35B-A3B-MTP checkpoint on the same V100. The guide includes the server command and the client for the three uncached requests. [Ubuntu guide](../strata.md#5-benchmarks) · [Results and native comparison](strata-results.json)
+
+## TensorFold
+
+The client reads TensorFold’s native prompt and generation timers and checks the token counts on each request. The 35B run used the MLX checkpoint with 4-bit expert weights and 8-bit routers. [Ubuntu guide](../tensorfold.md#5-benchmarks) · [Results and checkpoint revision](tensorfold-results.json)

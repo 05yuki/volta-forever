@@ -41,6 +41,8 @@ bash /tmp/vf-install.sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+The procedure below uses the released installer. The graph benchmark used the VF main-branch build linked in step 4. To reproduce that build, follow the [VF source build](../../README.md#build) and activate its launcher before creating the venv.
+
 ## 3. Engine
 
 ```sh
@@ -54,15 +56,14 @@ pip install vllm
 
 ## 4. Test
 
-Use the full CUDA 13 toolkit from step 1. Start the server in the active environment. vLLM downloads the 4-bit AWQ checkpoint on first launch. This diagnostic configuration serves one text request at a time on a 32 GiB V100. It uses eager execution and disables assembler optimizations to establish a correctness baseline. [Qwen3.5-35B-A3B-AWQ](https://huggingface.co/QuantTrio/Qwen3.5-35B-A3B-AWQ)
+Use the full CUDA 13 toolkit from step 1. Start the server in the active environment. vLLM downloads the 4-bit AWQ checkpoint on first launch. This configuration serves one text request at a time on a 32 GiB V100, with Marlin experts and CUDA graphs. The optimized run used VF commit `3a079c8` with vLLM 0.34.0. [Tested VF revision](https://github.com/nbald/volta-forever/commit/3a079c87b22a0793dc8aabfa62a5ca3ff11d91eb) [Qwen3.5-35B-A3B-AWQ](https://huggingface.co/QuantTrio/Qwen3.5-35B-A3B-AWQ)
 
 ```sh
 export PATH="$CUDA_HOME/bin:$PATH"
-export PTXAS_OPTIONS='--override-directive-values --maxrregcount=192 --opt-level=0'
-export TORCH_COMPILE_DISABLE=1
+export PTXAS_OPTIONS='--override-directive-values --maxrregcount=192 --opt-level=3'
 vllm serve QuantTrio/Qwen3.5-35B-A3B-AWQ --served-model-name qwen \
-  --dtype float16 --language-model-only --safetensors-load-strategy eager \
-  --max-model-len 512 --max-num-seqs 1 --gpu-memory-utilization 0.9 --enforce-eager \
+  --dtype float16 --language-model-only --safetensors-load-strategy lazy -cc.mode=3 \
+  --max-model-len 512 --max-num-seqs 1 --gpu-memory-utilization 0.9 \
   --host 127.0.0.1 --port 8000
 ```
 
@@ -79,10 +80,12 @@ With the server running, use the [benchmark client and prompts](./benchmarks/). 
 
 | Phase | Three runs (tokens/s) | Median (tokens/s) |
 | --- | --- | ---: |
-| Prefill | 211.52, 210.54, 211.74 | **211.52** |
-| Decode | 9.22, 9.23, 9.23 | **9.23** |
+| Prefill | 1014.16, 1016.32, 1014.26 | **1014.26** |
+| Decode | 72.09, 72.13, 72.17 | **72.13** |
 
-Each rate uses the change in vLLM’s own phase timer for one request. Prefill counts all 227 input tokens. Decode counts the 63 output tokens after the first token. These rates are the baseline for testing optimized execution. Median time to first token over loopback was 1.086 seconds. The test used a Tesla V100-SXM2-32GB, driver 580.178.04, VF 0.1.1, CUDA toolkit 13.5, vLLM 0.34.0 and PyTorch 2.14.0+cu130.
+Each rate uses the change in vLLM’s own phase timer for one request. Prefill counts all 227 input tokens. Decode counts the 63 output tokens after the first token. The test used a Tesla V100-SXM2-32GB, driver 580.178.04, CUDA toolkit 13.5, vLLM 0.34.0 and PyTorch 2.14.0+cu130. The server captured both full and piecewise CUDA graphs. [Measurements and generated text](./benchmarks/vllm-graphs.json)
+
+On the same card and the same three requests, full CUDA graphs with the compiler disabled reached 1016.51 prefill and 72.24 decode tokens/s. Eager mode at the same assembler optimization level reached 890.74 and 9.43 tokens/s. [Same-GPU comparison](./benchmarks/vllm-graphs.json)
 
 ## 6. Additional notes
 
