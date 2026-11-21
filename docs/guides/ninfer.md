@@ -1,6 +1,6 @@
-# Try upstream NInfer on a V100
+# Run NInfer on a V100
 
-The official NInfer CLI builds on Ubuntu, but its Qwen runtime requires compute capability 12.0. On our V100, the default VF profile stopped at that check before generating a token.
+The official NInfer CLI ran Qwen3.6-35B-A3B on one 32 GB Tesla V100. Set `VF_CAPABILITY=12.0` when launching NInfer so its hardware check accepts the device.
 
 ## 1. CUDA
 
@@ -63,14 +63,14 @@ VF_CAPABILITY=12.0 vf ./build/rtx5090-release/apps/ninfer qwen3_6_35b_a3b.ninfer
   --max-context 512 --max-tokens 12 --no-thinking --temperature 0
 ```
 
+The test returned **Paris** on a Tesla V100-SXM2-32GB with driver 580.178.04, VF 0.1.1 and the upstream CLI built with CUDA 13.5. The CLI reported 24 input tokens and two output tokens for this answer.
+
 ## 5. Benchmarks
 
-The test command prints prompt and generated token counts, prefill speed and decode speed after generation. On a Tesla V100-SXM2-32GB with driver 580.178.04, the CLI built with CUDA 13.5 loaded 19.6 GiB of real weights. An earlier VF build reached `engine ready` and timed out on the first prompt. A later VF build passed NInfer’s numerical check for the prompt’s Q8 projection, taking 2.51 s to compile the kernel on first use.
+The CLI prints separate prefill and decode speeds when a request finishes. For repeated requests on a warm model, use the official `ninfer-serve` binary with `--no-prefix-reuse`. Each chat response reports `timings.prompt_per_second`, `timings.predicted_per_second` and the actual token counts. [NInfer request timings](https://github.com/Neroued/ninfer/blob/master/docs/serving.md#llamacpp-compatible-request-observations)
 
 ## 6. Additional notes
 
-With the fixes in VF 0.1.1, a structural test using the original tokenizer and 934 zero-filled tensors completed the 35B graph at context 512, processing 24 prompt tokens and producing two tokens. [VF 0.1.1 release](https://github.com/nbald/volta-forever/releases/tag/v0.1.1)
-
-On VF 0.1.0, NInfer’s default profile stopped at `Qwen3.5 family runtime requires compute capability 12.0`. With `VF_CAPABILITY=12.0`, its upstream token-count test stopped at `cudaErrorSymbolNotFound`. [Upstream capability check](https://github.com/Neroued/ninfer/blob/ebdc67e584bcd9ebe16ee63af9abeb2118bac6cd/src/models/qwen3_5/program/planning/startup.cpp#L575-L580)
+This demo needs the linked-kernel fixes included in VF 0.1.1. VF 0.1.0 stopped with `cudaErrorSymbolNotFound` in NInfer’s token-count test even with the 12.0 profile. [VF release](https://github.com/nbald/volta-forever/releases/tag/v0.1.1)
 
 The CLI rejected Qwen3.5-35B-A3B Q4_K_M with `NInfer accepts only .ninfer artifacts`. Upstream publishes Qwen3.6-35B-A3B as a separate checkpoint in its own format. [Registered models](https://github.com/Neroued/ninfer#supported-models-and-deployments)

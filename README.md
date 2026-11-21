@@ -108,7 +108,7 @@ Start with Ubuntu 24.04 and a Tesla V100. Each guide checks for the NVIDIA R580 
 | [FreeToken](docs/guides/freetoken.md) | Qwen3.5-35B-A3B, GGUF Q4_K_M | All 40 expert banks loaded on the V100. The embedding and first expert matched CPU references. A full generation result is pending. |
 | [ZML](docs/guides/zml.md) | Qwen3.5-0.8B | The CUDA example answered “Paris”. The 35B AWQ loader stopped on a missing expert tensor. |
 | [Strata](docs/guides/strata.md) | Qwen 35B, GGUF with an MTP head | The regular Qwen3.5 file lacks the MTP head. The Qwen3.6 MTP file passed the tensor check and stopped at cuBLAS with eager loading. |
-| [NInfer](docs/guides/ninfer.md) | Qwen3.6-35B-A3B, upstream `.ninfer` | The official CLI loaded the real weights. With `VF_CAPABILITY=12.0` and zero-filled weights of the same shape, it processed a 24-token prompt and generated two tokens. |
+| [NInfer](docs/guides/ninfer.md) | Qwen3.6-35B-A3B, upstream `.ninfer` | The official CLI answered “Paris” using the published Q4/Q5/Q6 weights and `VF_CAPABILITY=12.0`. |
 
 ## What runs
 
