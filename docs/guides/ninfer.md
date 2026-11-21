@@ -65,7 +65,7 @@ VF_CAPABILITY=12.0 vf ./build/rtx5090-release/apps/ninfer qwen3_6_35b_a3b.ninfer
 
 ## 5. Benchmarks
 
-The test command prints prompt and generated token counts, prefill speed and decode speed after generation. On a Tesla V100-SXM2-32GB with driver 580.178.04, the CLI built with CUDA 13.5 loaded 19.6 GiB of real weights in 30 min 53 s. An earlier VF build reached `engine ready` in 33 min 18 s, then timed out on the first prompt. A later VF build passed NInfer’s numerical check for the prompt’s Q8 projection, taking 2.51 s to compile the kernel on first use.
+The test command prints prompt and generated token counts, prefill speed and decode speed after generation. On a Tesla V100-SXM2-32GB with driver 580.178.04, the CLI built with CUDA 13.5 loaded 19.6 GiB of real weights. An earlier VF build reached `engine ready` and timed out on the first prompt. A later VF build passed NInfer’s numerical check for the prompt’s Q8 projection, taking 2.51 s to compile the kernel on first use.
 
 ## 6. Additional notes
 

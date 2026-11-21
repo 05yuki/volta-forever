@@ -53,7 +53,7 @@ pip install sglang
 
 ## 4. Test
 
-Use the same shell so `CUDA_HOME` points to the toolkit from step 1. On first launch the server downloads Qwen2.5-0.5B-Instruct and compiles kernels, which can take several minutes.
+Use the same shell so `CUDA_HOME` points to the toolkit from step 1. On first launch the server downloads Qwen2.5-0.5B-Instruct and compiles kernels.
 
 ```sh
 export PATH="$CUDA_HOME/bin:$PATH"

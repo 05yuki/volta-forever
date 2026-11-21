@@ -59,6 +59,7 @@ Download the Q4_K_M text model (20.5 GiB) to a local drive. The following config
 ```sh
 model=Qwen3.5-35B-A3B-Q4_K_M.gguf
 curl -fL -C - -o "$model" "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/$model"
+export PTXAS_OPTIONS='--override-directive-values --maxrregcount=192'
 ft serve --model "$model" --served-model-name qwen --text-model-only \
   --moe-strategy fused --dtype float16 --attn triton --num-tokens 1024 --graph 0
 ```
@@ -80,7 +81,7 @@ curl -fsS -w '\n%{time_total} seconds\n' http://127.0.0.1:1919/v1/chat/completio
   -d '{"model":"qwen","messages":[{"role":"user","content":"Write a short sentence about Paris."}],"temperature":0,"max_tokens":32,"chat_template_kwargs":{"enable_thinking":false}}'
 ```
 
-On the validation system, loading the Q4_K_M over a remote mount took 32 min 10 s. FreeToken placed 18.1 GiB of expert weights across 40 layers on the V100 and reported 9.01 GiB of VRAM free after initialization. FreeToken was still compiling its GGML CUDA library when loading finished.
+FreeToken placed 18.1 GiB of expert weights across 40 layers on the V100 and reported 9.01 GiB of VRAM free after initialization. Engine warmup then failed on VF 0.1.0 because the Triton prefill kernel `chunk_gated_delta_rule_fwd_kkt_solve_kernel` exceeded the register limit. That run produced no tokens. With VF 0.1.1 and the register limit in step 4, the complete GatedDeltaNet prefill operator matched all 262,144 outputs and 524,288 updated state values from the CPU reference.
 
 ## 6. Additional notes
 

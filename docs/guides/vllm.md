@@ -39,7 +39,7 @@ pip install vllm
 
 ## 4. Test
 
-Start the server. On the first launch it downloads Qwen2.5-0.5B-Instruct and compiles kernels, which can take several minutes.
+Start the server. On the first launch it downloads Qwen2.5-0.5B-Instruct and compiles kernels.
 
 ```sh
 export CUDA_HOME="$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cu13"
