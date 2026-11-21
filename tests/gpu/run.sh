@@ -90,6 +90,8 @@ px ptx-family-declared-again "$G/ptx-cases/zeros-shadow.ptx" 42040000 42040000 4
 px ptx-family-of-another-name "$G/ptx-cases/zeros-renamed.ptx" 42040000 42040000 42040000 42040000
 px ptx-accumulator-as-operand "$G/ptx-cases/alias-a.ptx" 42080000 42080000 42000000 42000000
 px ptx-accumulator-as-operand-f16 "$G/ptx-cases/alias-a-f16.ptx" 54805480 4c004c00
+# Each warp computes 16 ones per destination, plus the specified accumulator fragment.
+px ptx-mma-constant-accumulator "$G/ptx-cases/mma-immediate.ptx" 41980000 41580000 41a00000 418c0000
 # A member of a family of registers written with zeros before its number (%d00 for %d0 of
 # %d<4>: the same register to the assembler) reads the accumulator in the middle of a chain of
 # products: 32.0 after four of the eight, and 64.0 in the others at the end.

@@ -292,8 +292,17 @@ pub fn names(text: &str) -> impl Iterator<Item = &str> {
 /// The registers of a brace-enclosed vector operand `{%a, %b}`; `None` if the operand is not one or
 /// holds something else than registers.
 pub fn vector(operand: &str) -> Option<Vec<&str>> {
+    vector_with(operand, |item| register(item).is_some())
+}
+
+/// The members of a brace-enclosed operand that all satisfy a particular operand form.
+pub fn vector_with(operand: &str, accepts: impl Fn(&str) -> bool) -> Option<Vec<&str>> {
     let inner = operand.strip_prefix('{')?.strip_suffix('}')?;
-    inner.split(',').map(|part| register(part.trim())).collect()
+    inner
+        .split(',')
+        .map(|part| part.trim())
+        .map(|item| accepts(item).then_some(item))
+        .collect()
 }
 
 /// `operand` if it is a single register name.

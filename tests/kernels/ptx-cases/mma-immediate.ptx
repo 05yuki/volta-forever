@@ -1,0 +1,25 @@
+.version 8.8
+.target sm_80
+.address_size 64
+.visible .entry k(.param .u64 output) {
+.reg .u64 %out, %offset;
+.reg .u32 %lane;
+.reg .b32 %a<4>, %b<2>;
+.reg .f32 %a0f, %a2f, %d<4>;
+ld.param.u64 %out, [output];
+mov.u32 %lane, %laneid;
+mul.wide.u32 %offset, %lane, 16;
+add.u64 %out, %out, %offset;
+mov.b32 %a0, 0x3c003c00;
+mov.b32 %a1, 0x3c003c00;
+mov.b32 %a2, 0x3c003c00;
+mov.b32 %a3, 0x3c003c00;
+mov.b32 %b0, 0x3c003c00;
+mov.b32 %b1, 0x3c003c00;
+mov.f32 %a0f, 3.0;
+mov.f32 %a2f, 4.0;
+mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0,_,%d2,_}, {%a0,%a1,%a2,%a3}, {%b0,%b1}, {%a0f,0.,%a2f,0.};
+mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d1,%d3,_,_}, {%a0,%a1,%a2,%a3}, {%b0,%b1}, {-2.5,0f3FC00000,0.,0.};
+st.global.v4.f32 [%out], {%d0,%d1,%d2,%d3};
+ret;
+}

@@ -1036,7 +1036,28 @@ fn a_product_before_its_ldmatrix_in_the_text_reads_what_it_loads() {
     assert_eq!(undeclared(&lowered), Vec::<String>::new());
 }
 
+#[test]
+fn transposed_ldmatrix_accepts_nvcc_qualifier_order() {
+    let canonical =
+        "{\n\t.reg .b64 %rd<2>;\n\tldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r1,%r2,%r3,%r4}, [%rd1];\n}";
+    assert_eq!(
+        lower(canonical),
+        lower(&canonical.replace("m8n8.x4.trans", "trans.m8n8.x4"))
+    );
+}
+
 const K16_F32: &str = "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32";
+
+#[test]
+fn f32_mma_accepts_component_constants_and_discarded_destinations() {
+    let operands = "{%d0, _, %d2, _}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%c0, 0., -2.5, 0f3FC00000}";
+    let lowered = lower(&format!("{{\n\t{K16_F32} {operands};\n\tret;\n}}"));
+    assert_eq!(count(&lowered, "selp.b32 %d"), 2);
+    assert!(!lowered.contains("selp.b32 _,"));
+    assert!(lowered.contains("0f3FC00000"));
+    let malformed = operands.replace("0f3FC00000", "0f3FC0000X");
+    assert!(refusal(&format!("{{\n\t{K16_F32} {malformed};\n}}")).contains("operands not recognised"));
+}
 
 #[test]
 fn an_ampere_fp16_product_is_two_turing_products_in_a_row() {

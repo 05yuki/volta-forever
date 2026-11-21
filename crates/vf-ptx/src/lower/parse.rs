@@ -281,6 +281,19 @@ pub(super) fn parse_block_scaled<'a>(
     })
 }
 
+/// A PTX floating constant, including exact single/double bit patterns. Keep the spelling:
+/// ptxas applies the original conversion to f32 in the accumulator of the Volta MMA.
+fn float_literal(text: &str) -> bool {
+    let unsigned = text.strip_prefix(['-', '+']).unwrap_or(text);
+    if let Some(bits) = unsigned.strip_prefix("0f").or_else(|| unsigned.strip_prefix("0F")) {
+        return bits.len() == 8 && bits.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    if let Some(bits) = unsigned.strip_prefix("0d").or_else(|| unsigned.strip_prefix("0D")) {
+        return bits.len() == 16 && bits.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    unsigned.starts_with(|c: char| c.is_ascii_digit() || c == '.') && unsigned.parse::<f64>().is_ok()
+}
+
 pub(super) fn parse<'a>(opcode: &str, operands: &'a str) -> Result<Tensor<'a>, Unsupported> {
     let unsupported = |what: &str| Unsupported(format!("{opcode}: {what}"));
     let parts = scan::split_operands(operands);
@@ -291,7 +304,21 @@ pub(super) fn parse<'a>(opcode: &str, operands: &'a str) -> Result<Tensor<'a>, U
         if qualifiers.contains(&"block_scale") {
             return parse_block_scaled(opcode, &qualifiers, &parts);
         }
-        let vectors: Option<Vec<Vec<&str>>> = parts.iter().map(|part| scan::vector(part)).collect();
+        let float_accumulator = matches!(
+            qualifiers[..],
+            ["m16n8k8" | "m16n8k16", "row", "col", "f32", "f16", "f16", "f32"]
+        );
+        let vectors: Option<Vec<Vec<&str>>> = parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| {
+                if i == 3 && float_accumulator {
+                    scan::vector_with(part, |item| scan::register(item).is_some() || float_literal(item))
+                } else {
+                    scan::vector(part)
+                }
+            })
+            .collect();
         let (d, a, b, c) = match vectors.as_deref() {
             Some([d, a, b, c]) => (d, a, b, c),
             _ => return Err(unsupported("operands not recognised")),
@@ -402,6 +429,10 @@ pub(super) fn parse<'a>(opcode: &str, operands: &'a str) -> Result<Tensor<'a>, U
         let mut qualifiers = qualifiers;
         if let Some(at) = qualifiers.iter().position(|qualifier| *qualifier == "m8n8") {
             qualifiers[..=at].rotate_right(1);
+        }
+        // nvcc also emits trans.m8n8.x4; after moving the shape first the count follows trans.
+        if matches!(qualifiers[..], ["m8n8", "trans", "x1" | "x2" | "x4", ..]) {
+            qualifiers.swap(1, 2);
         }
         let (count, transposed, shared) = match qualifiers[..] {
             ["m8n8", count, "b16"] => (count, false, false),

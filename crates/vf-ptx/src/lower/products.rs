@@ -137,9 +137,13 @@ impl<'a> Body<'a> {
             self.written(name);
         }
         for (at, name) in d.iter().enumerate() {
-            emit!(self, "selp.b32 {name}, {}, {}, {odd};", result[4 + at], result[at]);
+            if *name != "_" {
+                emit!(self, "selp.b32 {name}, {}, {}, {odd};", result[4 + at], result[at]);
+            }
         }
-        self.remember(Form::Wide, d, &result);
+        if !d.contains(&"_") {
+            self.remember(Form::Wide, d, &result);
+        }
     }
 
     /// `mma.m16n8k8` with f16 accumulators.
