@@ -78,8 +78,8 @@ struct LazyLibrary {
     library_values: Vec<usize>,
     /// Entry names with independence flags, for libraries restored from cache.
     cached_entries: Option<Vec<(String, bool)>>,
-    /// For device-linked input, the unique relocatable object that defines each retained kernel.
-    linked_entries: Option<HashMap<String, Option<usize>>>,
+    /// For each retained kernel, the relocatable objects that define it, in link order.
+    linked_entries: Option<HashMap<String, Vec<usize>>>,
     /// Proxy cache key, for saving sub-modules when they are first compiled.
     cache_key: Option<crate::cache::CacheKey>,
     /// The original image bytes, kept on a cache hit so that the fallback path (materialization,
@@ -528,7 +528,7 @@ pub unsafe fn setup_linked(
     let Some(entries) = image.linked_entries() else {
         return false;
     };
-    if !entries.values().any(Option::is_some) {
+    if entries.values().all(Vec::is_empty) {
         return false;
     }
     unsafe {
@@ -564,7 +564,7 @@ unsafe fn setup_common(
     cached_entries: Option<Vec<(String, bool)>>,
     cache_key: Option<crate::cache::CacheKey>,
     original_bytes: Option<Vec<u8>>,
-    linked_entries: Option<HashMap<String, Option<usize>>>,
+    linked_entries: Option<HashMap<String, Vec<usize>>>,
     jit_options: *mut c_int,
     jit_values: *mut *mut c_void,
     jit_count: c_uint,
@@ -1167,15 +1167,31 @@ pub unsafe fn get_kernel(library: usize, name: *const c_char, kernel: *mut *mut 
     // Per-entry classification: independent entries compile on demand, dependent entries come
     // from the materialized whole module.
     let t_kernel_start = std::time::Instant::now();
-    let linked_leaf = lazy_lib
+    let mut linked_leaf = None;
+    if let Some(indices) = lazy_lib
         .linked_entries
         .as_ref()
-        .and_then(|entries| entries.get(&name_str).copied().flatten())
-        .and_then(|index| {
-            let image = crate::images::retained(library)?;
-            let text = image.linked_object_ptx(index)?;
-            ModuleInfo::analyse(&text).extract_linked_leaf(&name_str)
-        });
+        .and_then(|entries| entries.get(&name_str))
+        && !indices.is_empty()
+        && let Some(image) = crate::images::retained(library)
+    {
+        let indices = indices.clone();
+        lazy_lib.kernels.insert(name_str.clone(), KernelState::Compiling);
+        drop(libs);
+        linked_leaf = image.linked_leaf(&name_str, &indices);
+        libs = mutex.lock().unwrap_or_else(|e| e.into_inner());
+        // An unload and a new library can reuse the same handle while PTX is being analysed.
+        if !libs.contains_key(&library)
+            || !crate::images::retained(library).is_some_and(|current| std::sync::Arc::ptr_eq(&current, &image))
+        {
+            return CUDA_ERROR_NOT_FOUND;
+        }
+        if libs[&library].materialized_handle.is_some() {
+            drop(libs);
+            return unsafe { materialize_and_get_kernel(library, name, &name_str, kernel) };
+        }
+    }
+    let lazy_lib = libs.get_mut(&library).unwrap();
     let is_independent = if lazy_lib.linked_entries.is_some() {
         linked_leaf.is_some()
     } else if let Some(ref entries) = lazy_lib.cached_entries {

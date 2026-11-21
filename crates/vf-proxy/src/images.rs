@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use vf_adapt::{Adapted, Emulated, Outcome, Refused, RefusedFunction};
 use vf_fatbin as fatbin;
@@ -35,6 +35,7 @@ pub const REFUSAL_ROUNDS: usize = 8;
 pub const ERROR_LOG_SIZE: usize = 1 << 20;
 
 struct PrelinkedObjects {
+    shared: OnceLock<vf_ptx::deps::LinkedShared>,
     objects: Vec<Box<[u8]>>,
     _pointers: Box<[*const u8]>,
 }
@@ -121,7 +122,7 @@ impl Replacement {
 
     /// A unique device-usable PTX input. If the driver could choose a different input, its linker
     /// must decide which definitions survive.
-    pub fn linked_object_ptx(&self, index: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+    fn linked_object_ptx(&self, index: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
         let fat = fatbin::parse(self.prelinked.as_ref()?.objects.get(index)?).ok()?;
         let mut usable = fat.entries.iter().filter(|e| config().policy.usable(e));
         let entry = usable.next()?;
@@ -131,9 +132,8 @@ impl Replacement {
         entry.payload().ok()
     }
 
-    /// Index only entry points that survived device linking, and for which exactly one input
-    /// defines the name. Defer ambiguous weak definitions to the driver's full device linker.
-    pub fn linked_entries(&self) -> Option<HashMap<String, Option<usize>>> {
+    /// Keep the defining input indices in link order for entries present in the linked cubin.
+    pub fn linked_entries(&self) -> Option<HashMap<String, Vec<usize>>> {
         let primary = fatbin::parse(&self.data).ok()?;
         let [binary] = primary.entries.as_slice() else {
             return None;
@@ -144,25 +144,41 @@ impl Replacement {
         let cubin = binary.payload().ok()?;
         let mut entries: HashMap<_, _> = fatbin::cubin_entries(&cubin)?
             .into_iter()
-            .map(|name| (name.to_owned(), None))
+            .map(|name| (name.to_owned(), Vec::new()))
             .collect();
         drop(cubin);
-        let mut duplicates = std::collections::HashSet::new();
-        for index in 0..self.prelinked.as_ref()?.objects.len() {
+        let prelinked = self.prelinked.as_ref()?;
+        let mut shared = vf_ptx::deps::LinkedShared::default();
+        for index in 0..prelinked.objects.len() {
             let text = self.linked_object_ptx(index)?;
-            for entry in vf_ptx::functions(&text).into_iter().filter(|f| f.entry) {
-                let name = std::str::from_utf8(&text[entry.name]).ok()?;
-                if let Some(object) = entries.get_mut(name)
-                    && object.replace(index).is_some()
-                {
-                    duplicates.insert(name.to_owned());
+            for name in shared.add_object(&text)? {
+                if let Some(objects) = entries.get_mut(&name) {
+                    objects.push(index);
                 }
             }
         }
-        for name in duplicates {
-            entries.insert(name, None);
-        }
+        prelinked.shared.get_or_init(|| shared);
         Some(entries)
+    }
+
+    /// NVCC can emit the same weak template in several objects. Use one complete leaf only
+    /// when all candidate definitions are independent and their executable PTX agrees exactly.
+    pub fn linked_leaf(&self, name: &str, indices: &[usize]) -> Option<Vec<u8>> {
+        let shared = self.prelinked.as_ref()?.shared.get()?;
+        let (&first, rest) = indices.split_first()?;
+        let text = self.linked_object_ptx(first)?;
+        let module = vf_ptx::deps::ModuleInfo::analyse(&text);
+        if rest.is_empty() {
+            return module.extract_linked_leaf(name, shared);
+        }
+        let definition = module.weak_leaf_definition(name, shared)?;
+        for &index in rest {
+            let text = self.linked_object_ptx(index)?;
+            if vf_ptx::deps::ModuleInfo::analyse(&text).weak_leaf_definition(name, shared)? != definition {
+                return None;
+            }
+        }
+        module.extract(name)
     }
 
     /// What to pass to the driver in place of the program's pointer.
@@ -545,6 +561,7 @@ unsafe fn adapt_linked(who: &str, wrapper: Wrapper) -> Option<Replacement> {
     };
     let mut result = Replacement::new(linked.to_vec(), Some(wrapper));
     result.prelinked = Some(PrelinkedObjects {
+        shared: OnceLock::new(),
         objects,
         _pointers: pointers,
     });

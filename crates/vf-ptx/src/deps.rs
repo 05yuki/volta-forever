@@ -24,6 +24,13 @@ fn is_name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'%' | b'.' | b'@')
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Linkage {
+    Private,
+    Weak,
+    External,
+}
+
 /// A module-level variable declaration or definition.
 #[derive(Debug, Clone)]
 struct VarDecl {
@@ -31,10 +38,7 @@ struct VarDecl {
     range: Range<usize>,
     /// The identifier name.
     name: String,
-    /// Whether this variable has `.visible` linkage. Recorded during parsing; checked by tests
-    /// that validate the parser's handling of linkage prefixes.
-    #[allow(dead_code)]
-    visible: bool,
+    linkage: Linkage,
     /// Whether this is a `.global` or `.const` variable (persists across launches). `.shared` is
     /// per-block per-launch and does not cause coherence issues when split.
     persistent: bool,
@@ -94,6 +98,8 @@ pub struct ModuleInfo {
     persistent_names: HashSet<String>,
     /// True when the module contains text at module level that the parser does not recognise.
     pub has_unrecognised_items: bool,
+    /// File-scope pragmas can alter every function in the module.
+    has_module_pragma: bool,
 }
 
 /// Whether a module can be split into per-kernel sub-modules.
@@ -459,20 +465,25 @@ struct ModuleLevelItems {
     func_decls: Vec<FuncDecl>,
     file_directives: Vec<Range<usize>>,
     has_unrecognised: bool,
+    has_module_pragma: bool,
+    has_unindexed_shared: bool,
 }
 
-fn find_module_level_items(text: &[u8], header_end: usize, func_ranges: &[(Range<usize>, bool)]) -> ModuleLevelItems {
+fn find_module_level_items(text: &[u8], header_end: usize, func_defs: &[FuncDef]) -> ModuleLevelItems {
     let mut result = ModuleLevelItems {
         vars: Vec::new(),
         func_decls: Vec::new(),
         file_directives: Vec::new(),
         has_unrecognised: false,
+        has_module_pragma: false,
+        has_unindexed_shared: false,
     };
 
     // Build gap ranges: regions not covered by any function definition.
     let mut gaps = Vec::new();
     let mut cursor = header_end;
-    for (range, _is_def) in func_ranges {
+    for func in func_defs {
+        let range = &func.range;
         if range.start > cursor {
             gaps.push(cursor..range.start);
         }
@@ -568,14 +579,28 @@ fn find_module_level_items(text: &[u8], header_end: usize, func_ranges: &[(Range
                     at += 1;
                 }
                 let decl_text = std::str::from_utf8(&text[start..at]).unwrap_or("");
-                let persistent = after.starts_with(b".global") || after.starts_with(b".const");
+                let shared = after.starts_with(b".shared");
+                let linkage = if has_visible || has_extern || after.starts_with(b".common") {
+                    Linkage::External
+                } else if has_weak {
+                    Linkage::Weak
+                } else {
+                    Linkage::Private
+                };
+                // The scanner records one name per declaration. Never infer shared-memory
+                // bindings from a variable list or a declaration it could not finish.
+                if shared && (decl_text.contains(',') || !decl_text.trim_end().ends_with(';')) {
+                    result.has_unindexed_shared = true;
+                }
                 if let Some(name) = extract_variable_name(decl_text) {
                     result.vars.push(VarDecl {
                         range: start..at,
                         name,
-                        visible: has_visible,
-                        persistent,
+                        linkage,
+                        persistent: !shared,
                     });
+                } else if shared {
+                    result.has_unindexed_shared = true;
                 }
                 continue;
             }
@@ -612,7 +637,7 @@ fn find_module_level_items(text: &[u8], header_end: usize, func_ranges: &[(Range
             // signatures when the gap covers the region between the .entry keyword and {) and are safe.
             if text[at..gap.end].starts_with(b".section")
                 || text[at..gap.end].starts_with(b".loc ")
-                || text[at..gap.end].starts_with(b".pragma ")
+                || (rest.starts_with(b".pragma") && rest.get(7).is_some_and(u8::is_ascii_whitespace))
                 || text[at..gap.end].starts_with(b".param ")
                 || text[at..gap.end].starts_with(b".reg ")
                 || text[at..gap.end].starts_with(b".maxntid")
@@ -654,6 +679,39 @@ fn find_module_level_items(text: &[u8], header_end: usize, func_ranges: &[(Range
         }
     }
 
+    // PTX directives need not start on a new line. The header and debug parsers consume
+    // whole lines, so check for link-relevant tokens they might have skipped (e.g. a
+    // .shared definition after .address_size or .file). Function bodies stay unexamined.
+    let mut covered: Vec<_> = func_defs
+        .iter()
+        .map(|f| &f.range)
+        .chain(result.vars.iter().map(|v| &v.range))
+        .chain(result.func_decls.iter().map(|f| &f.range))
+        .collect();
+    covered.sort_unstable_by_key(|r| r.start);
+    let mut start = 0;
+    for range in covered.into_iter().chain(std::iter::once(&(text.len()..text.len()))) {
+        let mut at = start;
+        while at < range.start {
+            if text[at] == b'"' {
+                at = scan::skip_string(text, at);
+            } else if is_name_byte(text[at]) {
+                let token = at;
+                at += 1;
+                while at < range.start && is_name_byte(text[at]) {
+                    at += 1;
+                }
+                match &text[token..at] {
+                    b".pragma" => result.has_module_pragma = true,
+                    b".shared" => result.has_unindexed_shared = true,
+                    _ => {}
+                }
+            } else {
+                at += 1;
+            }
+        }
+        start = start.max(range.end);
+    }
     result
 }
 
@@ -772,6 +830,88 @@ fn entry_references_var_static(
     false
 }
 
+/// Locate definitions and module-level declarations without analysing any instructions.
+fn module_structure(text_str: &str) -> (usize, Vec<FuncDef>, Vec<String>, ModuleLevelItems) {
+    let text = text_str.as_bytes();
+    let header_end = find_header_end(text);
+
+    let mut func_defs = Vec::new();
+    let mut entries = Vec::new();
+
+    crate::visit_functions(text, |directive, func| {
+        let name = text_str[func.name.clone()].to_string();
+        let body = func.body.clone();
+
+        let def_start = find_def_start(text, directive);
+        let def_end = func.body.end;
+        let def_end = if def_end < text.len() && text[def_end] == b'\n' {
+            def_end + 1
+        } else {
+            def_end
+        };
+
+        let is_entry = func.entry;
+
+        func_defs.push(FuncDef {
+            range: def_start..def_end,
+            name: name.clone(),
+            body,
+            is_entry,
+        });
+
+        if is_entry {
+            entries.push(name);
+        }
+    });
+
+    let module_items = find_module_level_items(text, header_end, &func_defs);
+    (header_end, func_defs, entries, module_items)
+}
+
+/// Link-visible variables across *all* the objects of a device link. Only identical weak
+/// shared definitions may be materialized in an isolated kernel.
+#[derive(Default)]
+pub struct LinkedShared {
+    definitions: HashMap<String, Option<Vec<u8>>>,
+}
+
+impl LinkedShared {
+    /// Return this object's entry names while recording the declarations that could bind
+    /// another object's shared symbol. Leave unrecognised module structure to the linker.
+    pub fn add_object(&mut self, source: &[u8]) -> Option<Vec<String>> {
+        let source_text = std::str::from_utf8(source).ok()?;
+        let blanked = source_text.contains('/').then(|| scan::blank_comments(source_text));
+        let (_, _, entries, items) = module_structure(blanked.as_deref().unwrap_or(source_text));
+        if items.has_unrecognised || items.has_unindexed_shared {
+            return None;
+        }
+        for var in items.vars {
+            if var.linkage == Linkage::Private {
+                continue;
+            }
+            let weak = (!var.persistent && var.linkage == Linkage::Weak).then(|| source[var.range].trim_ascii());
+            self.definitions
+                .entry(var.name)
+                .and_modify(|existing| {
+                    if existing.as_deref() != weak {
+                        *existing = None;
+                    }
+                })
+                .or_insert_with(|| weak.map(<[u8]>::to_vec));
+        }
+        Some(entries)
+    }
+
+    fn allows(&self, var: &VarDecl) -> bool {
+        !var.persistent
+            && match var.linkage {
+                Linkage::Private => true,
+                Linkage::Weak => matches!(self.definitions.get(&var.name), Some(Some(_))),
+                Linkage::External => false,
+            }
+    }
+}
+
 impl ModuleInfo {
     /// Analyse a PTX module. The text should be the full module content (already lowered for Volta
     /// if needed).
@@ -781,44 +921,7 @@ impl ModuleInfo {
         let source_text = std::str::from_utf8(source).unwrap_or("");
         let blanked = source_text.contains('/').then(|| scan::blank_comments(source_text));
         let text_str = blanked.as_deref().unwrap_or(source_text);
-        let text = text_str.as_bytes();
-        let header_end = find_header_end(text);
-
-        let mut func_defs = Vec::new();
-        let mut entries = Vec::new();
-
-        let mut func_ranges = Vec::new();
-
-        crate::visit_functions(text, |directive, func| {
-            let name = text_str[func.name.clone()].to_string();
-            let body = func.body.clone();
-
-            let def_start = find_def_start(text, directive);
-            let def_end = func.body.end;
-            let def_end = if def_end < text.len() && text[def_end] == b'\n' {
-                def_end + 1
-            } else {
-                def_end
-            };
-
-            let is_entry = func.entry;
-
-            func_defs.push(FuncDef {
-                range: def_start..def_end,
-                name: name.clone(),
-                body,
-                is_entry,
-            });
-            func_ranges.push((def_start..def_end, true));
-
-            if is_entry {
-                entries.push(name);
-            }
-        });
-
-        func_ranges.sort_by_key(|r| r.0.start);
-
-        let module_items = find_module_level_items(text, header_end, &func_ranges);
+        let (header_end, func_defs, entries, module_items) = module_structure(text_str);
         let variables = module_items.vars;
         let func_decls = module_items.func_decls;
         let file_directives = module_items.file_directives;
@@ -917,6 +1020,7 @@ impl ModuleInfo {
             loaded_vars,
             persistent_names,
             has_unrecognised_items,
+            has_module_pragma: module_items.has_module_pragma,
         }
     }
 
@@ -924,6 +1028,11 @@ impl ModuleInfo {
     /// per-entry classification, a module is "splittable" if at least one entry is independent.
     /// Dependent entries come from the whole module (materialized once).
     pub fn splittable(&self) -> Splittable {
+        if self.has_module_pragma {
+            return Splittable::No {
+                reason: "module-level pragma".into(),
+            };
+        }
         if self.entries.len() <= 1 {
             return Splittable::Yes;
         }
@@ -1008,6 +1117,9 @@ impl ModuleInfo {
     /// An independent entry compiles on demand in its own sub-module (with any message strings
     /// duplicated). A dependent entry comes from the whole module (materialized once).
     pub fn is_entry_independent(&self, entry: &str) -> bool {
+        if self.has_module_pragma {
+            return false;
+        }
         let vars = self.transitive_vars(entry);
         let persistent_refs: Vec<&String> = vars.iter().filter(|v| self.persistent_names.contains(*v)).collect();
         if persistent_refs.is_empty() {
@@ -1022,14 +1134,33 @@ impl ModuleInfo {
     /// Extract a leaf kernel from a relocatable object. A call (including an indirect call),
     /// an address of a device function, or a reference to persistent storage can depend on the
     /// complete linked image. Leave all of those to the device linker.
-    pub fn extract_linked_leaf(&self, name: &str) -> Option<Vec<u8>> {
+    pub fn extract_linked_leaf(&self, name: &str, shared: &LinkedShared) -> Option<Vec<u8>> {
+        self.linked_leaf(name, shared)?;
+        self.extract(name)
+    }
+
+    /// Compare weak definitions by their complete executable PTX. The returned bytes include
+    /// the module header, entry declaration and body, and every referenced per-block variable.
+    /// Module-wide file and debug string tables accompany the selected definition when emitted.
+    pub fn weak_leaf_definition(&self, name: &str, shared: &LinkedShared) -> Option<Vec<u8>> {
+        let entry = self.linked_leaf(name, shared)?;
+        let (_, weak, _, _) = parse_linkage(&self.text[entry.range.start..entry.body.start]);
+        if !weak {
+            return None;
+        }
+        self.extract_with_debug(name, &[])
+    }
+
+    fn linked_leaf(&self, name: &str, shared: &LinkedShared) -> Option<&FuncDef> {
         let entry = self.func_defs.iter().find(|f| f.is_entry && f.name == name)?;
         if self.has_unrecognised_items
+            || self.has_module_pragma
             || self.func_refs.get(name).is_some_and(|refs| !refs.is_empty())
-            || self
-                .var_refs
-                .get(name)
-                .is_some_and(|vars| !vars.is_disjoint(&self.persistent_names))
+            || self.var_refs.get(name).is_some_and(|refs| {
+                self.variables
+                    .iter()
+                    .any(|v| refs.contains(&v.name) && !shared.allows(v))
+            })
             || scan::items(&self.text, entry.body.clone())?.iter().any(|item| {
                 matches!(&item.kind, scan::Kind::Statement { opcode, .. }
                     if self.text[opcode.clone()].split(|&b| b == b'.').next() == Some(b"call"))
@@ -1037,7 +1168,7 @@ impl ModuleInfo {
         {
             return None;
         }
-        self.extract(name)
+        Some(entry)
     }
 
     /// A persistent variable qualifies as a message string if its address only flows into the
@@ -1088,21 +1219,20 @@ impl ModuleInfo {
     /// Extract a sub-module containing only the named entry function and its dependencies.
     /// Returns `None` if the entry function is not in this module.
     pub fn extract(&self, entry_name: &str) -> Option<Vec<u8>> {
-        if !self.entries.contains(&entry_name.to_string()) {
+        self.extract_with_debug(entry_name, &self.file_directives)
+    }
+
+    fn extract_with_debug(&self, entry_name: &str, debug_directives: &[Range<usize>]) -> Option<Vec<u8>> {
+        if self.has_module_pragma || !self.entries.contains(&entry_name.to_string()) {
             return None;
         }
 
         let needed_funcs = self.transitive_callees(entry_name);
         let needed_vars = self.transitive_vars(entry_name);
 
-        let mut out = Vec::with_capacity(self.text.len() / 2);
-
-        // Emit the header.
-        out.extend_from_slice(&self.text[self.header.clone()]);
-
         // A declaration or definition used as an initializer must precede that initializer.
         // Keep the original relative order of all selected items.
-        let mut ranges: Vec<_> = self.file_directives.iter().collect();
+        let mut ranges: Vec<_> = debug_directives.iter().collect();
         for var in &self.variables {
             if needed_vars.contains(&var.name) {
                 ranges.push(&var.range);
@@ -1119,6 +1249,8 @@ impl ModuleInfo {
             }
         }
         ranges.sort_unstable_by_key(|range| range.start);
+        let mut out = Vec::with_capacity(self.header.len() + ranges.iter().map(|r| r.len()).sum::<usize>());
+        out.extend_from_slice(&self.text[self.header.clone()]);
         for range in ranges {
             out.extend_from_slice(&self.text[range.clone()]);
         }
@@ -1332,6 +1464,136 @@ mod tests {
     use super::*;
 
     #[test]
+    fn duplicate_weak_leaves_match_the_executable_and_keep_their_debug_info() {
+        fn module(linkage: &str, storage: &str, size: u32, value: u32, file: &str) -> ModuleInfo {
+            let text = format!(
+                ".version 8.0\n.target sm_70\n.address_size 64\n\
+                 .file 1 \"{file}\"\n.weak {storage} .align 4 .b8 scratch[{size}];\n\
+                 {linkage} .entry project(.param .u64 output) {{\n\
+                 .reg .b32 a; .loc 1 3 0\n\
+                 mov.u32 a, {value}; st.shared.b32 [scratch], a; ret;\n}}\n"
+            );
+            ModuleInfo::analyse(text.as_bytes())
+        }
+        let first = module(".weak", ".shared", 8, 4, "first.cu");
+        let second = module(".weak", ".shared", 8, 4, "second.cu");
+        let mut shared = LinkedShared::default();
+        shared.add_object(&first.text).unwrap();
+        shared.add_object(&second.text).unwrap();
+        let key = first.weak_leaf_definition("project", &shared).unwrap();
+        assert_eq!(second.weak_leaf_definition("project", &shared).unwrap(), key);
+        let emitted = String::from_utf8(first.extract_linked_leaf("project", &shared).unwrap()).unwrap();
+        assert!(emitted.contains("first.cu") && emitted.contains(".loc 1 3 0"));
+        assert_ne!(
+            module(".weak", ".shared", 8, 5, "first.cu")
+                .weak_leaf_definition("project", &shared)
+                .unwrap(),
+            key
+        );
+        assert!(
+            module(".visible", ".shared", 8, 4, "first.cu")
+                .weak_leaf_definition("project", &shared)
+                .is_none()
+        );
+        assert!(
+            module(".weak", ".global", 8, 4, "first.cu")
+                .weak_leaf_definition("project", &shared)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shared_bindings_include_objects_without_the_entry() {
+        fn object(linkage: &str, alignment: u32, bytes: u32, entry: &str) -> String {
+            format!(
+                ".version 8.0\n.target sm_70\n.address_size 64\n\
+                     {linkage} .shared .align {alignment} .b8 scratch[{bytes}];\n\
+                     .weak .entry {entry}() {{ .reg .b32 r; ld.shared.b32 r, [scratch]; ret; }}\n"
+            )
+        }
+        let weak = object(".weak", 4, 8, "project");
+        let module = ModuleInfo::analyse(weak.as_bytes());
+        for (linkage, align, bytes, allowed) in [
+            (".weak", 4, 8, true),
+            ("", 128, 16, true), // A different object's private storage cannot bind ours.
+            (".visible", 4, 8, false),
+            (".extern", 4, 8, false),
+            (".weak", 128, 8, false),
+            (".weak", 4, 16, false),
+        ] {
+            let other = object(linkage, align, bytes, "other");
+            for inputs in [
+                vec![&weak, &other],        // The unique entry case.
+                vec![&weak, &weak, &other], // A third object defines a different entry.
+                vec![&other, &weak, &weak], // Binding must be safe in either order.
+            ] {
+                let mut shared = LinkedShared::default();
+                for input in inputs {
+                    shared.add_object(input.as_bytes()).unwrap();
+                }
+                assert_eq!(module.extract_linked_leaf("project", &shared).is_some(), allowed);
+                assert_eq!(module.weak_leaf_definition("project", &shared).is_some(), allowed);
+            }
+        }
+        let private = object("", 4, 8, "project");
+        let strong = object(".visible", 4, 8, "other");
+        let mut shared = LinkedShared::default();
+        shared.add_object(private.as_bytes()).unwrap();
+        shared.add_object(strong.as_bytes()).unwrap();
+        assert!(
+            ModuleInfo::analyse(private.as_bytes())
+                .extract_linked_leaf("project", &shared)
+                .is_some()
+        );
+        assert!(
+            ModuleInfo::analyse(strong.as_bytes())
+                .extract_linked_leaf("other", &shared)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn module_pragmas_require_the_linker_and_function_pragmas_stay_with_the_leaf() {
+        let header = ".version 8.0\n.target sm_70\n.address_size 64\n";
+        let kernel = ".weak .entry k() { .pragma \"nounroll\"; ret; }\n";
+        let source = format!("{header}{kernel}");
+        let mut shared = LinkedShared::default();
+        shared.add_object(source.as_bytes()).unwrap();
+        let module = ModuleInfo::analyse(source.as_bytes());
+        assert_eq!(module.extract_linked_leaf("k", &shared).unwrap(), source.as_bytes());
+        for source in [
+            format!("{header}.pragma \"nounroll\";\n{kernel}"),
+            format!("{header}{kernel}.pragma\t\"nounroll\";\n"),
+            format!("{header}.file 1 \"f.cu\" .pragma \"nounroll\";\n{kernel}"),
+        ] {
+            let module = ModuleInfo::analyse(source.as_bytes());
+            assert!(module.has_module_pragma);
+            assert!(!module.has_unrecognised_items);
+            assert!(!module.is_entry_independent("k"));
+            assert!(module.extract("k").is_none());
+            assert!(module.weak_leaf_definition("k", &shared).is_none());
+            assert!(module.extract_linked_leaf("k", &shared).is_none());
+            assert!(LinkedShared::default().add_object(source.as_bytes()).is_some());
+        }
+    }
+
+    #[test]
+    fn same_line_shared_declarations_cannot_escape_the_index() {
+        for directive in [".address_size 64", ".file 1 \".shared and .pragma inside a filename\""] {
+            let shared = format!(".version 8.0\n.target sm_70\n{directive} .visible .shared .b8 scratch[8];\n");
+            assert!(LinkedShared::default().add_object(shared.as_bytes()).is_none());
+        }
+        let filename = b".version 8.0\n.target sm_70\n.file 1 \".shared and .pragma\"\n.visible .entry k() { ret; }\n";
+        let mut shared = LinkedShared::default();
+        shared.add_object(filename).unwrap();
+        assert!(
+            ModuleInfo::analyse(filename)
+                .extract_linked_leaf("k", &shared)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn linked_leaf_keeps_nvcc_line_info_and_defers_calls_and_globals() {
         let source = br#".version 8.8
 .target sm_70
@@ -1360,10 +1622,12 @@ $str:
 }
 "#;
         let info = super::ModuleInfo::analyse(source);
-        let text = String::from_utf8(info.extract_linked_leaf("leaf").unwrap()).unwrap();
+        let mut shared = LinkedShared::default();
+        shared.add_object(source).unwrap();
+        let text = String::from_utf8(info.extract_linked_leaf("leaf", &shared).unwrap()).unwrap();
         assert!(text.contains(".file\t1") && text.contains(".debug_str") && text.contains("$str:"));
         for dependent in ["direct", "indirect", "shared_value", "missing"] {
-            assert!(info.extract_linked_leaf(dependent).is_none(), "{dependent}");
+            assert!(info.extract_linked_leaf(dependent, &shared).is_none(), "{dependent}");
         }
     }
 
@@ -1389,6 +1653,7 @@ $str:
             br#".version 8.0
 .target sm_70
 .address_size 64
+.pragma "nounroll";
 .func %private_helper() { trap; } .visible
 .func $Library() { call %private_helper, (); ret; }
 .visible .global .u64 table = $Library;
@@ -1704,7 +1969,10 @@ $str:
         let var_names: Vec<&str> = info.variables.iter().map(|v| v.name.as_str()).collect();
         assert!(var_names.contains(&"vis_var"), "vis_var not found: {var_names:?}");
         assert!(var_names.contains(&"weak_var"), "weak_var not found: {var_names:?}");
-        assert!(info.variables.iter().find(|v| v.name == "vis_var").unwrap().visible);
+        assert_eq!(
+            info.variables.iter().find(|v| v.name == "vis_var").unwrap().linkage,
+            Linkage::External
+        );
     }
 
     #[test]
