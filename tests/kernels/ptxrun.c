@@ -1,9 +1,9 @@
-// ptxrun: load one PTX module through the CUDA driver API, launch one kernel of it with one warp,
+// ptxrun: load one PTX module through the CUDA driver API, launch one kernel of it with one block,
 // and compare what each lane stored with the words given.
 //
-// usage: ptxrun [-d ORDINAL] MODULE.ptx KERNEL WORD0 [WORD1 [WORD2 [WORD3]]]
+// usage: ptxrun [-d ORDINAL] [-t THREADS] MODULE.ptx KERNEL WORD0 [WORD1 [WORD2 [WORD3]]]
 //
-// The kernel takes one parameter, the address of 32 * 16 bytes (zero when it starts), of which
+// The kernel takes one parameter, the address of THREADS * 16 bytes (zero when it starts), of which
 // each lane writes its own 16 (lane * 16). WORDn: what every lane must have as its word n, in
 // hexadecimal, or `-` for a word that is not looked at. Environment: DRVRUN_LIBCUDA (library to
 // load, default libcuda.so.1).
@@ -56,13 +56,21 @@ static const char* ename(CUresult r) {
 }
 #define CK(call) do { CUresult r_ = (call); if (r_) { printf("FAIL %s -> %d %s\n", #call, r_, ename(r_)); exit(1); } } while (0)
 
-enum { LANES = 32, WORDS = 4 };
+enum { WORDS = 4 };
 
 int main(int argc, char** argv) {
     int ordinal = 0, arg = 1;
     if (arg + 1 < argc && !strcmp(argv[arg], "-d")) { ordinal = atoi(argv[arg + 1]); arg += 2; }
+    int threads = 32;
+    if (arg + 1 < argc && !strcmp(argv[arg], "-t")) {
+        char* end;
+        long n = strtol(argv[arg + 1], &end, 10);
+        if (*end || n < 1 || n > 1024) { fprintf(stderr, "invalid block size\n"); return 2; }
+        threads = (int)n;
+        arg += 2;
+    }
     if (argc - arg < 3 || argc - arg > 2 + WORDS) {
-        fprintf(stderr, "usage: ptxrun [-d ORDINAL] MODULE.ptx KERNEL WORD0 [WORD1 [WORD2 [WORD3]]]\n");
+        fprintf(stderr, "usage: ptxrun [-d ORDINAL] [-t THREADS] MODULE.ptx KERNEL WORD0 [WORD1 [WORD2 [WORD3]]]\n");
         return 2;
     }
     const char *path = argv[arg], *kernel = argv[arg + 1];
@@ -106,23 +114,23 @@ int main(int argc, char** argv) {
     CK(cuModuleGetFunction(&function, module, kernel));
 
     CUdeviceptr out;
-    CK(cuMemAlloc_v2(&out, LANES * WORDS * 4));
-    CK(cuMemsetD8_v2(out, 0, LANES * WORDS * 4));
+    CK(cuMemAlloc_v2(&out, threads * WORDS * 4));
+    CK(cuMemsetD8_v2(out, 0, threads * WORDS * 4));
     void* args[1] = {&out};
-    CK(cuLaunchKernel(function, 1, 1, 1, LANES, 1, 1, 0, NULL, args, NULL));
+    CK(cuLaunchKernel(function, 1, 1, 1, threads, 1, 1, 0, NULL, args, NULL));
     CK(cuCtxSynchronize());
-    static uint32_t got[LANES][WORDS];
+    uint32_t got[threads][WORDS];
     CK(cuMemcpyDtoH_v2(got, out, sizeof got));
 
     int wrong = 0;
-    for (int lane = 0; lane < LANES; lane++) {
+    for (int lane = 0; lane < threads; lane++) {
         int bad = 0;
         for (int w = 0; w < WORDS; w++) bad |= looked[w] && got[lane][w] != want[w];
         if (bad && wrong++ < 4)
             printf("  lane %2d: %08x %08x %08x %08x\n", lane, got[lane][0], got[lane][1], got[lane][2], got[lane][3]);
     }
     printf("%s %s of %s: %d of %d lanes as expected (lane 0: %08x %08x %08x %08x)\n", wrong ? "FAIL" : "PASS", kernel,
-           path, LANES - wrong, LANES, got[0][0], got[0][1], got[0][2], got[0][3]);
+           path, threads - wrong, threads, got[0][0], got[0][1], got[0][2], got[0][3]);
     cuCtxDestroy_v2(context);
     return wrong != 0;
 }

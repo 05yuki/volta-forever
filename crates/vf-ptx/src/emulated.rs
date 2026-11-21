@@ -133,6 +133,8 @@ pub fn count_emulated(body: &[u8]) -> EmulatedCounts {
             &mut counts.ldmatrix
         } else if opcode.starts_with("movmatrix.") {
             &mut counts.movmatrix
+        } else if opcode.starts_with("mbarrier.") || opcode.starts_with("cp.async.mbarrier.") {
+            &mut counts.other
         } else if opcode.starts_with("cp.async.") {
             // The group instructions wait for nothing once the copies are synchronous.
             if matches!(

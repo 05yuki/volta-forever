@@ -72,6 +72,11 @@ drv fatbin-with-sm70 "$W/crates/vf-fatbin/tests/data/elf70-elf75-ptx70-lz4.fatbi
 drv ptx-tanh "$G/k_tanh.135.sm75.fast.ptx" "PTX for sm_75 retargeted \(1 module, 1 tanh expanded\)" "tanhk +ok"
 tc tensor-core "$G/k_tensor.135.sm75.ptx" "PTX for sm_75 retargeted \(1 module, 106 tensor-core instructions rewritten\)" "37 kernels, 0 wrong"
 tc chains "$G/k_chains.135.sm75.ptx" "PTX for sm_75 retargeted \(1 module, 77 tensor-core instructions rewritten\)" "7 kernels, 0 wrong"
+log=$out/logs/cta-mbarrier.log
+DRVRUN_LIBCUDA=$proxy/libcuda.so.1 VF_LOG_LEVEL=2 "$out/bin/ptxrun" -t 256 "$G/ptx-cases/cta-mbarrier.ptx" k 0 28 >"$log" 2>&1
+DRVRUN_LIBCUDA=$proxy/libcuda.so.1 VF_LOG_LEVEL=2 "$out/bin/ptxrun" -t 1 "$G/ptx-cases/cta-mbarrier.ptx" counts 0 108 >>"$log" 2>&1
+check cta-mbarrier "256 of 256 lanes as expected" "1 of 1 lanes as expected"
+
 # Kernels that exist as PTX text only (tests/kernels/ptx-cases): four products
 # on accumulators that hold 1.0, after a scope that declares their family again and sets its own
 # registers to zero (33 in every register: 32 until 2026-11-19, the 1.0 was lost), the same with

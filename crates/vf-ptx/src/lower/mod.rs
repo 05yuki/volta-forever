@@ -106,6 +106,7 @@ macro_rules! emit {
     }};
 }
 
+mod barrier;
 mod body;
 mod convert;
 mod lane;
@@ -199,14 +200,7 @@ const LATER_PARTS: &[&str] = &["::cluster"];
 const LATER_TYPES: &[&str] = &[".bf16", ".tf32", ".e4m3", ".e5m2", ".e2m1", ".ue8m0", ".ue4m3"];
 
 /// First words of opcodes: clusters of blocks, barriers in memory, tensor maps, multicast memory.
-const LATER_OPCODES: &[&str] = &[
-    "mapa",
-    "getctarank",
-    "mbarrier",
-    "clusterlaunchcontrol",
-    "tensormap",
-    "multimem",
-];
+const LATER_OPCODES: &[&str] = &["mapa", "getctarank", "clusterlaunchcontrol", "tensormap", "multimem"];
 
 /// Beginnings of opcodes whose first word is also that of instructions Volta has.
 const LATER_PREFIXES: &[&str] = &[

@@ -315,8 +315,8 @@ fn refuses_the_instructions_of_later_targets_it_has_no_sequence_for() {
             "ld.shared::cluster.L2::cache_hint.u32: no Volta sequence for this form",
         ),
         (
-            "mbarrier.init.shared::cta.b64 [%r1], %r2;",
-            "mbarrier.init.shared::cta.b64: no Volta sequence for this form",
+            "mbarrier.arrive_drop.shared::cta.b64 %rd0, [%r1];",
+            "mbarrier.arrive_drop.shared::cta.b64: no Volta sequence for this form",
         ),
         (
             "fence.proxy.async.shared::cta;",
@@ -3125,5 +3125,37 @@ fn regression_ptx_integer_radices_in_sizes_and_offsets() {
             .replace("16, 8;", "020, 0B1000U;"),
     ] {
         assert_eq!(lower(&encoded), expected);
+    }
+}
+
+#[test]
+fn cta_barriers_preserve_guards_and_separate_the_immutable_count_from_progress() {
+    let body = lower(
+        "{ .reg .pred p; .reg .b32 r; .reg .b64 token; .shared .align 8 .b64 gates[3];
+           @p mbarrier.init.shared::cta.b64 [gates+010], 5;
+           @!p cp.async.mbarrier.arrive.noinc.shared.b64 [gates+010];
+           @p mbarrier.arrive.shared.b64 token, [gates+010];
+           @p mbarrier.test_wait.parity.shared.b64 p, [gates+010], r; }",
+    );
+    assert!(body.contains("@p st.shared.u32 [gates+12], 5;"));
+    assert!(body.contains("@!p atom.acq_rel.cta.shared.inc.u32"));
+    assert!(body.contains("@p atom.acq_rel.cta.shared.inc.u32"));
+    assert!(body.contains("@p mov.b64 token,"));
+    assert!(body.contains("@p ld.acquire.cta.shared.u32"));
+    assert!(body.contains("@p setp.ne.u32 p,"));
+}
+
+#[test]
+fn other_barrier_operations_refuse_the_whole_body() {
+    for instruction in [
+        "mbarrier.arrive_drop.shared.b64 token, [r]",
+        "mbarrier.arrive.expect_tx.shared.b64 token, [r], 16",
+        "mbarrier.test_wait.shared.b64 p, [r], token",
+        "mbarrier.test_wait.parity.shared::cluster.b64 p, [r], 0",
+        "cp.async.mbarrier.arrive.shared.b64 [r]",
+        "cp.async.bulk.global.shared::cta.bulk_group [r], [s], 16",
+    ] {
+        let body = format!("{{ mbarrier.init.shared.b64 [r], 5; {instruction}; }}");
+        assert!(refusal(&body).starts_with(instruction.split_whitespace().next().unwrap()));
     }
 }

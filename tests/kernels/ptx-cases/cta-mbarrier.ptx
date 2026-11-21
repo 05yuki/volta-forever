@@ -1,0 +1,129 @@
+.version 7.8
+.target sm_80
+.address_size 64
+
+// One 256-thread block, 40 distinct exchanges, no CTA-wide synchronization after initialization.
+// All threads copy then arrive on full. Each warp leader signals empty once its readers finish.
+// The verifier reads the value written by a different warp on every exchange.
+.visible .entry k(.param .u64 output)
+{
+    .reg .u32 tid, phase, round, errors, value, expected, writer, source, index, address, recv, limit;
+    .reg .u64 out, own, ptr, delta, token;
+    .reg .pred first, leader, ready, bad;
+    .shared .align 8 .b64 gates[2];
+    .shared .align 4 .u32 payload[256];
+
+    ld.param.u64 out, [output];
+    mov.u32 tid, %tid.x;
+    mul.wide.u32 delta, tid, 16;
+    add.u64 own, out, delta;
+    add.u32 value, tid, 1700;
+    st.global.u32 [own], value;
+    setp.eq.u32 first, tid, 0;
+    @first mbarrier.init.shared.b64 [gates], 256;
+    @first mbarrier.init.shared.b64 [gates+8], 8;
+    bar.sync 0;
+
+    and.b32 index, tid, 31;
+    setp.eq.u32 leader, index, 0;
+    mov.u32 address, payload;
+    mad.lo.u32 address, tid, 4, address;
+    xor.b32 writer, tid, 32;
+    mov.u32 recv, payload;
+    mad.lo.u32 recv, writer, 4, recv;
+    mov.u32 round, 0;
+    mov.u32 errors, 0;
+
+next:
+    add.u32 source, tid, round;
+    and.b32 source, source, 255;
+    mul.wide.u32 delta, source, 16;
+    add.u64 ptr, out, delta;
+    cp.async.ca.shared.global [address], [ptr], 4;
+    cp.async.mbarrier.arrive.noinc.shared.b64 [gates];
+    and.b32 phase, round, 1;
+    mov.u32 limit, 1000000;
+await_full:
+    mbarrier.test_wait.parity.shared.b64 ready, [gates], phase;
+    @ready bra read_data;
+    sub.u32 limit, limit, 1;
+    setp.ne.u32 bad, limit, 0;
+    @bad bra await_full;
+    bra timeout;
+read_data:
+    ld.shared.u32 value, [recv];
+    add.u32 expected, writer, round;
+    and.b32 expected, expected, 255;
+    add.u32 expected, expected, 1700;
+    setp.ne.u32 bad, value, expected;
+    @bad add.u32 errors, errors, 1;
+    bar.warp.sync 0xffffffff;
+    @leader mbarrier.arrive.shared.b64 token, [gates+8];
+    mov.u32 limit, 1000000;
+await_empty:
+    mbarrier.test_wait.parity.shared::cta.b64 ready, [gates+8], phase;
+    @ready bra done_reading;
+    sub.u32 limit, limit, 1;
+    setp.ne.u32 bad, limit, 0;
+    @bad bra await_empty;
+    bra timeout;
+done_reading:
+    add.u32 round, round, 1;
+    setp.lt.u32 bad, round, 40;
+    @bad bra next;
+    st.global.u32 [own], errors;
+    st.global.u32 [own+4], round;
+    ret;
+timeout:
+    st.global.u32 [own], 0xffffffff;
+    st.global.u32 [own+4], round;
+    ret;
+}
+
+// One thread. Explicitly examine the incomplete and complete phase around each arrival,
+// including the first and the last arrivals of odd-sized, non-power-of-two phases.
+.visible .entry counts(.param .u64 output)
+{
+    .reg .u32 group, count, addr, round, phase, pending, errors, checks;
+    .reg .u64 out, token;
+    .reg .pred p, ready;
+    .shared .align 8 .b64 gates[3];
+
+    ld.param.u64 out, [output];
+    mov.u32 group, 0;
+    mov.u32 errors, 0;
+    mov.u32 checks, 0;
+group_start:
+    setp.eq.u32 p, group, 1;
+    selp.u32 count, 3, 17, p;
+    setp.eq.u32 p, group, 0;
+    selp.u32 count, 1, count, p;
+    mov.u32 addr, gates;
+    mad.lo.u32 addr, group, 8, addr;
+    mbarrier.init.shared.b64 [addr], count;
+    bar.sync 0;
+    mov.u32 round, 0;
+phase_start:
+    mov.u32 pending, count;
+    and.b32 phase, round, 1;
+arrive_one:
+    mbarrier.test_wait.parity.shared.b64 ready, [addr], phase;
+    @ready add.u32 errors, errors, 1;
+    mbarrier.arrive.shared.b64 token, [addr];
+    add.u32 checks, checks, 1;
+    sub.u32 pending, pending, 1;
+    setp.ne.u32 p, pending, 0;
+    @p bra arrive_one;
+    mbarrier.test_wait.parity.shared.b64 ready, [addr], phase;
+    @!ready add.u32 errors, errors, 1;
+    add.u32 checks, checks, 1;
+    add.u32 round, round, 1;
+    setp.lt.u32 p, round, 11;
+    @p bra phase_start;
+    add.u32 group, group, 1;
+    setp.lt.u32 p, group, 3;
+    @p bra group_start;
+    st.global.u32 [out], errors;
+    st.global.u32 [out+4], checks;
+    ret;
+}

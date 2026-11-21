@@ -142,7 +142,9 @@ pub(super) fn is_plain(opcode: &str) -> bool {
     if is_tensor(opcode) {
         return false;
     }
-    opcode.starts_with("griddepcontrol.")
+    opcode.starts_with("mbarrier.")
+        || opcode.starts_with("cp.async.mbarrier.")
+        || opcode.starts_with("griddepcontrol.")
         || opcode.starts_with("redux.sync.")
         || opcode.starts_with("createpolicy.")
         || opcode.contains(".relu.")

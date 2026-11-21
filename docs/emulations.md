@@ -603,6 +603,7 @@ The reference vectors are in `tests/kernels/blackwell/ref_scaled/`.
 
 | Instruction | On Volta |
 |---|---|
+| `mbarrier.init.shared.b64`, `mbarrier.arrive.shared.b64`, `mbarrier.test_wait.parity.shared.b64`, `cp.async.mbarrier.arrive.noinc.shared.b64` | A fixed arrival count and a wrapping, CTA-scoped atomic counter in the original 8-byte shared object. An acquire load checks the phase. Each synchronous copy finishes before its arrival. `.shared::cta` is also accepted. |
 | `cp.async.ca.shared.global [dst], [src], size` | A plain load from global memory and a store to shared memory. `cp.async.commit_group` and `cp.async.wait_group` become no-ops (the copies are synchronous). |
 | `ld.global.v8.b32` (256-bit load) | Two `ld.global.v4.b32` (128-bit loads). The second half is loaded first when the base register is a destination of the first half. |
 | `st.global.v4.b64` (256-bit store) | Two `st.global.v2.b64` (128-bit stores). |
@@ -624,9 +625,8 @@ that function are refused when the program asks for them. The refusal names the 
 the reason (on the console and in the error returned to the program, error 218).
 
 **Instructions without a sequence** (from the PTX census of NVIDIA's libraries): clusters
-of blocks (`barrier.cluster`, `mapa`, `getctarank`), barriers in memory (`mbarrier`),
-tensor maps (`tensormap`), multicast memory (`multimem`), and `stmatrix`. All are
-instructions of Hopper (sm_90) or later that have no meaningful equivalent on Volta.
+of blocks (`barrier.cluster`, `mapa`, `getctarank`), barrier operations with transactions or changing counts (`mbarrier.expect_tx`, `mbarrier.arrive_drop`),
+tensor maps (`tensormap`), multicast memory (`multimem`), and `stmatrix`. These forms are refused on Volta.
 
 **What the driver's compiler refuses.** The lowering rewrites or traps the instructions it
 knows. The driver may still refuse what remains: a function whose compiler error is

@@ -59,7 +59,9 @@ impl<'a> Body<'a> {
             operands.to_string()
         };
         let operands = operands.as_str();
-        if words[0] == "griddepcontrol" {
+        if words[0] == "mbarrier" || opcode.starts_with("cp.async.mbarrier.") {
+            self.cta_barrier(&guard, &words, &parts)?;
+        } else if words[0] == "griddepcontrol" {
             // Waits for, or releases, kernels launched as dependent on one another: without such
             // launches, which this GPU's driver does not have, there is nothing to wait for.
             self.nothing(followed);
