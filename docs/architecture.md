@@ -505,6 +505,7 @@ below by purpose. For the full reference with defaults, see `INSTALL.md`.
 | `VF_TRITON_PTXAS` | Path to NVIDIA’s `ptxas`. When set, the launcher configures Triton to keep the original PTX alongside the compiled cubin, so VF can adapt kernels targeting newer GPUs. Requires the CUDA toolkit’s `fatbinary` next to `ptxas`, in `$CUDA_HOME/bin` or on `PATH`. |
 | `VF_CAPABILITY` | Compute capability reported to callers without Volta code (e.g. `8.0`). The code taken from a program is then the code for that capability. |
 | `VF_FIT` | `0`: a launch that the driver refuses for registers is refused to the program. |
+| `VF_FIT_SHARED` | `1`: if a V100 rejects an oversized dynamic shared-memory opt-in, retry the setter at the device limit minus the kernel’s static shared memory. Kernel launches still have to fit. |
 
 ### Cache
 

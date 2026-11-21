@@ -315,6 +315,13 @@ fit second-translation "" "37 checks, 0 wrong" \
     "fit: k_fit_regs: blocks of 1024 threads take more registers than there are with the usual translation" \
     "fit: k_fit_reads_global is not launched from a second translation: it can reach data of its module"
 VF_FIT=0 fit second-translation-off -x "37 checks, 0 wrong"
+VF_FIT_SHARED=1 fit second-translation-shared -s "37 checks, 0 wrong"
+gcc -O2 -Wall -I"$T/cuda-13.5.0/include" "$G/fit_shared.c" -L"$proxy" -l:libcuda.so.1 -o "$out/bin/fit_shared" || exit 2
+for mode in 0 1; do
+    log="$out/logs/fit-shared-$mode.log"
+    VF_FIT_SHARED="$mode" LD_LIBRARY_PATH="$proxy${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$out/bin/fit_shared" >"$log" 2>&1
+    check "fit-shared-$mode" "shared opt-in checks passed"
+done
 
 # Proxy cache: a second run with a warm cache must skip adaptation and analysis and give the same
 # results, including the same refused kernels and the same emulation warnings.

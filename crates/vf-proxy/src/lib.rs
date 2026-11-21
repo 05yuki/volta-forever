@@ -84,6 +84,8 @@ pub struct Config {
     /// Whether to retry a launch that fails with 701 using a second translation within the
     /// register budget (`VF_FIT`, default on).
     pub fit: bool,
+    /// Retry oversized dynamic shared-memory opt-ins at the physical V100 limit.
+    pub fit_shared: bool,
     /// How many kernels with emulated instructions are listed on the console before the following
     /// are only counted (0: none, and no summary).
     pub emulation_warnings: usize,
@@ -112,6 +114,7 @@ pub fn config() -> &'static Config {
             stats: var("VF_STATS").is_some_and(|v| v != "0"),
             trace_launch: var("VF_TRACE_LAUNCH").is_some_and(|v| v != "0"),
             fit: var("VF_FIT").is_none_or(|v| v != "0"),
+            fit_shared: var("VF_FIT_SHARED").as_deref() == Some("1"),
             policy,
             emulation_warnings: var("VF_EMULATION_WARNINGS").and_then(|v| v.parse().ok()).unwrap_or(20),
             timing: var("VF_TIMING").is_some_and(|v| v != "0"),

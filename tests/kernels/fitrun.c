@@ -1,6 +1,6 @@
 // fitrun: the test of the second translation at launch (docs/architecture.md, "Launch"), through the driver API alone.
 //
-// usage: fitrun [-d ORDINAL] [-x] [-t LAUNCHES] k_fit_test.135.sm75.cubin
+// usage: fitrun [-d ORDINAL] [-x] [-s] [-t LAUNCHES] k_fit_test.135.sm75.cubin
 //
 // The kernels of k_fit_test.cu declare 64 registers; the layer's usual translation for sm_70 takes
 // more, and the driver refuses a block of 1,024 threads of it (CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES).
@@ -174,14 +174,16 @@ static void buffers(void) {
 }
 
 int main(int argc, char** argv) {
+    int requested_shared = 4 * WORDS, expected_shared = 4 * WORDS;
     int ordinal = 0, timed = 0, a = 1;
     for (; a < argc && argv[a][0] == '-'; a++) {
         if (!strcmp(argv[a], "-d") && a + 1 < argc) ordinal = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-t") && a + 1 < argc) timed = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-x")) expect_refusal = 1;
-        else { fprintf(stderr, "usage: fitrun [-d ORDINAL] [-x] [-t LAUNCHES] k_fit_test.135.sm75.cubin\n"); return 2; }
+        else if (!strcmp(argv[a], "-s")) { requested_shared = 101376; expected_shared = 98304; }
+        else { fprintf(stderr, "usage: fitrun [-d ORDINAL] [-x] [-s] [-t LAUNCHES] k_fit_test.135.sm75.cubin\n"); return 2; }
     }
-    if (a + 1 != argc) { fprintf(stderr, "usage: fitrun [-d ORDINAL] [-x] [-t LAUNCHES] k_fit_test.135.sm75.cubin\n"); return 2; }
+    if (a + 1 != argc) { fprintf(stderr, "usage: fitrun [-d ORDINAL] [-x] [-s] [-t LAUNCHES] k_fit_test.135.sm75.cubin\n"); return 2; }
     FILE* f = fopen(argv[a], "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", argv[a]); return 2; }
     fseek(f, 0, SEEK_END); size_t size = ftell(f); fseek(f, 0, SEEK_SET);
@@ -260,12 +262,12 @@ int main(int argc, char** argv) {
     CHECK(cuLibraryGetKernel(&shared_kernel, library, "k_fit_shared"));
     run("64 kB of shared memory without the attribute, function of a module", shared_function, 1024, 4 * WORDS, -1);
     run("64 kB of shared memory without the attribute, kernel of a library", (CUfunction)shared_kernel, 1024, 4 * WORDS, -1);
-    CHECK(cuFuncSetAttribute(shared_function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 4 * WORDS));
-    CHECK(cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 4 * WORDS, shared_kernel, device));
+    CHECK(cuFuncSetAttribute(shared_function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, requested_shared));
+    CHECK(cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, requested_shared, shared_kernel, device));
     int value = -1;
     CHECK(cuKernelGetAttribute(&value, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_kernel, device));
     checks++;
-    if (value != 4 * WORDS) { wrong++; printf("WRONG  the attribute read back from the library's kernel: %d, set to %d\n", value, 4 * WORDS); }
+    if (value != expected_shared) { wrong++; printf("WRONG  the attribute read back from the library's kernel: %d, set to %d\n", value, expected_shared); }
     else printf("ok     the attribute read back from the library's kernel: %d\n", value);
     run("64 kB of shared memory with the attribute, function of a module", shared_function, 256, 4 * WORDS, 0);
     run("64 kB of shared memory with the attribute, function of a module", shared_function, 1024, 4 * WORDS, expect_refusal ? OUT_OF_RESOURCES : 0);
@@ -454,7 +456,7 @@ int main(int argc, char** argv) {
     {
         CUkernel shared_k;
         CHECK(cuLibraryGetKernel(&shared_k, library, "k_fit_shared"));
-        CHECK(cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 4 * WORDS, shared_k, device));
+        CHECK(cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, requested_shared, shared_k, device));
         CUmodule lib_module;
         CHECK(cuLibraryGetModule(&lib_module, library));
         CUfunction shared_f;

@@ -63,6 +63,7 @@ use crate::{REALS, idx, log};
 
 type CUresult = c_int;
 const CUDA_SUCCESS: CUresult = 0;
+const CUDA_ERROR_INVALID_VALUE: CUresult = 1;
 /// `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`.
 pub const OUT_OF_RESOURCES: CUresult = 701;
 
@@ -395,17 +396,90 @@ pub fn asked_for_data(module: usize) {
 
 /// The program sets `attribute` on `kernel`: `set` is the driver's own call, made here so that
 /// it, what is remembered of it and its copy on the second kernel are one step (`ATTR_ORDER`).
-/// What the driver answered is returned as it is.
-pub fn set_attribute(kernel: usize, attribute: Attribute, set: impl FnOnce() -> CUresult) -> CUresult {
-    if !enabled() {
-        return set();
+pub fn set_attribute(kernel: usize, mut attribute: Attribute, set: impl FnOnce() -> CUresult) -> CUresult {
+    let fit = enabled();
+    let fit_shared = crate::config().fit_shared;
+    let _order = (fit || fit_shared).then(|| ATTR_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut result = set();
+    if result == CUDA_ERROR_INVALID_VALUE
+        && fit_shared
+        && let Some(reduced) = fitted_shared_attribute(kernel, attribute)
+        && set_on_driver(kernel, reduced) == CUDA_SUCCESS
+    {
+        log::info(format_args!(
+            "fit: driver accepted {reduced:?} in place of {attribute:?} on V100"
+        ));
+        attribute = reduced;
+        result = CUDA_SUCCESS;
     }
-    let _order = ATTR_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-    let result = set();
-    if result == CUDA_SUCCESS {
+    if fit && result == CUDA_SUCCESS {
         record_attribute(kernel, attribute);
     }
     result
+}
+
+/// The driver's opt-in limit includes both the kernel's static shared allocation and the dynamic
+/// bytes supplied at launch. All queries use the physical driver, including the device identity.
+fn fitted_shared_attribute(kernel: usize, attribute: Attribute) -> Option<Attribute> {
+    const MAX_DYNAMIC: c_int = 8;
+    const STATIC_SHARED: c_int = 1;
+    const OPT_IN_LIMIT: c_int = 97;
+    let (requested, device) = match attribute {
+        Attribute::Function(MAX_DYNAMIC, value) if value > 0 => (value, current_device()?),
+        Attribute::Kernel(MAX_DYNAMIC, value, device) if value > 0 => (value, device),
+        _ => return None,
+    };
+    // The real entry points have these CUDA driver ABI signatures.
+    let capability: unsafe extern "C" fn(*mut c_int, *mut c_int, c_int) -> CUresult =
+        unsafe { std::mem::transmute(REALS[idx::cuDeviceComputeCapability].load(Relaxed)) };
+    let (mut major, mut minor) = (0, 0);
+    if unsafe { capability(&mut major, &mut minor, device) } != CUDA_SUCCESS || (major, minor) != (7, 0) {
+        return None;
+    }
+    let name: unsafe extern "C" fn(*mut std::ffi::c_char, c_int, c_int) -> CUresult =
+        unsafe { std::mem::transmute(REALS[idx::cuDeviceGetName].load(Relaxed)) };
+    let mut bytes = [0u8; 256];
+    if unsafe { name(bytes.as_mut_ptr().cast(), bytes.len() as c_int, device) } != CUDA_SUCCESS {
+        return None;
+    }
+    let name = std::ffi::CStr::from_bytes_until_nul(&bytes).ok()?.to_bytes();
+    if !name
+        .split(|b| !b.is_ascii_alphanumeric())
+        .any(|part| part == b"V100" || part == b"V100S")
+    {
+        return None;
+    }
+    let device_attr: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> CUresult =
+        unsafe { std::mem::transmute(REALS[idx::cuDeviceGetAttribute].load(Relaxed)) };
+    let mut limit = 0;
+    if unsafe { device_attr(&mut limit, OPT_IN_LIMIT, device) } != CUDA_SUCCESS || limit <= 0 {
+        return None;
+    }
+    let mut static_bytes = 0;
+    let handle = kernel as *mut c_void;
+    let query = match attribute {
+        Attribute::Function(_, _) => {
+            let get: unsafe extern "C" fn(*mut c_int, c_int, *mut c_void) -> CUresult =
+                unsafe { std::mem::transmute(REALS[idx::cuFuncGetAttribute].load(Relaxed)) };
+            unsafe { get(&mut static_bytes, STATIC_SHARED, handle) }
+        }
+        _ => {
+            let get: unsafe extern "C" fn(*mut c_int, c_int, *mut c_void, c_int) -> CUresult =
+                unsafe { std::mem::transmute(REALS[idx::cuKernelGetAttribute].load(Relaxed)) };
+            unsafe { get(&mut static_bytes, STATIC_SHARED, handle, device) }
+        }
+    };
+    if query != CUDA_SUCCESS || !(0..=limit).contains(&static_bytes) {
+        return None;
+    }
+    let available = limit - static_bytes;
+    if requested <= available {
+        return None;
+    }
+    Some(match attribute {
+        Attribute::Function(_, _) => Attribute::Function(MAX_DYNAMIC, available),
+        _ => Attribute::Kernel(MAX_DYNAMIC, available, device),
+    })
 }
 
 /// The driver accepted `attribute` on `kernel` (under `ATTR_ORDER`).
@@ -817,11 +891,11 @@ fn kernel_of(second: usize, name: &str, library: bool) -> Option<usize> {
     Some(kernel as usize)
 }
 
-/// Set on the second translation's kernel what the program set on its own.
-fn apply(second: usize, attribute: Attribute) {
-    let kernel = second as *mut c_void;
+/// Set the attribute through the original CUDA entry point, without re-entering these hooks.
+fn set_on_driver(handle: usize, attribute: Attribute) -> CUresult {
+    let kernel = handle as *mut c_void;
     let real = |index: usize| REALS[index].load(Relaxed);
-    let result = match attribute {
+    match attribute {
         Attribute::Function(attribute, value) => {
             let set: unsafe extern "C" fn(*mut c_void, c_int, c_int) -> CUresult =
                 unsafe { std::mem::transmute(real(idx::cuFuncSetAttribute)) };
@@ -842,7 +916,12 @@ fn apply(second: usize, attribute: Attribute) {
                 unsafe { std::mem::transmute(real(idx::cuKernelSetCacheConfig)) };
             unsafe { set(kernel, config, device) }
         }
-    };
+    }
+}
+
+/// Replay a setting on the second translation.
+fn apply(second: usize, attribute: Attribute) {
+    let result = set_on_driver(second, attribute);
     if result != CUDA_SUCCESS {
         log::info(format_args!(
             "fit: {attribute:?} was not taken by the second translation's kernel (error {result})"
