@@ -60,6 +60,20 @@ A program's other CUDA 13 libraries (the cuFFT, cuSOLVER and cuSPARSE of a PyTor
 translated like the rest of its code. `vf fetch --all` downloads their CUDA 12.9.2 builds too
 (2.7 GB in all), which still have code for Volta, and the layer then uses those instead.
 
+### Running Ampere PTX on a V100 (`sm_80`)
+
+To select a program's Ampere kernels, have `vf` report compute capability 8.0 to the program:
+
+```sh
+VF_CAPABILITY=8.0 vf ./my_program
+```
+
+The program must include compatible PTX that `vf` can adapt for Volta (`sm_70`). A binary
+that contains only compiled `sm_80` machine code (a cubin) cannot run this way.
+
+On a V100 with this setting, ZML reported capability 8.0 and answered the test prompt with
+the expected word using Qwen3.5-9B. [Validation results](docs/validation.md#vllm-sglang-zml).
+
 ### With pip and virtual environments
 
 Nothing changes for pip: install the ordinary wheels for CUDA 13, they bring their own CUDA
