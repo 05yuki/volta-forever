@@ -126,7 +126,19 @@ impl<'a> Body<'a> {
             emit!(self, "shl.b32 {bits}, {bits}, 16;");
             self.written(d);
             emit!(self, "{guard}mov.b32 {d}, {bits};");
-        } else if let ["cvt", "rn", "f16x2", kind @ ("e4m3x2" | "e5m2x2")] = words[..]
+        } else if let ["cvt", "rn", "f16", "bf16"] = words[..] {
+            let [d, a] = parts[..] else {
+                return Err(unsupported("operands not recognised"));
+            };
+            let widened = self.bf16_to_f32(a);
+            self.written(d);
+            emit!(self, "{guard}cvt.rn.f16.f32 {d}, {widened};");
+        } else if let [
+            "cvt",
+            "rn",
+            destination @ ("f16x2" | "bf16x2"),
+            kind @ ("e4m3x2" | "e5m2x2"),
+        ] = words[..]
             && let Some(kind) = Fp8::named(kind)
         {
             // Exact: every FP8 value is a half. The upper byte gives the upper half.
@@ -136,8 +148,22 @@ impl<'a> Body<'a> {
             let pair = self.fresh();
             emit!(self, "cvt.u32.u16 {pair}, {a};");
             let halves = self.fp8_pair(kind, &pair);
-            self.written(d);
-            emit!(self, "{guard}mov.b32 {d}, {halves};");
+            if destination == "f16x2" {
+                self.written(d);
+                emit!(self, "{guard}mov.b32 {d}, {halves};");
+            } else {
+                // All finite FP8 values are exactly representable in both f16 and bf16.
+                let (lo, hi) = (self.fresh_half(), self.fresh_half());
+                let [low, high]: [String; 2] = self.fresh_n();
+                emit!(self, "mov.b32 {{{lo}, {hi}}}, {halves};");
+                emit!(self, "cvt.f32.f16 {low}, {lo};");
+                emit!(self, "cvt.f32.f16 {high}, {hi};");
+                let low = self.bf16("rz", &low);
+                let high = self.bf16("rz", &high);
+                emit!(self, "shl.b32 {high}, {high}, 16;");
+                self.written(d);
+                emit!(self, "{guard}or.b32 {d}, {high}, {low};");
+            }
         } else if let [
             "cvt",
             "rn",
@@ -273,17 +299,17 @@ impl<'a> Body<'a> {
             let bits = self.bf16("rn", &sum);
             self.written(d);
             emit!(self, "{guard}cvt.u16.u32 {d}, {bits};");
-        } else if let ["add", "bf16x2"] = words[..] {
+        } else if let [op @ ("add" | "sub"), "bf16x2"] | [op @ ("add" | "sub"), "rn", "bf16x2"] = words[..] {
             let [d, a, b] = parts[..] else {
                 return Err(unsupported("operands not recognised"));
             };
             let (a_hi, a_lo) = self.bf16x2_to_f32(a);
             let (b_hi, b_lo) = self.bf16x2_to_f32(b);
-            let [sum_hi, sum_lo]: [String; 2] = self.fresh_n();
-            emit!(self, "add.rn.f32 {sum_hi}, {a_hi}, {b_hi};");
-            emit!(self, "add.rn.f32 {sum_lo}, {a_lo}, {b_lo};");
-            let hi_bits = self.bf16("rn", &sum_hi);
-            let lo_bits = self.bf16("rn", &sum_lo);
+            let [high, low]: [String; 2] = self.fresh_n();
+            emit!(self, "{op}.rn.f32 {high}, {a_hi}, {b_hi};");
+            emit!(self, "{op}.rn.f32 {low}, {a_lo}, {b_lo};");
+            let hi_bits = self.bf16("rn", &high);
+            let lo_bits = self.bf16("rn", &low);
             emit!(self, "shl.b32 {hi_bits}, {hi_bits}, 16;");
             self.written(d);
             emit!(self, "{guard}or.b32 {d}, {hi_bits}, {lo_bits};");

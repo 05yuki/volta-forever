@@ -275,9 +275,12 @@ bf16 x bf16 has at most 14 significant bits, well within f32).
 |---|---|
 | `neg.bf16` | Flip the sign bit |
 | `add.bf16`, `add.bf16x2` | Operands as f32 (a shift), `add.rn.f32`, rounded to bf16 |
+| `sub{.rn}.bf16x2` | Subtract each pair of widened f32 operands and round each result to bf16 |
 | `mul.bf16` | Same with `mul.rn.f32` |
 | `fma.rn.bf16`, `fma.rn.bf16x2` | Rounded to odd in f32 first (from `fma.rm.f32` and `fma.rp.f32`), then to bf16 |
 | `cvt.rn.bf16.f64` | f32 rounded to odd (from `cvt.rm.f32.f64` and `cvt.rp.f32.f64`), then to bf16 |
+| `cvt.rn.f16.bf16` | Widen exactly to f32, then round to f16 |
+| `cvt.rn.bf16x2.e4m3x2`, `cvt.rn.bf16x2.e5m2x2` | Decode each FP8 byte through an exact f16 intermediate, then pack both bf16 values |
 | `setp.<cmp>.bf16` | Comparison of the two f32 |
 | `set.<cmp>.bf16x2.bf16x2` | Two comparisons, 1.0 or 0.0 as bf16 in each half |
 

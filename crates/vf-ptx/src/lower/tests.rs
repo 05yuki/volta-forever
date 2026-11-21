@@ -2286,6 +2286,19 @@ fn bf16_instructions_that_remain_refused() {
 }
 
 #[test]
+fn ninfer_packed_bf16_weights() {
+    let source = "{\n\t.reg .b16 %h<3>;\n\t.reg .b32 %r<4>;\n\t.reg .pred %p;\n\
+                  \tcvt.rn.bf16x2.e4m3x2 %r0, %h0;\n\tcvt.rn.bf16x2.e5m2x2 %r1, %h1;\n\
+                  \t@%p sub.rn.bf16x2 %r0, %r0, %r1;\n\tcvt.rn.f16.bf16 %h2, %h1;\n\tret;\n}";
+    let text = lower(source);
+    assert_eq!(count(&text, "sub.rn.f32 "), 2);
+    assert!(text.contains("@%p or.b32 %r0,"));
+    assert!(text.contains("cvt.rn.f16.f32 %h2,"));
+    assert!(!text.contains(".bf16"));
+    assert_eq!(undeclared(&text), Vec::<String>::new());
+}
+
+#[test]
 fn block_scaled_mma_is_lowered() {
     // kind::mxf4 (E2M1 operands, UE8M0 scale, scale_vec::2X, m16n8k64).
     let mxf4 = lower(
