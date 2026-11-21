@@ -1,0 +1,36 @@
+.version 8.8
+.target sm_100
+.address_size 64
+
+.visible .entry k(.param .u64 output) .reqntid 32,1,1
+{
+    .reg .b16 %nan, %neg_tiny, %zero;
+    .reg .pred %a, %b, %c, %no;
+    .reg .b32 %r<4>, %lane;
+    .reg .b64 %out;
+
+    mov.b32 %r0, 0xc0400000;
+    max.f32 %r0, 0fFF800000, 0f7FC00000, %r0;
+    min.f32 %r1, 0f00000000, 0f80000000, 0f7FC10000;
+    max.ftz.f32 %r2, 0f00000001, 0f80000002, 0f80000000;
+
+    mov.b16 %nan, 0x7fa5;
+    mov.b16 %neg_tiny, 0x8001;
+    mov.b16 %zero, 0;
+    setp.leu.bf16 %a, %nan, %zero;
+    setp.lt.bf16 %b, %neg_tiny, %zero;
+    setp.num.bf16 %c, %nan, %zero;
+    setp.nan.and.bf16 %c, %zero, %nan, !%c;
+    mov.u32 %lane, %laneid;
+    setp.ge.u32 %no, %lane, 32;
+    @%no setp.lt.bf16 %a, %zero, %zero;
+    selp.u32 %r3, 1, 0, %a;
+    @%b or.b32 %r3, %r3, 2;
+    @%c or.b32 %r3, %r3, 4;
+    setp.le.bf16 %a, %nan, %zero;
+    @!%a or.b32 %r3, %r3, 8;
+    ld.param.u64 %out, [output];
+    mad.wide.u32 %out, %lane, 16, %out;
+    st.global.v4.b32 [%out], {%r0,%r1,%r2,%r3};
+    ret;
+}

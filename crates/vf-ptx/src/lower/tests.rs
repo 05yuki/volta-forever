@@ -2382,6 +2382,38 @@ fn xla_bf16_arithmetic_and_three_input_max() {
 }
 
 #[test]
+fn three_input_fp32_bounds_preserve_the_guard_and_destination_alias() {
+    for opcode in ["min.f32", "max.f32", "min.ftz.f32", "max.ftz.f32"] {
+        let input = format!("{{\n.reg .f32 %f<4>;\n.reg .pred %p;\n@%p {opcode} %f0, %f1, %f2, %f0;\n}}");
+        let text = lower(&input);
+        assert_eq!(text.matches(opcode).count(), 2);
+        assert!(text.contains(&format!("@%p {opcode} %f0,")));
+        assert!(text.contains(", %f0;"));
+        assert!(undeclared(&text).is_empty());
+        let native = format!("{{\n.reg .f32 %f<3>;\n{opcode} %f0, %f1, %f2;\n}}");
+        assert_eq!(lower(&native), native);
+    }
+}
+
+#[test]
+fn unordered_bf16_predicates_preserve_boolean_operands() {
+    for cmp in ["equ", "neu", "ltu", "leu", "gtu", "geu", "num", "nan"] {
+        for (boolean, extra) in [("", ""), (".and", ", !%p2"), (".or", ", %p2"), (".xor", ", %p2")] {
+            let input = format!(
+                "{{\n.reg .b16 %h<2>;\n.reg .pred %p<3>;\n@%p0 setp.{cmp}{boolean}.bf16 %p1, %h0, %h1{extra};\n}}"
+            );
+            let text = lower(&input);
+            let compare = text
+                .lines()
+                .find(|line| line.contains(&format!("@%p0 setp.{cmp}{boolean}.f32 %p1,")))
+                .unwrap();
+            assert!(compare.ends_with(&format!("{extra};")));
+            assert!(undeclared(&text).is_empty());
+        }
+    }
+}
+
+#[test]
 fn xla_nan_reductions_and_bf16_bounds() {
     let text = lower(
         "{\n\t.reg .b16 %h<3>;\n\t.reg .b32 %r<2>;\n\t.reg .pred %p;\n\

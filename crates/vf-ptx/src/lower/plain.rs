@@ -95,6 +95,14 @@ impl<'a> Body<'a> {
             let d = parts[0];
             self.written(d);
             emit!(self, "{guard}mov.b64 {d}, {{{}, {}}};", results[0], results[1]);
+        } else if matches!(opcode, "min.f32" | "max.f32" | "min.ftz.f32" | "max.ftz.f32") {
+            let [d, a, b, c] = parts[..] else {
+                return Err(unsupported("operands not recognised"));
+            };
+            let pair = self.fresh();
+            emit!(self, "{opcode} {pair}, {a}, {b};");
+            self.written(d);
+            emit!(self, "{guard}{opcode} {d}, {pair}, {c};");
         } else if let ["min" | "max", "relu", "s32"] = words[..] {
             let [d, a, b] = parts[..] else {
                 return Err(unsupported("operands not recognised"));
@@ -412,15 +420,25 @@ impl<'a> Body<'a> {
             let bits = self.bf16("rn", &f32_val);
             self.written(d);
             emit!(self, "{guard}cvt.u16.u32 {d}, {bits};");
-        } else if let ["setp", cmp @ ("eq" | "ne" | "lt" | "le" | "gt" | "ge"), "bf16"] = words[..] {
-            // Compare two bf16 values by widening to f32 (exact) and comparing.
-            let [d, a, b] = parts[..] else {
-                return Err(unsupported("operands not recognised"));
+        } else if let [
+            "setp",
+            cmp @ ("eq" | "ne" | "lt" | "le" | "gt" | "ge" | "equ" | "neu" | "ltu" | "leu" | "gtu" | "geu" | "num"
+            | "nan"),
+            ref boolean @ ..,
+            "bf16",
+        ] = words[..]
+        {
+            // Bit-exact widening keeps subnormals, signed zeros and NaNs for ordered and
+            // unordered comparisons. PTX uses the same Boolean operators on f32 predicates.
+            let (d, a, b, suffix, extra) = match (boolean, parts.as_slice()) {
+                ([], &[d, a, b]) => (d, a, b, String::new(), String::new()),
+                ([op @ ("and" | "or" | "xor")], &[d, a, b, c]) => (d, a, b, format!(".{op}"), format!(", {c}")),
+                _ => return Err(unsupported("operands or Boolean operation not recognised")),
             };
             let a_f32 = self.bf16_to_f32(a);
             let b_f32 = self.bf16_to_f32(b);
             self.written(d);
-            emit!(self, "{guard}setp.{cmp}.f32 {d}, {a_f32}, {b_f32};");
+            emit!(self, "{guard}setp.{cmp}{suffix}.f32 {d}, {a_f32}, {b_f32}{extra};");
         } else if let [
             "set",
             cmp @ ("eq" | "ne" | "lt" | "le" | "gt" | "ge"),

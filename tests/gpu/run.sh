@@ -83,6 +83,7 @@ px stmatrix-multi "$G/ptx-cases/stmatrix-multi.ptx" 0 0
 px stmatrix-transposed "$G/ptx-cases/stmatrix-transposed.ptx" 0 0
 
 # Each half of a packed BF16 bound propagates its own NaNs and preserves signed zero.
+px xla-sort-bounds "$G/ptx-cases/xla-sort-bounds.ptx" c0400000 80000000 00000000 0000000f
 px packed-bf16-bounds "$G/ptx-cases/packed-bf16-bounds.ptx" 00000002 80008001 7fff0002 40007fff
 
 # Kernels that exist as PTX text only (tests/kernels/ptx-cases): four products

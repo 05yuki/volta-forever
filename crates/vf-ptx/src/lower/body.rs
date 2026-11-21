@@ -317,7 +317,10 @@ impl<'a> Body<'a> {
                 self.chain_end_touching(operands, product);
             }
         }
-        if is_plain(opcode) {
+        // The two-input FP32 bounds are native. Blackwell also accepts a third input.
+        let three_input_bound = matches!(opcode, "min.f32" | "max.f32" | "min.ftz.f32" | "max.ftz.f32")
+            && scan::split_operands(operands).len() == 4;
+        if is_plain(opcode) || three_input_bound {
             return self.plain(range, opcode, operands, followed);
         }
         if opcode != TANH && !is_tensor(opcode) && !is_later(opcode) {
