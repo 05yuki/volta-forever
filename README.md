@@ -7,9 +7,10 @@ patch, no rebuild. Put two letters in front of your command:
 
 ```sh
 vf python3 -c "import torch; print(torch.cuda.get_device_name())"    # Tesla V100-SXM2-32GB
-vf python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-0.5B-Instruct
 vf llama-completion -m model.gguf -p "Hello" -n 48 -ngl 99
 ```
+
+For a model demo, see the [Ubuntu guides](#inference-engines-on-ubuntu).
 
 What a GPU of 2017 lacks is emulated on what it has: the tensor-core instructions of Turing,
 Ampere and Blackwell, so your V100 now speaks BF16, FP8 and NVFP4.
@@ -95,6 +96,19 @@ rather than an environment: `eval "$(vf env)"`.
 
 `INSTALL.md` has the options, the switches and what the launcher sets, for those who would
 rather set it by hand.
+
+## Inference engines on Ubuntu
+
+Start with Ubuntu 24.04 and a Tesla V100. Each guide checks for the NVIDIA R580 driver, explains which CUDA components the engine needs, and gives commands to install `vf` and test a model.
+
+| Ubuntu guide | Model in the example | V100 result |
+|---|---|---|
+| [vLLM](docs/guides/vllm.md) | Qwen2.5-0.5B-Instruct, FP16 | The local chat API answered “Paris”. |
+| [SGLang](docs/guides/sglang.md) | Qwen2.5-0.5B-Instruct, FP16 | The local chat API answered “Paris” with FlashInfer and the CUDA 13 toolkit. |
+| [FreeToken](docs/guides/freetoken.md) | Qwen3.5-35B-A3B, GGUF Q4_K_M | All 40 expert banks loaded on the V100. The embedding and first expert matched CPU references. A full generation result is pending. |
+| [ZML](docs/guides/zml.md) | Qwen3.5-0.8B | The CUDA example answered “Paris”. The 35B AWQ loader stopped on a missing expert tensor. |
+| [Strata](docs/guides/strata.md) | Qwen 35B, GGUF with an MTP head | The regular Qwen3.5 file lacks the MTP head. The Qwen3.6 MTP file passed the tensor check and stopped at cuBLAS with eager loading. |
+| [NInfer](docs/guides/ninfer.md) | Qwen3.6-35B-A3B, upstream `.ninfer` | The official CLI loaded the real weights. With `VF_CAPABILITY=12.0` and zero-filled weights of the same shape, it processed a 24-token prompt and generated two tokens. |
 
 ## What runs
 
