@@ -53,7 +53,6 @@ total                           9710      9492      6768       49      169      
 REPORT
     echo "0.1.0 test" > "$_d/VERSION"
     # Copy the launcher into bin/.
-    cp "$W/scripts/triton-ptxas.py" "$_d/scripts/"
     cp "$launcher" "$_d/bin/vf"
     chmod +x "$_d/bin/vf"
     ln -s vf "$_d/bin/volta-forever"
@@ -906,25 +905,6 @@ if [ "$_st" != 0 ] && [ -d "$tmp/half-empty" ] && [ -z "$(ls -A "$tmp/half-empty
 else
     fail "$name" "exit $_st; left: $(ls -A "$tmp/half-empty" 2>/dev/null | tr '\n' ' ')"
 fi
-
-# Opt-in PTX retention for Triton and the executable path printed by vf env.
-name="triton-assembler-environment"
-got=$(TRITON_PTXAS_PATH=/original "$vf" --no-audit sh -c 'printf %s "$TRITON_PTXAS_PATH"')
-got_enabled=$(VF_TRITON_PTXAS="/compiler with spaces" "$vf" --no-audit sh -c 'printf %s "$TRITON_PTXAS_PATH"')
-got_blackwell=$(VF_TRITON_PTXAS="/compiler with spaces" "$vf" --no-audit sh -c 'printf %s "$TRITON_PTXAS_BLACKWELL_PATH"')
-got_env=$(unset VF_TRITON_PTXAS TRITON_PTXAS_PATH TRITON_PTXAS_BLACKWELL_PATH
-    eval "$(VF_TRITON_PTXAS="/compiler with spaces" "$vf" env --no-audit)"
-    printf '%s|%s|%s' "$VF_TRITON_PTXAS" "$TRITON_PTXAS_PATH" "$TRITON_PTXAS_BLACKWELL_PATH")
-if [ "$got" = /original ] && [ "$got_enabled" = "$arch/scripts/triton-ptxas.py" ] && [ -x "$got_enabled" ] &&
-   [ "$got_blackwell" = "$got_enabled" ] && [ "$got_env" = "/compiler with spaces|$got_enabled|$got_enabled" ] &&
-   ! "$vf" env --no-audit | grep -q '^export TRITON_PTXAS'; then
-    pass "$name"
-else
-    fail "$name" "$got, $got_enabled, $got_env"
-fi
-
-name="triton-assembler"
-if python3 "$W/tests/launcher/triton-ptxas.py"; then pass "$name"; else fail "$name"; fi
 
 # --- done -----------------------------------------------------------------------
 
