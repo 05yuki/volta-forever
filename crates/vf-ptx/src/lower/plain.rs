@@ -307,6 +307,19 @@ impl<'a> Body<'a> {
             emit!(self, "shr.u32 {result}, {result}, 16;");
             self.written(d);
             emit!(self, "{guard}cvt.u16.u32 {d}, {result};");
+        } else if let [op @ ("max" | "min"), "NaN", "bf16x2"] = words[..] {
+            let [d, a, b] = parts[..] else {
+                return Err(unsupported("operands not recognised"));
+            };
+            let (a_hi, a_lo) = self.bf16x2_to_f32(a);
+            let (b_hi, b_lo) = self.bf16x2_to_f32(b);
+            let [high, low]: [String; 2] = self.fresh_n();
+            let plain = format!("{op}.f32");
+            self.bound(&plain, &high, &a_hi, &b_hi);
+            self.bound(&plain, &low, &a_lo, &b_lo);
+            // Each result is an input bf16 or a canonical NaN. Pack the two high halfwords.
+            self.written(d);
+            emit!(self, "{guard}prmt.b32 {d}, {low}, {high}, 0x7632;");
         } else if let ["abs", "bf16"] = words[..] {
             let [d, a] = parts[..] else {
                 return Err(unsupported("operands not recognised"));

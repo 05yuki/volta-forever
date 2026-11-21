@@ -1,0 +1,26 @@
+.version 7.8
+.target sm_90
+.address_size 64
+
+.visible .entry k(.param .u64 output) .reqntid 32,1,1
+{
+    .reg .b32 %a, %b, %r<4>, %lane;
+    .reg .b64 %out;
+    .reg .pred %p;
+    // Mixed signed zeros, a negative subnormal and a positive subnormal.
+    mov.b32 %a, 0x80008001;
+    mov.b32 %b, 0x00000002;
+    max.NaN.bf16x2 %r0, %a, %b;
+    min.NaN.bf16x2 %r1, %a, %b;
+    mov.b32 %r2, 0xff813f80;
+    mov.b32 %r3, 0x40007fc3;
+    min.NaN.bf16x2 %r2, %r2, %b;
+    max.NaN.bf16x2 %r3, %r3, %a;
+    mov.u32 %lane, %laneid;
+    setp.ge.u32 %p, %lane, 32;
+    @%p min.NaN.bf16x2 %r0, %r2, %r3;
+    ld.param.u64 %out, [output];
+    mad.wide.u32 %out, %lane, 16, %out;
+    st.global.v4.b32 [%out], {%r0,%r1,%r2,%r3};
+    ret;
+}

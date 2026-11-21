@@ -80,6 +80,9 @@ check cta-mbarrier "256 of 256 lanes as expected" "1 of 1 lanes as expected"
 # The x1 warp store uses eight independent row addresses and leaves the padding intact.
 px stmatrix-x1 "$G/ptx-cases/stmatrix-x1.ptx" a9c31357 a9c31357 0
 
+# Each half of a packed BF16 bound propagates its own NaNs and preserves signed zero.
+px packed-bf16-bounds "$G/ptx-cases/packed-bf16-bounds.ptx" 00000002 80008001 7fff0002 40007fff
+
 # Kernels that exist as PTX text only (tests/kernels/ptx-cases): four products
 # on accumulators that hold 1.0, after a scope that declares their family again and sets its own
 # registers to zero (33 in every register: 32 until 2026-11-19, the 1.0 was lost), the same with
