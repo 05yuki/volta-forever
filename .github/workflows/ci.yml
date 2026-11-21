@@ -3,13 +3,15 @@ name: ci
 on:
   push:
   pull_request:
+  release:
+    types: [published]
 
 jobs:
   check:
-    # Everything that needs no GPU and no file of NVIDIA's.
-    runs-on: ubuntu-24.04
+    # Build the installer test binaries on the oldest distribution in the matrix.
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -38,9 +40,20 @@ jobs:
           scripts/fetch-all.sh denvdis
           VF_TOOL=dist/bin/vf-translate JOBS=4 tests/sass/compare.sh
 
+      - name: Prepare the installer test archive from this build
+        if: github.event_name != 'release'
+        run: tests/launcher/installer-fixture.sh "$RUNNER_TEMP/installer-fixture"
+      - uses: actions/upload-artifact@v7
+        if: github.event_name != 'release'
+        with:
+          name: installer-fixture
+          path: ${{ runner.temp }}/installer-fixture/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
   install:
-    # The one-liner of the README in fresh systems, against the release of this tree's version.
-    # Until that release exists the installer is not run, and a notice says so.
+    needs: check
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -52,15 +65,25 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends curl ca-certificates
-      - uses: actions/checkout@v4
-      - name: Install, then run a command through the layer
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        if: github.event_name != 'release'
+        with:
+          name: installer-fixture
+          path: installer-fixture
+      - name: Install and run the installed binaries
         run: |
-          version=$(sed -n 's/^    version=${VF_VERSION:-\(.*\)}$/\1/p' install.sh)
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
           test -n "$version"
-          if ! curl -fsIL -o /dev/null "https://github.com/$GITHUB_REPOSITORY/releases/download/v$version/SHA256SUMS"; then
-              echo "::notice::there is no release v$version yet: install.sh was not run in ${{ matrix.image }}"
-              exit 0
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+              test "$GITHUB_REF_NAME" = "v$version"
+              export VF_INSTALL_BASE="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
+          else
+              export VF_INSTALL_BASE="file://$GITHUB_WORKSPACE/installer-fixture"
           fi
           VF_INSTALL_FETCH=0 sh install.sh
           vf version
           test "$(VF_QUIET=1 vf sh -c 'echo "$VOLTA_FOREVER"')" = "$version"
+          VF_QUIET=1 vf sh -c 'grep -F "$VOLTA_FOREVER_HOME/lib/libvf_audit.so" "/proc/$$/maps" > /dev/null'
+          vf inspect tests/kernels/k_fit_test.135.sm75.cubin > /tmp/vf-inspect.txt
+          grep -F 'cubin for sm_75' /tmp/vf-inspect.txt
