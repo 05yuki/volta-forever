@@ -60,7 +60,7 @@ Download the Q4_K_M text model (20.5 GiB) to a local drive. The following config
 model=Qwen3.5-35B-A3B-Q4_K_M.gguf
 curl -fL -C - -o "$model" "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/$model"
 export PTXAS_OPTIONS='--override-directive-values --maxrregcount=192'
-ft serve --model "$model" --served-model-name qwen --text-model-only \
+ft serve --model "$model" --served-model-name qwen --text-model-only --enable-timings-report \
   --moe-strategy fused --dtype float16 --attn triton --num-tokens 1024 --graph 0
 ```
 
@@ -71,20 +71,32 @@ curl -fsS http://127.0.0.1:1919/v1/chat/completions -H 'Content-Type: applicatio
   -d '{"model":"qwen","messages":[{"role":"user","content":"What is the capital of France? Answer with just the city."}],"temperature":0,"max_tokens":16,"chat_template_kwargs":{"enable_thinking":false}}'
 ```
 
+The V100 returned `Paris` with `finish_reason` set to `stop`.
+
 ## 5. Benchmarks
 
-After the warmup request in step 4, time a second response. Divide its `usage.completion_tokens` by the elapsed seconds to get output tokens/s, including prompt processing and HTTP time.
+Run the streaming client against the server. It sends one warm-up and three different prompts, one at a time, at temperature zero. [Benchmark client and prompts](./benchmarks/)
 
 ```sh
-curl -fsS -w '\n%{time_total} seconds\n' http://127.0.0.1:1919/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"qwen","messages":[{"role":"user","content":"Write a short sentence about Paris."}],"temperature":0,"max_tokens":32,"chat_template_kwargs":{"enable_thinking":false}}'
+mkdir -p ~/freetoken-v100/benchmark && cd ~/freetoken-v100/benchmark
+base=https://raw.githubusercontent.com/nbald/volta-forever/main/docs/guides/benchmarks
+curl -fsSLO "$base/freetoken.py" && curl -fsSLO "$base/prompts.json"
+python3 freetoken.py
 ```
 
-FreeToken placed 18.1 GiB of expert weights across 40 layers on the V100 and reported 9.01 GiB of VRAM free after initialization. Engine warmup then failed on VF 0.1.0 because the Triton prefill kernel `chunk_gated_delta_rule_fwd_kkt_solve_kernel` exceeded the register limit. That run produced no tokens. With VF 0.1.1 and the register limit in step 4, the complete GatedDeltaNet prefill operator matched all 262,144 outputs and 524,288 updated state values from the CPU reference.
+Each measured request read 227 uncached tokens and generated 64. The responses started with the requested cities, Kyoto, Lyon and Lima. Median time to the first token was 328 ms at the server and 335 ms over loopback. [Measurements and generated text](./benchmarks/freetoken-results.json)
+
+| Scheduler phase | Three runs (tokens/s) | Median (tokens/s) |
+| --- | --- | ---: |
+| Prefill | 675.64, 704.55, 705.06 | **704.55** |
+| Decode | 14.09, 14.87, 14.85 | **14.85** |
+
+FreeToken’s `prompt_ms` spans the first prefill batch through the first sampled token. Its `predicted_ms` covers the following 63 tokens. Both exclude time in the request queue. Repeating all four chats on the same server gave medians of 733.68 and 17.08 tokens/s.
+
+On the same V100, native llama.cpp processed the same file and prompts at 468.67 prefill and 99.67 decode tokens/s. These are the comparison targets for FreeToken. The FreeToken measurement above used `--graph 0`. [Reference measurements and commands](./benchmarks/llamacpp-reference.json)
 
 ## 6. Additional notes
 
-Validation used Ubuntu 24.04, volta-forever 0.1.0, FreeToken 0.2.2, PyTorch 2.14.1+cu130 and driver 580.178.04 on a Tesla V100-SXM2-32GB. Four real embedding rows matched the CPU exactly. A separate test ran the first expert's Q4_K gate and up projections, SwiGLU and Q5_K down projection. Its 2,048 outputs matched a CPU reference using the same Q8_1 activation quantization to a relative L2 error of 2.9 × 10⁻⁷.
+Validation used Ubuntu 24.04, VF 0.1.1, FreeToken 0.2.2, PyTorch 2.14.1+cu130 and driver 580.178.04 on a Tesla V100-SXM2-32GB. FreeToken placed 18.1 GiB of expert weights on the GPU. The register limit in step 4 lets its Triton GatedDeltaNet prefill kernel run on Volta. A separate test matched all 262,144 outputs and 524,288 updated state values against a CPU reference.
 
 FreeToken Desktop 0.2.0-beta.27 also rendered its setup screen and model catalog under Xvfb. Desktop is optional for the local inference API. [Desktop download](https://www.flashml.ai/)
