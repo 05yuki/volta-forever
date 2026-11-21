@@ -240,7 +240,7 @@ impl Policy {
     }
 
     /// The driver uses this fat-binary entry on the device.
-    fn usable(&self, entry: &Entry<'_>) -> bool {
+    pub fn usable(&self, entry: &Entry<'_>) -> bool {
         match entry.kind() {
             KIND_ELF => self.runs(entry.sm()),
             KIND_PTX => self.jit_accepts(entry),

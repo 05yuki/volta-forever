@@ -78,6 +78,8 @@ struct LazyLibrary {
     library_values: Vec<usize>,
     /// Entry names with independence flags, for libraries restored from cache.
     cached_entries: Option<Vec<(String, bool)>>,
+    /// For device-linked input, the unique relocatable object that defines each retained kernel.
+    linked_entries: Option<HashMap<String, Option<usize>>>,
     /// Proxy cache key, for saving sub-modules when they are first compiled.
     cache_key: Option<crate::cache::CacheKey>,
     /// The original image bytes, kept on a cache hit so that the fallback path (materialization,
@@ -312,6 +314,7 @@ pub unsafe fn setup(
             None,
             cache_key,
             None, // no original bytes kept: adapted_data already holds the adapted image
+            None,
             jit_options,
             jit_values,
             jit_count,
@@ -395,6 +398,7 @@ pub unsafe fn setup_from_cache(
             Some(cached_entries),
             Some(cache_key),
             Some(original_bytes),
+            None,
             jit_options,
             jit_values,
             jit_count,
@@ -493,7 +497,61 @@ fn build_standin_from_original(original: &[u8]) -> Option<Vec<u8>> {
     Some(b".version 9.0\n.target sm_70\n.address_size 64\n\0".to_vec())
 }
 
-/// Common path for setting up a lazy library from either fresh analysis or cached data.
+/// Set up an image containing separate device-link inputs. Only retained, unambiguous leaf
+/// kernels will be compiled separately. All other lookups use the original wrapper layout.
+///
+/// # Safety
+/// The handle and options are the caller's arguments to cuLibraryLoadData.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn setup_linked(
+    handle: *mut *mut c_void,
+    image: &crate::images::Replacement,
+    jit_options: *mut c_int,
+    jit_values: *mut *mut c_void,
+    jit_count: c_uint,
+    library_options: *mut c_int,
+    library_values: *mut *mut c_void,
+    library_count: c_uint,
+) -> bool {
+    // JIT options and the host universal function/data table can require the complete image on
+    // this very call. The preserved-binary hint alone does not affect the linker's choices.
+    if handle.is_null()
+        || jit_count != 0
+        || (library_count != 0
+            && (library_options.is_null()
+                || unsafe { std::slice::from_raw_parts(library_options, library_count as usize) }
+                    .iter()
+                    .any(|&opt| opt != CU_LIBRARY_BINARY_IS_PRESERVED)))
+    {
+        return false;
+    }
+    let Some(entries) = image.linked_entries() else {
+        return false;
+    };
+    if !entries.values().any(Option::is_some) {
+        return false;
+    }
+    unsafe {
+        setup_common(
+            handle,
+            b".version 8.0\n.target sm_70\n.address_size 64\n",
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            Some(entries),
+            jit_options,
+            jit_values,
+            jit_count,
+            library_options,
+            library_values,
+            library_count,
+        )
+    }
+}
+
+/// Common path for setting up a lazy library from fresh analysis, linked objects, or cached data.
 ///
 /// # Safety
 /// `handle` must be writable.
@@ -506,6 +564,7 @@ unsafe fn setup_common(
     cached_entries: Option<Vec<(String, bool)>>,
     cache_key: Option<crate::cache::CacheKey>,
     original_bytes: Option<Vec<u8>>,
+    linked_entries: Option<HashMap<String, Option<usize>>>,
     jit_options: *mut c_int,
     jit_values: *mut *mut c_void,
     jit_count: c_uint,
@@ -551,9 +610,14 @@ unsafe fn setup_common(
     }
 
     let standin_handle = standin as usize;
-    let entry_count = cached_entries
-        .as_ref()
-        .map_or_else(|| info.as_ref().map_or(0, |i| i.entry_count()), |e| e.len());
+    let entry_count = linked_entries.as_ref().map_or_else(
+        || {
+            cached_entries
+                .as_ref()
+                .map_or_else(|| info.as_ref().map_or(0, |i| i.entry_count()), |e| e.len())
+        },
+        HashMap::len,
+    );
 
     log::info(format_args!(
         "lazy: module with {entry_count} entries deferred (will compile on demand)"
@@ -571,6 +635,7 @@ unsafe fn setup_common(
         library_options: saved_lib_options,
         library_values: saved_lib_values,
         cached_entries,
+        linked_entries,
         cache_key,
         original_bytes,
     };
@@ -863,11 +928,17 @@ pub unsafe fn materialize(library: usize) -> Result<usize, CUresult> {
     lazy_lib.materializing = true;
     let mut adapted_data = lazy_lib.adapted_data.clone();
     let original = lazy_lib.original_bytes.clone();
+    let linked = lazy_lib
+        .linked_entries
+        .as_ref()
+        .and_then(|_| crate::images::retained(library));
     let jit_opts = lazy_lib.jit_options.clone();
     let jit_vals = lazy_lib.jit_values.clone();
     let lib_opts = lazy_lib.library_options.clone();
     let lib_vals = lazy_lib.library_values.clone();
-    let entry_count = if let Some(ref entries) = lazy_lib.cached_entries {
+    let entry_count = if let Some(ref entries) = lazy_lib.linked_entries {
+        entries.len()
+    } else if let Some(ref entries) = lazy_lib.cached_entries {
         entries.len()
     } else if let Some(ref info) = lazy_lib.info {
         info.entry_count()
@@ -890,7 +961,7 @@ pub unsafe fn materialize(library: usize) -> Result<usize, CUresult> {
         }
         drop(libs);
     }
-    if adapted_data.is_empty() {
+    if adapted_data.is_empty() && linked.is_none() {
         log::warn(format_args!("lazy: cannot materialize: no adapted data"));
         let mut libs = mutex.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(lazy_lib) = libs.get_mut(&library) {
@@ -904,12 +975,30 @@ pub unsafe fn materialize(library: usize) -> Result<usize, CUresult> {
 
     // Load the full adapted image outside the lock (the compilation may take seconds).
     // SAFETY: `adapted_data` is the adapted image; the options are those saved from the program's call.
-    let loaded = unsafe { load_whole(adapted_data, &jit_opts, &jit_vals, &lib_opts, &lib_vals) };
+    let loaded = if let Some(image) = linked {
+        // The stand-in owns the wrapper until the materialized library is unloaded.
+        let load = unsafe { load_through_driver(image.as_ptr(), &jit_opts, &jit_vals, &lib_opts, &lib_vals) };
+        if load.code == CUDA_SUCCESS {
+            Ok((load.handle, None, Vec::new()))
+        } else {
+            log::warn(format_args!(
+                "lazy: device link failed (error {}): {}",
+                load.code,
+                first_messages(&load.error_log)
+            ));
+            Err(load.code)
+        }
+    } else {
+        unsafe { load_whole(adapted_data, &jit_opts, &jit_vals, &lib_opts, &lib_vals) }
+            .map(|(handle, data, refused)| (handle, Some(data), refused))
+    };
 
     let mut libs = mutex.lock().unwrap_or_else(|e| e.into_inner());
     let result = match loaded {
         Ok((handle, image, refused)) => {
-            crate::images::keep(handle, crate::images::Replacement::from_vec(image));
+            if let Some(image) = image {
+                crate::images::keep(handle, crate::images::Replacement::from_vec(image));
+            }
             // By the handle the program holds: its lookups are answered from there.
             crate::kernels::describe(library, refused, Vec::new());
             if let Some(lazy_lib) = libs.get_mut(&library) {
@@ -1077,7 +1166,19 @@ pub unsafe fn get_kernel(library: usize, name: *const c_char, kernel: *mut *mut 
 
     // Per-entry classification: independent entries compile on demand, dependent entries come
     // from the materialized whole module.
-    let is_independent = if let Some(ref entries) = lazy_lib.cached_entries {
+    let t_kernel_start = std::time::Instant::now();
+    let linked_leaf = lazy_lib
+        .linked_entries
+        .as_ref()
+        .and_then(|entries| entries.get(&name_str).copied().flatten())
+        .and_then(|index| {
+            let image = crate::images::retained(library)?;
+            let text = image.linked_object_ptx(index)?;
+            ModuleInfo::analyse(&text).extract_linked_leaf(&name_str)
+        });
+    let is_independent = if lazy_lib.linked_entries.is_some() {
+        linked_leaf.is_some()
+    } else if let Some(ref entries) = lazy_lib.cached_entries {
         entries.iter().any(|(n, ind)| n == &name_str && *ind)
     } else if let Some(ref info) = lazy_lib.info {
         info.is_entry_independent(&name_str)
@@ -1095,7 +1196,6 @@ pub unsafe fn get_kernel(library: usize, name: *const c_char, kernel: *mut *mut 
     // Extract the sub-module for this independent kernel: from the proxy cache if available,
     // otherwise from the in-memory analysis.  When neither is available (cache hit path, kernel
     // not cached), adapt the original bytes on demand.
-    let t_kernel_start = std::time::Instant::now();
     let cache_key_clone = lazy_lib
         .cache_key
         .as_ref()
@@ -1106,7 +1206,9 @@ pub unsafe fn get_kernel(library: usize, name: *const c_char, kernel: *mut *mut 
         None
     };
     let from_cache = sub_ptx.is_some();
-    let sub_ptx = sub_ptx.or_else(|| lazy_lib.info.as_ref().and_then(|info| info.extract(&name_str)));
+    let sub_ptx = sub_ptx
+        .or(linked_leaf)
+        .or_else(|| lazy_lib.info.as_ref().and_then(|info| info.extract(&name_str)));
     // Fallback: adapt the original bytes and extract from the fresh analysis.
     let sub_ptx = match sub_ptx {
         Some(ptx) => ptx,

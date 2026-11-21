@@ -219,7 +219,7 @@ impl NewEntry {
     }
 
     /// `entry` with a new uncompressed payload, for architecture `sm`, with content version
-    /// `(major, minor)`. Everything else in the header (kind, option string, variant flags) is kept.
+    /// `(major, minor)`. Architecture-specific and family flags only apply to their original SM.
     pub fn replace(entry: &Entry<'_>, mut payload: Vec<u8>, sm: u32, version: (u16, u16)) -> NewEntry {
         let mut header = entry.header.to_vec();
         if entry.kind() == KIND_PTX {
@@ -231,7 +231,11 @@ impl NewEntry {
         header[0x18..0x1a].copy_from_slice(&version.1.to_le_bytes());
         header[0x1a..0x1c].copy_from_slice(&version.0.to_le_bytes());
         header[0x1c..0x20].copy_from_slice(&sm.to_le_bytes());
-        header[0x28..0x30].copy_from_slice(&(entry.flags() & !FLAGS_COMPRESSION).to_le_bytes());
+        let mut flags = entry.flags() & !FLAGS_COMPRESSION;
+        if sm != entry.sm() {
+            flags &= !(FLAG_VARIANT_A | FLAG_VARIANT_F);
+        }
+        header[0x28..0x30].copy_from_slice(&flags.to_le_bytes());
         header[0x38..0x40].copy_from_slice(&0u64.to_le_bytes());
         NewEntry { header, payload }
     }
@@ -333,6 +337,44 @@ pub fn cubin_len(bytes: &[u8]) -> Option<usize> {
     (end <= CUBIN_MAX).then_some(end as usize)
 }
 
+/// Entry points retained by the device linker in a little-endian 64-bit CUDA ELF.
+/// Borrow the names, so reading a large linked cubin does not copy its code sections.
+pub fn cubin_entries(bytes: &[u8]) -> Option<Vec<&str>> {
+    if bytes.len() < cubin_tables_len(bytes)? || u16_at(bytes, 18) != 190 {
+        return None;
+    }
+    let shoff = u64_at(bytes, 40) as usize;
+    let sections = bytes.get(shoff..shoff + 64 * usize::from(u16_at(bytes, 60)))?;
+    let contents = |section: &[u8]| {
+        let start = usize::try_from(u64_at(section, 24)).ok()?;
+        let size = usize::try_from(u64_at(section, 32)).ok()?;
+        bytes.get(start..start.checked_add(size)?)
+    };
+    let (sections, _) = sections.as_chunks::<64>();
+    let symbols = sections.iter().find(|s| u32_at(*s, 4) == 2)?;
+    if u64_at(symbols, 56) != 24 {
+        return None;
+    }
+    let strings = sections.get(u32_at(symbols, 40) as usize)?;
+    if u32_at(strings, 4) != 3 {
+        return None;
+    }
+    let strings = contents(strings)?;
+    let mut entries = Vec::new();
+    let (symbols, trailing) = contents(symbols)?.as_chunks::<24>();
+    if !trailing.is_empty() {
+        return None;
+    }
+    for symbol in symbols {
+        if symbol[4] & 0xf == 2 && symbol[5] & 0x10 != 0 && u16_at(symbol, 6) != 0 {
+            let name = strings.get(u32_at(symbol, 0) as usize..)?;
+            let end = name.iter().position(|&b| b == 0)?;
+            entries.push(std::str::from_utf8(&name[..end]).ok()?);
+        }
+    }
+    Some(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +428,22 @@ mod tests {
         let elf = fat.entries[0].payload().unwrap();
         assert_eq!(cubin_sm(&elf), Some(75));
         assert_eq!(elf.len(), 18592);
+    }
+
+    #[test]
+    fn reads_only_defined_cuda_entry_symbols() {
+        let fat = parse(ELF75_PTX75_ZSTD).unwrap();
+        let elf = fat.entries[0].payload().unwrap();
+        let mut names = cubin_entries(&elf).unwrap();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["block_sum", "dbl", "half_dot", "histo", "mathk", "saxpy", "warp_sum"]
+        );
+        assert!(cubin_entries(&elf[..63]).is_none());
+        let mut bad = elf.into_owned();
+        bad[18] = 62; // x86-64, not a cubin.
+        assert!(cubin_entries(&bad).is_none());
     }
 
     #[test]
@@ -447,6 +505,25 @@ mod tests {
         );
         assert_eq!(&*ptx.payload().unwrap(), b".version 9.0\n");
         assert_eq!(ptx.stored.len() % 8, 0);
+    }
+
+    #[test]
+    fn retargeting_drops_only_the_source_architecture_variant() {
+        let fat = parse(ELF75_PTX75_ZSTD).unwrap();
+        let original = &fat.entries[1];
+        for variant in [FLAG_VARIANT_A, FLAG_VARIANT_F] {
+            let mut header = original.header.to_vec();
+            let flags = original.flags() | variant;
+            header[0x28..0x30].copy_from_slice(&flags.to_le_bytes());
+            let source = Entry {
+                header: &header,
+                stored: original.stored,
+            };
+            for (target, expected) in [(source.sm(), flags), (70, flags & !variant)] {
+                let bytes = build(&[NewEntry::replace(&source, Vec::new(), target, (9, 0))]);
+                assert_eq!(parse(&bytes).unwrap().entries[0].flags(), expected & !FLAGS_COMPRESSION);
+            }
+        }
     }
 
     #[test]

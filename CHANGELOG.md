@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- CUDA runtime libraries built with separate device compilation can now use their relocatable PTX on Volta. VF compiles independent kernels on demand and preserves cross-object calls when linking the complete library.
 - The PTX translator handles packed BF16 subtraction, packed FP8-to-BF16 conversion and BF16-to-FP16 conversion.
 - vLLM's standard NVML backend now sees the same capability as its CUDA 13 PyTorch runtime under `vf`. Its NVML query reports 7.5 for Volta by default and honors `VF_CAPABILITY`.
 - Under `vf` or `vf venv`, direct CUDA driver clients with no embedded GPU code also see 7.5 on a V100 by default. Direct clients can still read native Volta kernel binary versions. CUDA 12 runtimes keep their previous handling of explicit overrides, and other GPUs retain their physical capabilities.

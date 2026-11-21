@@ -21,7 +21,7 @@ use std::ops::Range;
 use crate::scan;
 
 fn is_name_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'.' | b'@')
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'%' | b'.' | b'@')
 }
 
 /// A module-level variable declaration or definition.
@@ -109,9 +109,9 @@ pub enum Splittable {
 // Body analysis
 // ---------------------------------------------------------------------------
 
-/// Collect identifiers in text that could be references to module-level names. Skips register
-/// names (`%...`), labels (`$L...`), numbers, comments, and strings.
-fn find_referenced_names(text: &str) -> HashSet<String> {
+/// Find references to declared names, skipping numbers, comments and strings. A name beginning
+/// with % may denote a user-defined symbol as well as a register.
+fn find_referenced_names(text: &str, declared: impl Fn(&str) -> bool) -> HashSet<String> {
     let bytes = text.as_bytes();
     let mut names = HashSet::new();
     let mut i = 0;
@@ -134,26 +134,20 @@ fn find_referenced_names(text: &str) -> HashSet<String> {
             }
             continue;
         }
-        if bytes[i] == b'%' {
-            i += 1;
-            while i < bytes.len() && is_name_byte(bytes[i]) {
-                i += 1;
-            }
-            continue;
-        }
         if bytes[i].is_ascii_digit() {
             while i < bytes.len() && is_name_byte(bytes[i]) {
                 i += 1;
             }
             continue;
         }
-        if bytes[i] == b'_' || bytes[i] == b'$' || bytes[i].is_ascii_alphabetic() {
+        if matches!(bytes[i], b'_' | b'$' | b'%') || bytes[i].is_ascii_alphabetic() {
             let start = i;
             while i < bytes.len() && is_name_byte(bytes[i]) {
                 i += 1;
             }
+            // nvcc often uses $L for labels, but a declared symbol can have that prefix too.
             let name = &text[start..i];
-            if !name.starts_with("$L") {
+            if declared(name) {
                 names.insert(name.to_string());
             }
             continue;
@@ -401,7 +395,7 @@ fn extract_variable_name(decl: &str) -> Option<String> {
         if bytes[i] == b'[' || bytes[i] == b'=' || bytes[i] == b';' {
             break;
         }
-        if (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'$')
+        if (bytes[i].is_ascii_alphabetic() || matches!(bytes[i], b'_' | b'$' | b'%'))
             && (i == 0 || !is_name_byte(bytes[i - 1]))
         {
             let start = i;
@@ -501,7 +495,8 @@ fn find_module_level_items(text: &[u8], header_end: usize, func_ranges: &[(Range
             }
 
             // `.file` directive: keep for debug info.
-            if text[at..gap.end].starts_with(b".file ") {
+            let rest = &text[at..gap.end];
+            if rest.starts_with(b".file") && rest.get(5).is_some_and(u8::is_ascii_whitespace) {
                 let start = at;
                 while at < gap.end && text[at] != b'\n' {
                     at += 1;
@@ -511,6 +506,22 @@ fn find_module_level_items(text: &[u8], header_end: usize, func_ranges: &[(Range
                 }
                 result.file_directives.push(start..at);
                 continue;
+            }
+
+            // nvcc's .loc records may name strings defined in this DWARF section.
+            // Keep the labels and their bytes together with the .file directives.
+            if let Some(after) = rest.strip_prefix(b".section")
+                && after.first().is_some_and(u8::is_ascii_whitespace)
+                && let Some(tail) = after.trim_ascii_start().strip_prefix(b".debug_str")
+                && tail.trim_ascii_start().starts_with(b"{")
+            {
+                let open = gap.end - tail.trim_ascii_start().len();
+                if let Some(close) = crate::matching(text, open).filter(|&i| i < gap.end) {
+                    let end = close + 1 + usize::from(text.get(close + 1) == Some(&b'\n'));
+                    result.file_directives.push(at..end);
+                    at = end;
+                    continue;
+                }
             }
 
             // Comments that were not caught by skip_comment (line start with `//`).
@@ -668,7 +679,7 @@ fn parse_linkage(text: &[u8]) -> (bool, bool, bool, usize) {
             break;
         }
         // Skip whitespace after the keyword.
-        while at < text.len() && text[at].is_ascii_whitespace() && text[at] != b'\n' {
+        while at < text.len() && text[at].is_ascii_whitespace() {
             at += 1;
         }
     }
@@ -697,7 +708,7 @@ fn extract_func_decl_name(decl: &str) -> Option<String> {
         if bytes[i] == b';' {
             break;
         }
-        let can_start = bytes[i] == b'.' || bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'$';
+        let can_start = bytes[i].is_ascii_alphabetic() || matches!(bytes[i], b'.' | b'_' | b'$' | b'%');
         if depth == 0 && can_start && (i == 0 || !is_name_byte(bytes[i - 1])) {
             let start = i;
             while i < bytes.len() && is_name_byte(bytes[i]) {
@@ -773,18 +784,16 @@ impl ModuleInfo {
         let text = text_str.as_bytes();
         let header_end = find_header_end(text);
 
-        // Use the existing `functions()` to find all function definitions.
-        let all_funcs = crate::functions(text);
         let mut func_defs = Vec::new();
         let mut entries = Vec::new();
 
         let mut func_ranges = Vec::new();
 
-        for func in &all_funcs {
+        crate::visit_functions(text, |directive, func| {
             let name = text_str[func.name.clone()].to_string();
             let body = func.body.clone();
 
-            let def_start = find_def_start(text, func.name.start);
+            let def_start = find_def_start(text, directive);
             let def_end = func.body.end;
             let def_end = if def_end < text.len() && text[def_end] == b'\n' {
                 def_end + 1
@@ -792,8 +801,7 @@ impl ModuleInfo {
                 def_end
             };
 
-            let before_name = &text[def_start..func.name.start];
-            let is_entry = before_name.windows(6).any(|w| w == b".entry");
+            let is_entry = func.entry;
 
             func_defs.push(FuncDef {
                 range: def_start..def_end,
@@ -806,7 +814,7 @@ impl ModuleInfo {
             if is_entry {
                 entries.push(name);
             }
-        }
+        });
 
         func_ranges.sort_by_key(|r| r.0.start);
 
@@ -845,14 +853,14 @@ impl ModuleInfo {
 
         // A referenced variable brings every symbol used to initialize it. A persistent
         // address in an initializer can also be loaded and written through.
+        let declared = |name: &str| all_var_names.contains(name) || all_func_names.contains(name);
         let mut initializer_refs: HashMap<&str, HashSet<String>> = HashMap::new();
         let mut escaped_vars = HashSet::new();
         for var in &variables {
             let Some((_, initializer)) = text_str[var.range.clone()].split_once('=') else {
                 continue;
             };
-            let mut refs = find_referenced_names(initializer);
-            refs.retain(|n| all_var_names.contains(n) || all_func_names.contains(n));
+            let refs = find_referenced_names(initializer, declared);
             escaped_vars.extend(refs.intersection(&persistent_names).cloned());
             if !refs.is_empty() {
                 initializer_refs.entry(&var.name).or_default().extend(refs);
@@ -867,7 +875,7 @@ impl ModuleInfo {
 
         for func in &func_defs {
             let body_text = &text_str[func.body.clone()];
-            let mut all_names = find_referenced_names(body_text);
+            let mut all_names = find_referenced_names(body_text, declared);
             if !initializer_refs.is_empty() {
                 let mut pending: Vec<_> = all_names
                     .iter()
@@ -1011,6 +1019,27 @@ impl ModuleInfo {
         persistent_refs.iter().all(|v| self.is_message_string_only(v))
     }
 
+    /// Extract a leaf kernel from a relocatable object. A call (including an indirect call),
+    /// an address of a device function, or a reference to persistent storage can depend on the
+    /// complete linked image. Leave all of those to the device linker.
+    pub fn extract_linked_leaf(&self, name: &str) -> Option<Vec<u8>> {
+        let entry = self.func_defs.iter().find(|f| f.is_entry && f.name == name)?;
+        if self.has_unrecognised_items
+            || self.func_refs.get(name).is_some_and(|refs| !refs.is_empty())
+            || self
+                .var_refs
+                .get(name)
+                .is_some_and(|vars| !vars.is_disjoint(&self.persistent_names))
+            || scan::items(&self.text, entry.body.clone())?.iter().any(|item| {
+                matches!(&item.kind, scan::Kind::Statement { opcode, .. }
+                    if self.text[opcode.clone()].split(|&b| b == b'.').next() == Some(b"call"))
+            })
+        {
+            return None;
+        }
+        self.extract(name)
+    }
+
     /// A persistent variable qualifies as a message string if its address only flows into the
     /// arguments of vprintf/__assertfail (declared `.extern`) and is never the address operand of
     /// a load, a store, an atomic or a reduction, never stored as data, and never passed to
@@ -1121,54 +1150,312 @@ impl ModuleInfo {
     }
 }
 
-/// Scan backwards from `name_start` to find the start of the function definition (the keyword
-/// `.entry`, `.func`, or a qualifier like `.visible`).
-fn find_def_start(text: &[u8], name_start: usize) -> usize {
-    // Go back to the start of the line that contains the keyword.
-    let mut at = name_start;
-    // The definition starts on or before the current line. Scan back through lines until we find
-    // one that starts with a function keyword (possibly with a qualifier).
-    loop {
-        // Find the start of the current line.
-        let line_start = text[..at].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
-        let line = &text[line_start..at.min(text.len())];
-        let indent = line.iter().take_while(|b| b.is_ascii_whitespace()).count();
-        let trimmed = &line[indent..];
-        if trimmed.starts_with(b".entry")
-            || trimmed.starts_with(b".func")
-            || trimmed.starts_with(b".visible")
-            || trimmed.starts_with(b".weak")
-        {
-            return line_start + indent;
+/// References spanning CUDA relocatable objects. Private symbols are scoped to their object;
+/// extern, visible, weak and common symbols meet at the same node across the link.
+#[derive(Default)]
+pub struct LinkedDependencies {
+    objects: usize,
+    nodes: HashMap<(Option<usize>, String), usize>,
+    callers: Vec<Vec<usize>>,
+    kernels: Vec<(usize, String)>,
+    trapped: Vec<(usize, crate::Trapped)>,
+    indirect: Vec<(usize, String)>,
+}
+
+/// Indirect calls specify either a complete target list (an array or a .calltargets directive),
+/// whose referenced functions are already in the graph, or only a .callprototype signature.
+fn calls_through_prototype(source: &str, items: &[scan::Item]) -> bool {
+    let mut prototypes = HashSet::new();
+    for (index, item) in items.iter().enumerate() {
+        if matches!(&item.kind, scan::Kind::Statement { opcode, .. } if &source[opcode.clone()] == ".callprototype") {
+            let Some(label) = index
+                .checked_sub(1)
+                .and_then(|i| items.get(i))
+                .filter(|item| item.kind == scan::Kind::Label)
+            else {
+                return true;
+            };
+            prototypes.insert(source[label.range.clone()].trim_end_matches(':').trim());
         }
-        // Check for `.maxntid`, `.minnctapersm`, `.reqntid`, `.maxnreg` on a line by itself
-        // (these are function attributes that come between the signature and the body).
-        if trimmed.starts_with(b".maxntid")
-            || trimmed.starts_with(b".minnctapersm")
-            || trimmed.starts_with(b".reqntid")
-            || trimmed.starts_with(b".maxnreg")
-        {
-            // Continue scanning upward.
-            if line_start == 0 {
-                return 0;
+    }
+    !prototypes.is_empty()
+        && items.iter().any(|item| {
+            let scan::Kind::Statement { opcode, operands, .. } = &item.kind else {
+                return false;
+            };
+            source[opcode.clone()].split('.').next() == Some("call")
+                && scan::split_operands(&source[operands.clone()])
+                    .last()
+                    .is_some_and(|target| prototypes.contains(target))
+        })
+}
+
+impl LinkedDependencies {
+    /// Add one PTX unit. Unrecognised module directives can introduce names or edges (for
+    /// example an alias), so the caller must fall back when this returns false.
+    #[must_use]
+    pub fn add(&mut self, text: &[u8], traps: &[crate::Trapped]) -> bool {
+        let info = ModuleInfo::analyse(text);
+        if info.has_unrecognised_items {
+            return false;
+        }
+        let unit = self.objects;
+        self.objects += 1;
+        let source = std::str::from_utf8(text).unwrap_or("");
+        let blanked = source.contains('/').then(|| scan::blank_comments(source));
+        let source = blanked.as_deref().unwrap_or(source);
+        let defs = info
+            .func_defs
+            .iter()
+            .map(|f| (f.name.as_str(), f.range.start..f.body.start));
+        let decls = info.func_decls.iter().map(|f| (f.name.as_str(), f.range.clone()));
+        let vars = info.variables.iter().map(|v| (v.name.as_str(), v.range.clone()));
+        let declarations: Vec<_> = defs.chain(decls).chain(vars).collect();
+        let shared: HashSet<_> = declarations
+            .iter()
+            .filter_map(|(name, range)| {
+                let declaration = &source[range.clone()];
+                let head = declaration.split('=').next().unwrap_or(declaration);
+                head.split_ascii_whitespace()
+                    .any(|word| matches!(word, ".extern" | ".visible" | ".weak" | ".common"))
+                    .then_some(*name)
+            })
+            .collect();
+        let mut symbols = HashMap::new();
+        for (name, _) in declarations {
+            let id = *self
+                .nodes
+                .entry(((!shared.contains(name)).then_some(unit), name.to_string()))
+                .or_insert_with(|| {
+                    self.callers.push(Vec::new());
+                    self.callers.len() - 1
+                });
+            symbols.insert(name, id);
+        }
+        for f in &info.func_defs {
+            let caller = symbols[f.name.as_str()];
+            let functions = &info.func_refs[&f.name];
+            let Some(items) = scan::items(source.as_bytes(), f.body.clone()) else {
+                return false;
+            };
+            if calls_through_prototype(source, &items) {
+                self.indirect.push((caller, f.name.clone()));
             }
-            at = line_start - 1;
-            continue;
+            for target in functions.iter().chain(&info.var_refs[&f.name]) {
+                self.callers[symbols[target.as_str()]].push(caller);
+            }
         }
-        if line_start == 0 {
-            return 0;
+        // A definition can initialize a table which is declared extern and read from another unit.
+        for var in &info.variables {
+            if let Some((_, value)) = source[var.range.clone()].split_once('=') {
+                let table = symbols[var.name.as_str()];
+                for target in find_referenced_names(value, |name| symbols.contains_key(name)) {
+                    self.callers[symbols[target.as_str()]].push(table);
+                }
+            }
         }
-        at = line_start - 1;
-        // Safety: don't scan too far back.
-        if name_start - at > 4096 {
-            return line_start;
+        self.kernels
+            .extend(info.entries.iter().map(|name| (symbols[name.as_str()], name.clone())));
+        for trap in traps {
+            if let Some(&id) = symbols.get(trap.function.as_str()) {
+                self.trapped.push((id, trap.clone()));
+            }
         }
+        true
+    }
+
+    /// The kernels in the complete link that can reach one of its trapped functions.
+    pub fn refused(mut self) -> Vec<crate::Refused> {
+        let entries: HashSet<_> = self.kernels.iter().map(|(id, _)| *id).collect();
+        if let Some((_, trap)) = self.trapped.iter().find(|(id, _)| !entries.contains(id)) {
+            // A pointer passed in from the host need not appear in any PTX initializer. Only a
+            // device function can be its target. Other kernels remain usable.
+            let reason = format!("indirect call may reach {}: {}", trap.function, trap.reason);
+            self.trapped.extend(self.indirect.into_iter().map(|(id, function)| {
+                (
+                    id,
+                    crate::Trapped {
+                        function,
+                        reason: reason.clone(),
+                    },
+                )
+            }));
+        }
+        let mut reasons = vec![None; self.callers.len()];
+        let mut pending = Vec::new();
+        for (i, (id, _)) in self.trapped.iter().enumerate() {
+            reasons[*id] = Some(i);
+            pending.push(*id);
+        }
+        while let Some(id) = pending.pop() {
+            for &caller in &self.callers[id] {
+                if reasons[caller].is_none() {
+                    reasons[caller] = reasons[id];
+                    pending.push(caller);
+                }
+            }
+        }
+        self.kernels
+            .into_iter()
+            .filter_map(|(id, kernel)| {
+                let trap = &self.trapped[reasons[id]?].1;
+                Some(crate::Refused {
+                    kernel,
+                    function: trap.function.clone(),
+                    reason: trap.reason.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Include a linkage qualifier before the directive, including across newlines. Comments were
+/// already blanked when the offsets were determined.
+fn find_def_start(text: &[u8], directive: usize) -> usize {
+    let mut end = directive;
+    while end > 0 && text[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && is_name_byte(text[start - 1]) {
+        start -= 1;
+    }
+    if matches!(&text[start..end], b".visible" | b".weak" | b".extern") {
+        start
+    } else {
+        directive
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_leaf_keeps_nvcc_line_info_and_defers_calls_and_globals() {
+        let source = br#".version 8.8
+.target sm_70
+.address_size 64
+.extern .func helper();
+.extern .global .u32 counter;
+.visible .entry leaf() {
+    .loc	1 2 0, function_name $str, inlined_at 1 3 1
+    ret;
+}
+.visible .entry direct() { call helper, (); ret; }
+.visible .entry indirect(.param .u64 ptr) {
+    .reg .b64 %rd;
+    ld.param.u64 %rd, [ptr];
+    proto: .callprototype _ ();
+    call %rd, (), proto;
+    ret;
+}
+.visible .entry shared_value() { .reg .u32 %r; ld.global.u32 %r, [counter]; ret; }
+.file	1 "linked.cu"
+.section	.debug_str
+{
+$str:
+.b8 97
+.b8 0
+}
+"#;
+        let info = super::ModuleInfo::analyse(source);
+        let text = String::from_utf8(info.extract_linked_leaf("leaf").unwrap()).unwrap();
+        assert!(text.contains(".file\t1") && text.contains(".debug_str") && text.contains("$str:"));
+        for dependent in ["direct", "indirect", "shared_value", "missing"] {
+            assert!(info.extract_linked_leaf(dependent).is_none(), "{dependent}");
+        }
+    }
+
+    #[test]
+    fn linked_calls_and_external_table_reach_a_helper_in_another_object() {
+        let mut graph = super::LinkedDependencies::default();
+        assert!(graph.add(
+            br#".version 8.0
+.target sm_70
+.address_size 64
+.extern
+.func $Library();
+.extern
+.global .u64 table;
+.func %private_helper() { ret; }
+.visible .entry direct() { call $Library, (); ret; }
+.visible .entry indirect() { .reg .u64 %r; ld.global.u64 %r, [table]; ret; }
+.visible .entry unaffected() { call %private_helper, (); ret; }
+"#,
+            &[],
+        ));
+        assert!(graph.add(
+            br#".version 8.0
+.target sm_70
+.address_size 64
+.func %private_helper() { trap; } .visible
+.func $Library() { call %private_helper, (); ret; }
+.visible .global .u64 table = $Library;
+"#,
+            &[crate::Trapped {
+                function: "%private_helper".into(),
+                reason: "fixture".into(),
+            }],
+        ));
+        let refused = graph.refused();
+        let names: Vec<_> = refused.iter().map(|r| r.kernel.as_str()).collect();
+        assert_eq!(names, ["direct", "indirect"]);
+        assert!(refused.iter().all(|r| r.function == "%private_helper"));
+    }
+
+    #[test]
+    fn indirect_call_through_a_kernel_argument_may_reach_a_trapped_device_function() {
+        let mut graph = LinkedDependencies::default();
+        assert!(graph.add(
+            br#".version 8.0
+.target sm_70
+.address_size 64
+.func invoke(.reg .b64 fp) {
+    proto: .callprototype _ ();
+    call.uni fp, (), proto;
+    ret;
+}
+.visible .entry dispatch(.param .u64 pointer) {
+    .reg .b64 f;
+    ld.param.u64 f, [pointer];
+    call invoke, (f);
+    ret;
+}
+.func good() { ret; }
+.visible .entry bounded(.param .u64 pointer) {
+    .reg .b64 f;
+    ld.param.u64 f, [pointer];
+    known: .calltargets good;
+    unused: .callprototype _ ();
+    call.uni f, known;
+    ret;
+}
+.visible .entry safe() { ret; }
+"#,
+            &[]
+        ));
+        assert!(graph.add(
+            b".version 8.0\n.target sm_70\n.address_size 64\n.visible .func bad() { trap; }\n",
+            &[crate::Trapped {
+                function: "bad".into(),
+                reason: "fixture".into()
+            }]
+        ));
+        let refused = graph.refused();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].kernel, "dispatch");
+        assert!(refused[0].reason.contains("indirect call"));
+    }
+
+    #[test]
+    fn unknown_link_directives_require_the_original_linker() {
+        let mut graph = LinkedDependencies::default();
+        assert!(!graph.add(
+            b".version 8.0\n.target sm_70\n.address_size 64\n.alias alias, real;\n",
+            &[]
+        ));
+    }
 
     const MODULE: &str = "\
 .version 9.0

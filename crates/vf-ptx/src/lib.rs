@@ -254,13 +254,19 @@ fn matching(text: &[u8], open: usize) -> Option<usize> {
 }
 
 fn is_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.' | b'@')
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'%' | b'.' | b'@')
 }
 
 /// The function definitions of a module (`.entry` and `.func` with a body), in order. Declarations
 /// (ended by `;`) are skipped, and so is anything else in braces at module level (initialisers).
 pub fn functions(text: &[u8]) -> Vec<Function> {
     let mut found = Vec::new();
+    visit_functions(text, |_, function| found.push(function));
+    found
+}
+
+// Also expose the position of the .entry or .func directive to the module analysis.
+fn visit_functions(text: &[u8], mut visit: impl FnMut(usize, Function)) {
     let mut at = 0;
     while at < text.len() {
         if let Some(next) = skip_comment(text, at) {
@@ -310,17 +316,20 @@ pub fn functions(text: &[u8]) -> Vec<Function> {
         }
         match (name, body) {
             (Some(name), Some(body)) => {
+                let directive = at;
                 at = body.end;
-                found.push(Function {
-                    name,
-                    body,
-                    entry: keyword == b".entry",
-                });
+                visit(
+                    directive,
+                    Function {
+                        name,
+                        body,
+                        entry: keyword == b".entry",
+                    },
+                );
             }
             _ => at = cursor.max(at + 1),
         }
     }
-    found
 }
 
 const TANH: &[u8] = b"tanh.approx.f32";

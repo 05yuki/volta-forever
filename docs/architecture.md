@@ -186,6 +186,13 @@ on demand (`crates/vf-proxy/src/lazy.rs`, `VF_LAZY`, on by default):
 - Operations that need the full module (`cuLibraryGetGlobal`, `cuLibraryGetManaged`,
   kernel count and enumeration) load the whole adapted image through the driver at that moment.
 
+For a device-linked library, VF also reads the entry points in the linked cubin and
+matches them to the relocatable PTX objects. A kernel can be compiled separately
+when one object defines it, it calls no device functions and it uses no persistent
+module state. Other lookups use the complete device-linked wrapper so that NVIDIA's
+linker resolves external functions and shared globals. Debug strings referenced by
+the extracted kernel's line information stay with it.
+
 The soundness rule: a kernel is **independent** (can be compiled alone) when it
 references no persistent variable (`.global`, `.const`) of the module, except the
 string constants of `vprintf` and `__assertfail`, whose content is identical in every

@@ -20,6 +20,11 @@ mkdir -p "$out/bin" "$out/logs"
 [ -x "$out/bin/tcrun" ] && [ "$out/bin/tcrun" -nt "$G/tcrun.c" ] || gcc -O2 -Wall -o "$out/bin/tcrun" "$G/tcrun.c" -ldl -lm || exit 2
 [ -x "$out/bin/ptxrun" ] && [ "$out/bin/ptxrun" -nt "$G/ptxrun.c" ] || gcc -O2 -Wall -o "$out/bin/ptxrun" "$G/ptxrun.c" -ldl || exit 2
 [ -x "$out/bin/rt_probe.135.sm75ptx" ] || "$G/build-rt-probe.sh" "$out/bin" >/dev/null || exit 2
+rdc=$out/bin/rdc.135.sm120a
+if [[ ! -x $rdc || $G/rdc_main.cu -nt $rdc || $G/rdc_other.cu -nt $rdc ]]; then
+    "$T/cuda-13.5.0/bin/nvcc" -O2 -rdc=true --cudart=shared \
+        -gencode 'arch=compute_120a,code=[sm_120a,compute_120a]' "$G/rdc_main.cu" "$G/rdc_other.cu" -o "$rdc" || exit 2
+fi
 [ -e "$W/dist/forward/libcublas.so.13" ] || { echo "missing: $W/dist/forward (run scripts/build-forwarders.sh)"; exit 2; }
 
 failed=0
@@ -266,6 +271,8 @@ check translated-guard-written "SUMMARY: 3 PASS, 0 FAIL" "3 kernels with emulate
 rt runtime-12.9 rt_probe.129.sm70 "$T/cuda-12.9.2/lib" "own kernel: 0/65536 wrong" "sgemm check: 0 wrong" "half gemm check: 0 wrong"
 rt runtime-13.5-ptx rt_probe.135.sm75ptx "$T/cuda-13.5.0/lib" "runtime 13050, driver API 13000" "rt_probe.135.sm75ptx is told compute capability 7.5: its code starts there" "device 0: .*sm_75" "PTX for sm_75 retargeted" "own kernel: 0/65536 wrong" "machine code for sm_75 translated" "kernel volta_sgemm_.* is not given to the program: its machine code for sm_75 is not translated" "cublasCreate -> 0 " "cublasSgemm -> 13 "
 rt runtime-13.5-cublas-forwarded rt_probe.135.sm75ptx "$W/dist/forward:$T/cuda-12.9.2/lib" "device 0: .*sm_75" "own kernel: 0/65536 wrong" "libcublas.so.12[0-9.]* is told the real compute capability" "cuBLAS version 120902" "sgemm check: 0 wrong" "half gemm check: 0 wrong"
+VF_CAPABILITY=12.0 rt rdc-cross-object rdc.135.sm120a "$T/cuda-13.5.0/lib" "compiling sub-module for kernel set_five" "kernel using another CUDA object: 42" "cross-object cluster kernel refused" "unresolved indirect kernel refused"
+VF_CAPABILITY=12.0 VF_LAZY=0 rt rdc-cross-object-eager rdc.135.sm120a "$T/cuda-13.5.0/lib" "kernel using another CUDA object: 42" "cross-object cluster kernel refused" "unresolved indirect kernel refused"
 VF_CAPABILITY=7.0 rt capability-forced rt_probe.135.sm75ptx "$T/cuda-13.5.0/lib" "is told compute capability 7.0, as VF_CAPABILITY asks" "device 0: .*sm_70" "own kernel: 0/65536 wrong" "cublasCreate -> 8 "
 VF_STATS=1 rt stats rt_probe.129.sm70 "$T/cuda-12.9.2/lib" "half gemm check: 0 wrong" "calls: .*cuLaunchKernel=[0-9]+"
 VF_ADAPT=0 rt adapt-off rt_probe.135.sm75ptx "$T/cuda-13.5.0/lib" "cudaGetLastError\(\) +-> 209"

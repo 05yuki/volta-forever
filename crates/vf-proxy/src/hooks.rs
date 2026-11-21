@@ -292,7 +292,9 @@ unsafe fn load_adapted(
         }
         return Ok(());
     }
-    if result != CUDA_ERROR_INVALID_PTX || handle.is_null() {
+    // The diagnostic retry takes a single image. Dropping a linked wrapper's relocatable
+    // objects would ask the driver to compile a different program.
+    if result != CUDA_ERROR_INVALID_PTX || handle.is_null() || replacement.has_prelinked_objects() {
         return Err(result);
     }
     // The compiler refused something of the adapted image; which functions, only its messages tell.
@@ -702,6 +704,41 @@ pub unsafe extern "C" fn cuLibraryLoadData(
         t_adapt.as_secs_f64() * 1000.0,
         replacement.len(),
     ));
+
+    // The CUDA linker needs all relocatable objects together. Loading only the primary binary
+    // through the single-module lazy path would discard their PTX and external definitions.
+    if replacement.has_prelinked_objects() {
+        if lazy::enabled()
+            && unsafe {
+                lazy::setup_linked(
+                    library,
+                    &replacement,
+                    jit_options,
+                    jit_values,
+                    jit_count,
+                    library_options,
+                    library_values,
+                    library_count,
+                )
+            }
+        {
+            images::keep(unsafe { *library } as usize, replacement);
+            return CUDA_SUCCESS;
+        }
+        let result = call(replacement.as_ptr());
+        if result == CUDA_SUCCESS {
+            if !library.is_null() {
+                images::keep(unsafe { *library } as usize, replacement);
+            }
+            return result;
+        }
+        log::warn(format_args!(
+            "cuLibraryLoadData: the driver refused the adapted device-linked image (error {result}); loading the original"
+        ));
+        let result = call(code);
+        unsafe { images::loaded_as_is(result, library) };
+        return result;
+    }
 
     // Try lazy compilation: defer JIT of a multi-entry PTX module.
     if lazy::enabled() {

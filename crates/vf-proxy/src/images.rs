@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use vf_adapt::{Adapted, Emulated, Outcome, Refused, RefusedFunction};
 use vf_fatbin as fatbin;
@@ -34,11 +34,19 @@ pub const REFUSAL_ROUNDS: usize = 8;
 /// Size of the buffer given to the driver for the compiler's messages: room for thousands of them.
 pub const ERROR_LOG_SIZE: usize = 1 << 20;
 
+struct PrelinkedObjects {
+    objects: Vec<Box<[u8]>>,
+    _pointers: Box<[*const u8]>,
+}
+
 /// An adapted image, owned by this library for as long as the driver may read it, and what the
 /// adaptation found about its kernels.
 pub struct Replacement {
     data: Box<[u8]>,
     wrapper: Option<Box<Wrapper>>,
+    // A v2 wrapper's fourth word points to this null-terminated array. Every pointed-to object
+    // and the pointer array itself must survive CUDA's deferred linking.
+    prelinked: Option<PrelinkedObjects>,
     refused: Vec<Refused>,
     emulated: Vec<Emulated>,
     /// How the code reached the device, for the profiler.
@@ -48,9 +56,12 @@ pub struct Replacement {
     pub original_image: Option<Vec<u8>>,
 }
 
-// SAFETY: the pointers inside `wrapper` lead to `data`, which the replacement owns, and to memory of
-// the program that the driver was going to read anyway.
+// SAFETY: the wrapper points at owned, immutable data. Its fourth word is either the program
+// file name (v1), or an immutable array and objects owned by this replacement (v2).
 unsafe impl Send for Replacement {}
+// Shared references are published only after the metadata is registered. The image, wrapper and
+// relocation inputs remain immutable, just as they must for concurrent lookups by the driver.
+unsafe impl Sync for Replacement {}
 
 impl Replacement {
     fn new(data: Vec<u8>, wrapper: Option<Wrapper>) -> Replacement {
@@ -64,6 +75,7 @@ impl Replacement {
         Replacement {
             data,
             wrapper,
+            prelinked: None,
             refused: Vec::new(),
             emulated: Vec::new(),
             origin: None,
@@ -90,6 +102,9 @@ impl Replacement {
     /// The image to load after the driver's compiler refused functions of this one, as its `log`
     /// says, and those functions. See `vf_adapt::Policy::without_refused`.
     pub fn without_refused(&self, log: &str) -> Option<(Replacement, Vec<RefusedFunction>)> {
+        if self.has_prelinked_objects() {
+            return None;
+        }
         let retry = config().policy.without_refused(&self.data, log)?;
         let mut next = Replacement::new(retry.image, self.wrapper.as_deref().copied());
         next.refused = self.refused.iter().cloned().chain(retry.kernels).collect();
@@ -97,6 +112,57 @@ impl Replacement {
         next.origin = self.origin;
         next.original_image = self.original_image.clone();
         Some((next, retry.functions))
+    }
+
+    /// The linked inputs are meaningful only together, via `as_ptr`.
+    pub fn has_prelinked_objects(&self) -> bool {
+        self.prelinked.is_some()
+    }
+
+    /// A unique device-usable PTX input. If the driver could choose a different input, its linker
+    /// must decide which definitions survive.
+    pub fn linked_object_ptx(&self, index: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+        let fat = fatbin::parse(self.prelinked.as_ref()?.objects.get(index)?).ok()?;
+        let mut usable = fat.entries.iter().filter(|e| config().policy.usable(e));
+        let entry = usable.next()?;
+        if entry.kind() != fatbin::KIND_PTX || usable.next().is_some() {
+            return None;
+        }
+        entry.payload().ok()
+    }
+
+    /// Index only entry points that survived device linking, and for which exactly one input
+    /// defines the name. Defer ambiguous weak definitions to the driver's full device linker.
+    pub fn linked_entries(&self) -> Option<HashMap<String, Option<usize>>> {
+        let primary = fatbin::parse(&self.data).ok()?;
+        let [binary] = primary.entries.as_slice() else {
+            return None;
+        };
+        if binary.kind() != fatbin::KIND_ELF {
+            return None;
+        }
+        let cubin = binary.payload().ok()?;
+        let mut entries: HashMap<_, _> = fatbin::cubin_entries(&cubin)?
+            .into_iter()
+            .map(|name| (name.to_owned(), None))
+            .collect();
+        drop(cubin);
+        let mut duplicates = std::collections::HashSet::new();
+        for index in 0..self.prelinked.as_ref()?.objects.len() {
+            let text = self.linked_object_ptx(index)?;
+            for entry in vf_ptx::functions(&text).into_iter().filter(|f| f.entry) {
+                let name = std::str::from_utf8(&text[entry.name]).ok()?;
+                if let Some(object) = entries.get_mut(name)
+                    && object.replace(index).is_some()
+                {
+                    duplicates.insert(name.to_owned());
+                }
+            }
+        }
+        for name in duplicates {
+            entries.insert(name, None);
+        }
+        Some(entries)
     }
 
     /// What to pass to the driver in place of the program's pointer.
@@ -136,7 +202,12 @@ impl Replacement {
 
 /// Replacements in use, by the module or library handle the driver returned for them. The driver may
 /// read an image again after the load returns (lazy loading), so they live until the unload.
-static KEPT: LazyLock<Mutex<HashMap<usize, Replacement>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static KEPT: LazyLock<Mutex<HashMap<usize, Arc<Replacement>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Keep the complete device-linked wrapper alive while compiling outside the lazy-library lock.
+pub fn retained(handle: usize) -> Option<Arc<Replacement>> {
+    KEPT.lock().unwrap_or_else(|e| e.into_inner()).get(&handle).cloned()
+}
 
 /// The driver loaded `replacement` as `handle`: keep it, and what is known of its kernels.
 pub fn keep(handle: usize, mut replacement: Replacement) {
@@ -162,7 +233,7 @@ pub fn keep(handle: usize, mut replacement: Replacement) {
     }
     KEPT.lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(handle, replacement);
+        .insert(handle, Arc::new(replacement));
 }
 
 pub fn release(handle: usize) {
@@ -339,6 +410,20 @@ fn adapted(who: &str, image: &[u8], adapt: impl FnOnce() -> Adapted) -> Adapted 
     adapted
 }
 
+fn adapt_container(who: &str, bytes: &[u8], fat: &fatbin::FatBinary<'_>) -> Result<Adapted, fatbin::Error> {
+    let mut failed = None;
+    let result = adapted(who, bytes, || {
+        config().policy.adapt_fatbin(fat).unwrap_or_else(|e| {
+            failed = Some(e);
+            Adapted {
+                outcome: Outcome::Unknown,
+                image: None,
+            }
+        })
+    });
+    failed.map_or(Ok(result), Err)
+}
+
 /// `at`: where the fat binary is, for the bytes of the whole of it.
 fn adapt_fatbin(
     who: &str,
@@ -346,33 +431,127 @@ fn adapt_fatbin(
     fat: Result<fatbin::FatBinary<'_>, fatbin::Error>,
     wrapper: Option<Wrapper>,
 ) -> Option<Replacement> {
-    // SAFETY: `fat` was read from `at`, and is `fat.len` bytes there.
-    let original = fat
-        .as_ref()
-        .ok()
-        .map(|fat| unsafe { std::slice::from_raw_parts(at, fat.len) });
-    let adapted = fat.and_then(|fat| {
-        // SAFETY: as above.
-        let whole = unsafe { std::slice::from_raw_parts(at, fat.len) };
-        let mut failed = None;
-        let adapted = adapted(who, whole, || {
-            config().policy.adapt_fatbin(&fat).unwrap_or_else(|e| {
-                failed = Some(e);
-                Adapted {
-                    outcome: Outcome::Unknown,
-                    image: None,
-                }
-            })
-        });
-        failed.map_or(Ok(adapted), Err)
+    let result = fat.and_then(|fat| {
+        // SAFETY: `fat` was read from `at`, and is `fat.len` bytes there.
+        let original = unsafe { std::slice::from_raw_parts(at, fat.len) };
+        Ok((original, adapt_container(who, original, &fat)?))
     });
-    match adapted {
-        Ok(adapted) => finish(who, "fat binary", adapted, wrapper, false, original),
+    match result {
+        Ok((original, adapted)) => finish(who, "fat binary", adapted, wrapper, false, Some(original)),
         Err(e) => {
             log::warn(format_args!("{who}: {e}; loaded as is"));
             None
         }
     }
+}
+
+/// Adapt a device-linked image. CUDA first tries the fully linked binary. If it has no code
+/// for the device, the driver can link the relocatable fat binaries in the fourth word of the
+/// wrapper. A compilation unit can refer to a function or variable defined by another unit.
+///
+/// # Safety
+/// The wrapper and the null-terminated array in `extra` are supplied by the CUDA runtime.
+/// Each non-null array member is the address of a complete fat binary, not another wrapper.
+unsafe fn adapt_linked(who: &str, wrapper: Wrapper) -> Option<Replacement> {
+    let policy = &config().policy;
+    let primary = unsafe { fatbin::parse_at(wrapper.data) }.ok()?;
+    let linked = unsafe { std::slice::from_raw_parts(wrapper.data, primary.len) };
+    let adapted = policy.adapt_fatbin(&primary).ok()?;
+    if adapted.image.is_some() || matches!(adapted.outcome, Outcome::Native) {
+        // This is the complete, already linked program.
+        return finish(who, "linked fat binary", adapted, None, false, Some(linked));
+    }
+    if wrapper.extra.is_null() {
+        return None;
+    }
+
+    let mut objects = Vec::new();
+    let mut refused = Vec::new();
+    let mut emulated = Vec::new();
+    let mut origin = None;
+    let mut object_traps = Vec::new();
+    let mut check_external_calls = false;
+    let mut next = wrapper.extra.cast::<*const u8>();
+    loop {
+        let ptr = unsafe { next.read() };
+        if ptr.is_null() {
+            break;
+        }
+        next = unsafe { next.add(1) };
+        let fat = unsafe { fatbin::parse_at(ptr) }.ok()?;
+        let source = unsafe { std::slice::from_raw_parts(ptr, fat.len) };
+        let lowering = adapt_container(who, source, &fat).ok()?;
+        let traps = match &lowering.outcome {
+            Outcome::Retargeted { trapped, refused, .. } => {
+                // An .entry cannot be called as a .func; entry-only refusals already have their
+                // complete names. A trapped helper can also be reached from another object.
+                check_external_calls |= trapped.iter().any(|t| !refused.iter().any(|r| r.kernel == t.function));
+                trapped.clone()
+            }
+            Outcome::Translated { refused, .. } if !refused.is_empty() => {
+                // A refused machine-code function might be called from a different object.
+                // Its relocations do not give the PTX graph below the edges needed for this.
+                log::warn(format_args!(
+                    "{who}: a relocatable cubin has refused functions; loaded as is"
+                ));
+                return None;
+            }
+            _ => Vec::new(),
+        };
+        object_traps.push(traps);
+        match finish(who, "relocatable fat binary", lowering, None, false, Some(source)) {
+            Some(replaced) => {
+                origin = origin.or(replaced.origin);
+                refused.extend(replaced.refused);
+                emulated.extend(replaced.emulated);
+                objects.push(replaced.data);
+            }
+            None => objects.push(source.into()),
+        }
+    }
+    let origin = origin?;
+    if check_external_calls {
+        let mut graph = vf_ptx::deps::LinkedDependencies::default();
+        for (object, traps) in objects.iter().zip(&object_traps) {
+            let fat = fatbin::parse(object).ok()?;
+            for entry in fat.entries.iter().filter(|entry| policy.usable(entry)) {
+                if entry.kind() == fatbin::KIND_ELF {
+                    // A machine-code caller could reach a trapped PTX helper without a visible edge.
+                    log::warn(format_args!(
+                        "{who}: relocatable machine code may call a trapped PTX function; loaded as is"
+                    ));
+                    return None;
+                }
+                if !graph.add(&entry.payload().ok()?, traps) {
+                    log::warn(format_args!(
+                        "{who}: incomplete dependency information for relocatable PTX; loaded as is"
+                    ));
+                    return None;
+                }
+            }
+        }
+        refused.extend(graph.refused());
+        refused.sort_by(|a, b| a.kernel.cmp(&b.kernel));
+        refused.dedup_by(|a, b| a.kernel == b.kernel);
+    }
+    let pointers = objects
+        .iter()
+        .map(|obj| obj.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect::<Box<[_]>>();
+    let wrapper = Wrapper {
+        extra: pointers.as_ptr().cast(),
+        ..wrapper
+    };
+    let mut result = Replacement::new(linked.to_vec(), Some(wrapper));
+    result.prelinked = Some(PrelinkedObjects {
+        objects,
+        _pointers: pointers,
+    });
+    result.refused = refused;
+    result.emulated = emulated;
+    result.origin = Some(origin);
+    Some(result)
 }
 
 /// Copy the original image bytes at `ptr` exactly as the adaptation would consume them: the fat
@@ -462,6 +641,9 @@ unsafe fn adapt_unguarded(who: &str, ptr: *const c_void, len: Option<usize>) -> 
     }
     if magic == fatbin::WRAPPER_MAGIC {
         let wrapper = unsafe { ptr.cast::<Wrapper>().read_unaligned() };
+        if wrapper.version == 2 && !wrapper.data.is_null() {
+            return unsafe { adapt_linked(who, wrapper) };
+        }
         if wrapper.version != 1 || wrapper.data.is_null() {
             log::warn(format_args!(
                 "{who}: fat binary wrapper version {} loaded as is",
