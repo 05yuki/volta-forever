@@ -228,18 +228,34 @@ impl<'a> Body<'a> {
         src: &[&str],
         base: &str,
         offset: Option<&str>,
+        transposed: bool,
     ) -> Result<(), Unsupported> {
         let start = self.matrix_address(opcode, base, offset, true)?;
         let at = self.fresh();
-        let pair = self.lane(Lane::PairOffset);
+
         // All threads that execute an aligned store participate. Keep a uniform guard on the
         // collective as well as on the store, including on paths where the instruction is skipped.
         for (matrix, source) in src.iter().enumerate() {
-            let row = self.lane(Lane::RowOf(matrix as u32));
-            emit!(self, "{guard}shfl.sync.idx.b32 {at}, {start}, {row}, 31, -1;");
-            self.shuffles += 1;
-            emit!(self, "{guard}add.u32 {at}, {at}, {pair};");
-            emit!(self, "{guard}st.shared.b32 [{at}], {source};");
+            if transposed {
+                // In lane 4g+t the low and high halves go to rows 2t and 2t+1, column g.
+                let column = self.lane(Lane::ColumnOffset);
+                let halves = [self.fresh_half(), self.fresh_half()];
+                emit!(self, "mov.b32 {{{}, {}}}, {source};", halves[0], halves[1]);
+                for (half, value) in halves.iter().enumerate() {
+                    let row = self.lane(Lane::ColumnOf((2 * matrix + half) as u32));
+                    emit!(self, "{guard}shfl.sync.idx.b32 {at}, {start}, {row}, 31, -1;");
+                    self.shuffles += 1;
+                    emit!(self, "{guard}add.u32 {at}, {at}, {column};");
+                    emit!(self, "{guard}st.shared.b16 [{at}], {value};");
+                }
+            } else {
+                let pair = self.lane(Lane::PairOffset);
+                let row = self.lane(Lane::RowOf(matrix as u32));
+                emit!(self, "{guard}shfl.sync.idx.b32 {at}, {start}, {row}, 31, -1;");
+                self.shuffles += 1;
+                emit!(self, "{guard}add.u32 {at}, {at}, {pair};");
+                emit!(self, "{guard}st.shared.b32 [{at}], {source};");
+            }
         }
         emit!(self, "{guard}bar.warp.sync -1;");
         Ok(())

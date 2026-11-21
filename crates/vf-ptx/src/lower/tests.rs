@@ -440,7 +440,7 @@ fn x1_matrix_store_preserves_guards_and_materializes_loaded_fragments() {
         ("stmatrix.sync.aligned.m8n8.x2.shared.b16", "[%r1], {%r0}"),
         ("stmatrix.sync.aligned.m8n8.x4.shared.b16", "[%r1], {%r0, %r2}"),
         ("stmatrix.sync.aligned.m8n8.x3.shared.b16", "[%r1], {%r0, %r1, %r2}"),
-        ("stmatrix.sync.aligned.m8n8.x1.trans.shared.b16", "[%r1], {%r0}"),
+        ("stmatrix.sync.aligned.m8n8.x1.trans.shared.b8", "[%r1], {%r0}"),
         ("stmatrix.sync.aligned.m8n8.x1.shared.b8", "[%r1], {%r0}"),
         (store, "[%r1], {%r0, %r2}"),
         (store, "[%r1+%r2], {%r0}"),
@@ -472,6 +472,20 @@ fn each_matrix_store_fragment_uses_its_own_eight_row_addresses() {
             assert!(lowered.contains(&format!(", {row}, 31, -1;")), "{lowered}");
         }
         assert_eq!(lowered.matches("bar.warp.sync").count(), 1);
+        assert!(undeclared(&lowered).is_empty());
+    }
+}
+
+#[test]
+fn transposed_matrix_store_writes_each_half_to_its_own_row() {
+    for count in [1, 2, 4] {
+        let registers = (0..count).map(|n| format!("%r{n}")).collect::<Vec<_>>().join(", ");
+        let lowered = lower(&format!(
+            "{{\n.reg .u32 %r<5>;\n.reg .pred %p;\n@%p stmatrix.sync.aligned.m8n8.x{count}.trans.shared::cta.b16 [%r4+16], {{{registers}}};\n}}"
+        ));
+        assert_eq!(lowered.matches("@%p st.shared.b16").count(), 2 * count);
+        assert_eq!(lowered.matches("@%p shfl.sync.idx.b32").count(), 2 * count);
+        assert_eq!(lowered.matches("@%p bar.warp.sync").count(), 1);
         assert!(undeclared(&lowered).is_empty());
     }
 }

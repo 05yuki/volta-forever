@@ -80,6 +80,7 @@ check cta-mbarrier "256 of 256 lanes as expected" "1 of 1 lanes as expected"
 # The x1 warp store uses eight independent row addresses and leaves the padding intact.
 px stmatrix-x1 "$G/ptx-cases/stmatrix-x1.ptx" a9c31357 a9c31357 0
 px stmatrix-multi "$G/ptx-cases/stmatrix-multi.ptx" 0 0
+px stmatrix-transposed "$G/ptx-cases/stmatrix-transposed.ptx" 0 0
 
 # Each half of a packed BF16 bound propagates its own NaNs and preserves signed zero.
 px packed-bf16-bounds "$G/ptx-cases/packed-bf16-bounds.ptx" 00000002 80008001 7fff0002 40007fff

@@ -83,8 +83,9 @@ pub(super) enum Tensor<'a> {
         base: &'a str,
         offset: Option<&'a str>,
     },
-    /// One 32-bit fragment per untransposed 8x8 matrix stored in CTA shared memory.
+    /// One 32-bit fragment per 8x8 matrix stored in CTA shared memory.
     Store {
+        transposed: bool,
         src: Vec<&'a str>,
         base: &'a str,
         offset: Option<&'a str>,
@@ -422,15 +423,22 @@ pub(super) fn parse<'a>(opcode: &str, operands: &'a str) -> Result<Tensor<'a>, U
             }
         }
     } else if opcode.starts_with("stmatrix.sync.aligned.") {
-        let ["m8n8", count, "shared" | "shared::cta", "b16"] = qualifiers[..] else {
-            return Err(unsupported("no Volta sequence for this form"));
+        let (count, transposed) = match qualifiers[..] {
+            ["m8n8", count, "shared" | "shared::cta", "b16"] => (count, false),
+            ["m8n8", count, "trans", "shared" | "shared::cta", "b16"] => (count, true),
+            _ => return Err(unsupported("no Volta sequence for this form")),
         };
         let count = matrix_count(count).ok_or_else(|| unsupported("matrix count not recognised"))?;
         if let [place, vector] = parts.as_slice()
             && let (Some((base, offset)), Some(src)) = (address(place), scan::vector(vector))
             && src.len() == count
         {
-            Ok(Tensor::Store { src, base, offset })
+            Ok(Tensor::Store {
+                transposed,
+                src,
+                base,
+                offset,
+            })
         } else {
             Err(unsupported("operands not recognised"))
         }

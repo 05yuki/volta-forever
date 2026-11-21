@@ -1,0 +1,77 @@
+.version 8.0
+.target sm_90
+.address_size 64
+
+// Every row has four data words followed by four canaries. A permutation makes the
+// four matrices use non-consecutive row addresses. The reader verifies all 256 words.
+.visible .entry k(.param .u64 output) .reqntid 32,1,1
+{
+    .reg .u32 lane, base, at, low, high, value<4>, i, row, col, slot, matrix;
+    .reg .u32 got, expected, bad, canary, changed;
+    .reg .u64 out;
+    .reg .pred more, odd, uniform;
+    .shared .align 16 .b32 memory[256];
+    mov.u32 lane, %laneid;
+    mov.u32 base, memory;
+    mov.u32 i, lane;
+fill:
+    mad.lo.u32 at, i, 4, base;
+    st.shared.b32 [at], 0xfa24c61d;
+    add.u32 i, i, 32;
+    setp.lt.u32 more, i, 256;
+    @more bra fill;
+    bar.sync 0;
+
+    add.u32 low, lane, 0x1140;
+    add.u32 high, lane, 0x2260;
+    shl.b32 high, high, 16;
+    or.b32 value0, high, low;
+    add.u32 value1, value0, 0x01000100;
+    add.u32 value2, value1, 0x01000100;
+    add.u32 value3, value2, 0x01000100;
+    mad.lo.u32 slot, lane, 13, 5;
+    and.b32 slot, slot, 31;
+    mad.lo.u32 at, slot, 32, base;
+    stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [at], {value0, value1, value2, value3};
+    setp.lt.u32 uniform, lane, 32;
+    @!uniform stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [at], {value3, value2, value1, value0};
+    bar.sync 0;
+
+    shr.u32 row, lane, 2;
+    and.b32 col, lane, 3;
+    and.b32 i, row, 1;
+    setp.ne.u32 odd, i, 0;
+    mov.u32 matrix, 0;
+    mov.u32 bad, 0;
+    mov.u32 canary, 0;
+check:
+    mad.lo.u32 slot, matrix, 8, row;
+    mad.lo.u32 slot, slot, 13, 5;
+    and.b32 slot, slot, 31;
+    mad.lo.u32 at, slot, 32, base;
+    mad.lo.u32 at, col, 4, at;
+    // Source lanes for the two adjacent columns are four apart; row parity selects
+    // whether each contributes its high or low halfword.
+    shr.u32 i, row, 1;
+    mad.lo.u32 i, col, 8, i;
+    selp.u32 low, 0x2260, 0x1140, odd;
+    add.u32 low, low, i;
+    mad.lo.u32 low, matrix, 256, low;
+    add.u32 high, low, 4;
+    shl.b32 high, high, 16;
+    or.b32 expected, high, low;
+    ld.shared.b32 got, [at];
+    xor.b32 changed, got, expected;
+    or.b32 bad, bad, changed;
+    ld.shared.b32 got, [at+16];
+    xor.b32 changed, got, 0xfa24c61d;
+    or.b32 canary, canary, changed;
+    add.u32 matrix, matrix, 1;
+    setp.lt.u32 more, matrix, 4;
+    @more bra check;
+    ld.param.u64 out, [output];
+    mad.wide.u32 out, lane, 16, out;
+    st.global.b32 [out], bad;
+    st.global.b32 [out+4], canary;
+    ret;
+}

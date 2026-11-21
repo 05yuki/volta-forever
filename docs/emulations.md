@@ -220,7 +220,7 @@ preamble, 3 or 4 per matrix). Transposed: 38 (3 + 9 per matrix).
 **movmatrix.** `movmatrix.sync.aligned.m8n8.trans.b16` transposes a matrix fragment across
 lanes. It becomes two warp shuffles.
 
-**stmatrix.** For untransposed `stmatrix.sync.aligned.m8n8` stores of `.b16` in `.shared` or `.shared::cta`, `.x1`, `.x2` and `.x4` store one, two and four matrices. Each consecutive group of eight lanes supplies the row addresses for one matrix. Each group of four lanes stores one row of every matrix, using one source register per matrix.
+**stmatrix.** For `stmatrix.sync.aligned.m8n8` stores of `.b16` in `.shared` or `.shared::cta`, `.x1`, `.x2` and `.x4` store one, two and four matrices. Each consecutive group of eight lanes supplies the row addresses for one matrix. Each group of four lanes stores one row of every matrix, using one source register per matrix. With `.trans`, each lane stores the low and high halves of its register in successive rows of one column.
 
 **Test cases.** `tests/gpu/run.sh`: the `tensor-core` and `ampere` cases load every
 operand with `ldmatrix` and check every register of every thread against the host model.
