@@ -26,7 +26,7 @@ This diagnostic run used eager execution with assembler optimization disabled on
 
 ## SGLang
 
-Run the same four prompts against the idle server started by the SGLang guide.
+The recorded 35B measurement used an experimental SGLang adapter. For a compatible 35B server that exposes GPU forward timers and serves the model as `qwen`, run the following client. [Archived benchmark configuration](https://github.com/nbald/volta-forever/blob/7ead7334d0909483b63139d253aead22cf97820a/docs/guides/sglang.md)
 
 ```sh
 mkdir -p ~/sglang-v100/benchmark && cd ~/sglang-v100/benchmark

@@ -111,5 +111,7 @@
     "prefill_tokens_per_s": 643.9104217188905,
     "decode_tokens_per_s": 67.3014707418176,
     "first_s": 0.37379537080414593
-  }
+  },
+  "configuration_source": "https://github.com/nbald/volta-forever/blob/7ead7334d0909483b63139d253aead22cf97820a/docs/guides/sglang.md",
+  "configuration_status": "Experimental SGLang operator adapter and PTX-preserving assembler"
 }
