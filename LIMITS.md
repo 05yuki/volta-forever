@@ -174,17 +174,23 @@ bytes, as the PTX manual requires. A program that does not stops with a misalign
 fault (error 716); `VF_ALIGNED_ROWS=0` makes the layer test the addresses, with slower
 emulated kernels.
 
+## CUDA graphs
+
+A Tesla V100 can capture and replay translated kernels. SGLang used a batch-one CUDA graph for
+decode with Qwen3.5-35B-A3B-AWQ. Its prefill ran outside the graph. A replayed launch that
+exceeds the register budget can return an error after capture, beyond the register retry
+described above. [GPU validation](docs/validation.md#cuda-graph-replay)
+
 ## What was not tried
 
 - More than one GPU in a process; NVLink
 - MPS (the Multi-Process Service)
-- CUDA graphs
 - Driver 580.196.07 and later drivers of the 580 branch (everything was run with 580.178.04)
 - Windows; ARM
 - CUDA 14 and later
 - Nsight Compute and Nsight Systems (CUPTI's sampling of the program counter was used through
   the layer)
-- A wide range of models: each engine was run with one small model
+- Coverage across all model architectures. The engine guides give the checkpoints and workloads tested.
 
 ## Numerical accuracy
 

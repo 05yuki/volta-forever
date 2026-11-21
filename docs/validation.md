@@ -773,6 +773,20 @@ nvJPEG and NVRTC, run with the forwarding libraries in front of CUDA 12.9.2, the
 checked against the host's; first calls from 32 threads at once; and what a function that
 CUDA 12.9.2 lacks answers.
 
+### CUDA graph replay
+
+On a Tesla V100-SXM2-32GB with driver 580.178.04 and VF 0.1.1, SGLang's FP16 Triton decode
+attention ran with 16 query heads, two KV heads and head width 256. Four KV lengths
+(23, 227, 288 and 512) and one or four partitions gave eight graphs. After capture, each
+test replaced the query, filled the output with NaNs and replayed the graph. All 32,768
+outputs were finite and agreed with the new CPU FP32 references within 0.00028 relative
+L2 error. [Replay test](../tests/gpu/sglang-decode-graph.py)
+
+The SGLang server also used batch-one graph replay on Qwen3.5-35B-A3B-AWQ. It answered three
+distinct prompts correctly with 227 uncached input tokens and 64 output tokens each. Its
+scheduler reported graph execution during decode on all three requests. Prefill ran outside
+the graph. [SGLang guide](guides/sglang.md)
+
 ### Through the launcher
 
 Everything above sets the layer's environment by hand, the way `INSTALL.md` gives under "By
@@ -947,7 +961,7 @@ llama.cpp with Qwen2.5-0.5B-Instruct and with Qwen3.8-27B, ZML with Qwen3.5-9B. 
 another batch or another option may launch a kernel that no test ran, and with FlashInfer one of
 the five kernels that are refused (`LIMITS.md`). ZML's check compares no token with a reference.
 
-**What was not tried** is listed in `LIMITS.md`: more than one GPU, MPS, CUDA graphs, later
+**What was not tried** is listed in `LIMITS.md`: more than one GPU, MPS, later
 drivers, other operating systems. Code for sm_80 and later that comes without PTX and without
 code for sm_75 is not translated: the translator reads sm_75.
 
