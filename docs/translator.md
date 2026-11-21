@@ -79,7 +79,8 @@ For each rule, nvdisasm must read the translated word on sm_70 exactly as it rea
 the original on sm_75, with the uniform registers renamed. PyTorch's 475 cubins
 exercise 75 rules across 393,803 instructions. The Triton gated delta rule
 kernel used by vLLM exercises two further forms, `USGXT.U32` with an immediate
-and `LEA.HI` with a uniform source.
+and `LEA.HI` with a uniform source. Its unified attention kernel also uses
+`ULEA.HI.SX32`, which maps to `LEA.HI.SX32` on ordinary registers.
 
 An instruction with a uniform operand (a load at `[R4 + UR6 + 0x10]`, a
 comparison against UR2) is rewritten to the sm_70 form with an ordinary

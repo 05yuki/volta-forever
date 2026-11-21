@@ -123,12 +123,14 @@ mod tests {
     use crate::decode::Decoder;
 
     #[test]
-    fn remap_uniform_operands_in_triton_gated_delta_kernel() {
+    fn remap_uniform_operands_in_triton_kernels() {
         // Actual sm_75 words and their sm_70 forms as read by nvdisasm.
         // Ordinary registers start at R100 in this check.
         let cases = [
             // USGXT.U32 UR11, UR11, 0x4 -> SGXT.U32 R111, R111, 0x4
             (0x000fe20008000000_000000040b0b789a, 0x000fe20000000000_000000046f6f781a),
+            // ULEA.HI.SX32 UR6, UR6, UR5, 0x1f -> LEA.HI.SX32 R106, R106, R105, 0x1f
+            (0x000fc8000f8ffa3f_0000000506067291, 0x000fc800078ffaff_000000696a6a7211),
             // LEA.HI R0, R2, UR14, RZ, 0x1c -> LEA.HI R0, R2, R114, RZ, 0x1c
             (0x000fe4000f8fe0ff_0000000e02007c11, 0x000fe400078fe0ff_0000007202007211),
         ];
