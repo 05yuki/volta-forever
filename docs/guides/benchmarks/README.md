@@ -26,7 +26,7 @@ The official vLLM 0.34.0 server used its compiler, Marlin experts and full and p
 
 ## SGLang
 
-Run the client against the official SGLang server started by the Ubuntu guide. On the published VF 0.1.1 release, the three measured requests reached a median of **71.04 prefill** and **11.98 decode** tokens/s with eight-token prefill chunks and eager execution. Each response started with its requested city. [Stock server and per-request data](sglang-stock-results.json)
+Run the client against the official SGLang server started by the Ubuntu guide. With VF 0.1.1 and batch-one CUDA decode graphs, it measured **71.52 prefill** and **38.26 decode** tokens/s. The paired series using the same cache salts measured **62.55/38.25** with graphs and **72.97/12.27** with graphs disabled. The server processed 227 uncached tokens and returned 64 for each of the three requests. [Same-GPU measurements](sglang-stock-graphs.json) · [Eager diagnostic](sglang-stock-results.json)
 
 ```sh
 mkdir -p ~/sglang-v100/benchmark && cd ~/sglang-v100/benchmark

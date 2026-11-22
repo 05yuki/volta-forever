@@ -68,7 +68,8 @@ python -m sglang.launch_server --model-path QuantTrio/Qwen3.5-35B-A3B-AWQ \
   --json-model-override-args "$awq" --attention-backend triton --sampling-backend pytorch \
   --context-length 512 --max-running-requests 1 --chunked-prefill-size 8 \
   --mem-fraction-static 0.85 --model-loader-extra-config '{"enable_multithread_load":false}' \
-  --disable-cuda-graph --enable-metrics --skip-server-warmup --watchdog-timeout 3600 \
+  --cuda-graph-backend-prefill disabled --cuda-graph-bs-decode 1 --cuda-graph-backend-decode full \
+  --enable-metrics --skip-server-warmup --watchdog-timeout 3600 \
   --host 127.0.0.1 --port 8000
 ```
 
@@ -81,12 +82,14 @@ curl -fsS http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: applicatio
 
 ## 5. Benchmarks
 
-With the server running, run `python3 docs/guides/benchmarks/sglang.py` from a checkout of this project. The client sends one warm-up and three distinct requests. Each measured request processed 227 uncached input tokens and generated 64 output tokens. The rates use SGLang’s GPU forward timers and count the 63 decode tokens after the first output token. [Client and prompts](./benchmarks/) · [Results and configuration](./benchmarks/sglang-stock-results.json)
+With the server running, run `python3 docs/guides/benchmarks/sglang.py` from a checkout of this project. The client sends one warm-up and three distinct requests. Each measured request processed 227 uncached input tokens and generated 64 output tokens. SGLang’s GPU forward timers cover all 227 prefill tokens and the 63 output tokens after the first. [Client and prompts](./benchmarks/)
 
-| Phase | Three requests (tokens/s) | Median (tokens/s) |
-| --- | --- | ---: |
-| Prefill | 72.24, 71.04, 70.28 | **71.04** |
-| Decode | 12.04, 11.97, 11.98 | **11.98** |
+| Decode CUDA graph | Median prefill (tokens/s) | Median decode (tokens/s) |
+| --- | ---: | ---: |
+| Enabled | 62.55 | 38.25 |
+| Disabled | 72.97 | 12.27 |
+
+The two servers ran in sequence on the same V100. Changing `--cuda-graph-backend-decode full` to `disabled` was the only configuration change. Decode ran **3.12× faster** with CUDA graphs. [Paired results](./benchmarks/sglang-stock-graphs.json) · [Initial eager baseline](./benchmarks/sglang-stock-results.json)
 
 ## 6. Additional notes
 
